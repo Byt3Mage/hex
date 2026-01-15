@@ -6,9 +6,8 @@ use crate::{
     arena::{Ident, Interner},
     compiler::{
         ast::{
-            AstArena, AstTypeId, AstTypeKind, ExprId, ExprKind, Field, GenericArg,
-            GenericParamKind, GenericParams, ItemId, ItemKind, Path, PatternId, PatternKind,
-            StmtId, StmtKind, Variant,
+            AstArena, AstField, AstVariant, DeclId, DeclKind, ExprId, ExprKind, PatternId,
+            PatternKind, StmtId, StmtKind,
         },
         tokens::Span,
     },
@@ -44,14 +43,11 @@ pub enum ResolveError {
     ReturnOutsideFunction {
         span: Span,
     },
-    SelfOutsideImpl {
-        span: Span,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
-    Item(ItemId),
+    Item(DeclId),
     Variable,     // let bindings, function params
     GenericType,  // <T>
     GenericConst, // <const N: int>
@@ -66,7 +62,7 @@ pub struct Symbol {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScopeId {
-    Item(ItemId),
+    Decl(DeclId),
     Expr(ExprId),
 }
 
@@ -74,8 +70,6 @@ pub enum ScopeId {
 pub enum ScopeKind {
     Module,
     Function,
-    Impl,
-    Type,
     Block,
     Loop,
 }
@@ -117,7 +111,7 @@ impl SymbolTable {
         }
     }
 
-    fn new_scope(&mut self, id: ScopeId, kind: ScopeKind, parent: Option<ScopeId>) {
+    fn scope(&mut self, id: ScopeId, kind: ScopeKind, parent: Option<ScopeId>) {
         self.scopes.insert(id, Scope::new(kind, parent));
     }
 
@@ -159,10 +153,6 @@ impl SymbolTable {
     pub fn find_function_scope(&self, scope_id: ScopeId) -> Option<ScopeId> {
         self.find_enclosing(scope_id, ScopeKind::Function)
     }
-
-    pub fn find_impl_scope(&self, scope_id: ScopeId) -> Option<ScopeId> {
-        self.find_enclosing(scope_id, ScopeKind::Impl)
-    }
 }
 
 pub struct NameResolver<'a> {
@@ -182,25 +172,6 @@ impl<'a> NameResolver<'a> {
         }
     }
 
-    pub fn resolve(mut self, root: ItemId) -> (SymbolTable, Vec<ResolveError>) {
-        let scope_id = ScopeId::Item(root);
-        self.table.new_scope(scope_id, ScopeKind::Module, None);
-
-        if let ItemKind::Module { items } = &self.ast.items[root].kind {
-            // First pass: register all items
-            for &item_id in items {
-                self.register_item(item_id, scope_id);
-            }
-
-            // Second pass: resolve all items
-            for &item_id in items {
-                self.resolve_item(item_id, scope_id);
-            }
-        }
-
-        (self.table, self.errors)
-    }
-
     fn error(&mut self, err: ResolveError) {
         self.errors.push(err);
     }
@@ -217,8 +188,32 @@ impl<'a> NameResolver<'a> {
         }
     }
 
-    fn register_item(&mut self, item_id: ItemId, scope_id: ScopeId) {
-        let item = &self.ast.items[item_id];
+    pub fn resolve(
+        mut self,
+        expr_id: ExprId,
+        decls: &[DeclId],
+    ) -> (SymbolTable, Vec<ResolveError>) {
+        self.resolve_module(expr_id, decls, None);
+        (self.table, self.errors)
+    }
+
+    fn resolve_module(&mut self, expr_id: ExprId, decls: &[DeclId], parent: Option<ScopeId>) {
+        let scope = ScopeId::Expr(expr_id);
+        self.table.scope(scope, ScopeKind::Module, parent);
+
+        // First pass: register all items
+        for &decl_id in decls {
+            self.register_decl(decl_id, scope);
+        }
+
+        // Second pass: resolve all items
+        for &decl_id in decls {
+            self.resolve_decl(decl_id, scope);
+        }
+    }
+
+    fn register_decl(&mut self, item_id: DeclId, parent: ScopeId) {
+        let item = &self.ast.decls[item_id];
 
         self.define(
             Symbol {
@@ -226,457 +221,201 @@ impl<'a> NameResolver<'a> {
                 name: item.name,
                 span: item.span,
             },
-            scope_id,
+            parent,
         );
 
-        // Create inner scopes for items that need them
         match &item.kind {
-            ItemKind::Module { items } => {
-                let mod_scope = ScopeId::Item(item_id);
-                self.table
-                    .new_scope(mod_scope, ScopeKind::Module, Some(scope_id));
-
-                for &inner_id in items {
-                    self.register_item(inner_id, mod_scope);
-                }
+            DeclKind::Function { .. } => {
+                let scope = ScopeId::Decl(item_id);
+                self.table.scope(scope, ScopeKind::Function, Some(parent));
             }
 
-            ItemKind::Function { .. } => {
-                self.table
-                    .new_scope(ScopeId::Item(item_id), ScopeKind::Function, Some(scope_id));
-            }
-
-            ItemKind::Struct { .. }
-            | ItemKind::Enum { .. }
-            | ItemKind::Union { .. }
-            | ItemKind::Const { .. }
-            | ItemKind::TypeAlias { .. }
-            | ItemKind::Import(_) => {}
+            DeclKind::Const { .. } => {}
         }
     }
 
-    fn resolve_item(&mut self, item_id: ItemId, parent_scope: ScopeId) {
-        let item = &self.ast.items[item_id];
+    fn resolve_decl(&mut self, item_id: DeclId, parent_scope: ScopeId) {
+        let item = &self.ast.decls[item_id];
 
         match &item.kind {
-            ItemKind::Module { items } => {
-                let mod_scope = ScopeId::Item(item_id);
-                for &inner_id in items {
-                    self.resolve_item(inner_id, mod_scope);
-                }
-            }
-
-            ItemKind::Function {
-                generics,
-                params,
-                ret,
-                body,
-            } => {
-                let func_scope = ScopeId::Item(item_id);
-
-                // Register generic parameters
-                self.resolve_generics(generics, func_scope);
+            DeclKind::Function { params, ret, body } => {
+                let scope = ScopeId::Decl(item_id);
 
                 // Register function parameters
                 for param in params {
-                    self.resolve_type(param.ty, func_scope);
-                    self.add_pattern_bindings(param.pattern, func_scope);
+                    self.resolve_expr(param.ty, scope);
+                    self.add_pattern_bindings(param.pattern, scope);
                 }
 
                 // Resolve return type
                 if let Some(ret_ty) = ret {
-                    self.resolve_type(*ret_ty, func_scope);
+                    self.resolve_expr(*ret_ty, scope);
                 }
 
                 // Resolve body
-                self.resolve_expr(*body, func_scope);
+                self.resolve_expr(*body, scope);
             }
 
-            ItemKind::Struct { generics, fields } => {
-                let struct_scope = ScopeId::Item(item_id);
-                self.table
-                    .new_scope(struct_scope, ScopeKind::Type, Some(parent_scope));
-                self.resolve_generics(generics, struct_scope);
-                self.resolve_fields(fields, struct_scope);
-            }
-
-            ItemKind::Enum { variants } => {
-                self.resolve_variants(variants, parent_scope);
-            }
-
-            ItemKind::Union { generics, fields } => {
-                let union_scope = ScopeId::Item(item_id);
-                self.table
-                    .new_scope(union_scope, ScopeKind::Type, Some(parent_scope));
-                self.resolve_generics(generics, union_scope);
-                self.resolve_fields(fields, union_scope);
-            }
-
-            ItemKind::Const { ty, value } => {
+            DeclKind::Const { ty, value } => {
                 if let Some(ty) = ty {
-                    self.resolve_type(*ty, parent_scope);
+                    self.resolve_expr(*ty, parent_scope);
                 }
                 self.resolve_expr(*value, parent_scope);
             }
-
-            ItemKind::TypeAlias { generics, ty } => {
-                let alias_scope = ScopeId::Item(item_id);
-                self.table
-                    .new_scope(alias_scope, ScopeKind::Type, Some(parent_scope));
-                self.resolve_generics(generics, alias_scope);
-                self.resolve_type(*ty, alias_scope);
-            }
-
-            ItemKind::Import(_) => {
-                // Import resolution is typically a separate phase
-            }
         }
     }
 
-    fn resolve_generics(&mut self, generics: &GenericParams, scope_id: ScopeId) {
-        for param in &generics.params {
-            let kind = match &param.kind {
-                GenericParamKind::Type { default } => {
-                    if let Some(default_ty) = default {
-                        self.resolve_type(*default_ty, scope_id);
-                    }
-                    SymbolKind::GenericType
-                }
-                GenericParamKind::Const { ty, default } => {
-                    self.resolve_type(*ty, scope_id);
-                    if let Some(default_expr) = default {
-                        self.resolve_expr(*default_expr, scope_id);
-                    }
-                    SymbolKind::GenericConst
-                }
-            };
-
-            self.define(
-                Symbol {
-                    kind,
-                    name: param.name,
-                    span: param.span,
-                },
-                scope_id,
-            );
-        }
-    }
-
-    // ========================================================================
-    // Types
-    // ========================================================================
-
-    fn resolve_type(&mut self, type_id: AstTypeId, scope_id: ScopeId) {
-        let ty = &self.ast.types[type_id];
-
-        match &ty.kind {
-            AstTypeKind::Path(path) => {
-                self.resolve_path(path, scope_id);
-            }
-
-            AstTypeKind::Pointer { pointee, .. } => {
-                self.resolve_type(*pointee, scope_id);
-            }
-
-            AstTypeKind::Optional(inner) => {
-                self.resolve_type(*inner, scope_id);
-            }
-
-            AstTypeKind::Array { elem, size } => {
-                self.resolve_type(*elem, scope_id);
-                self.resolve_expr(*size, scope_id);
-            }
-
-            AstTypeKind::Slice(elem) => {
-                self.resolve_type(*elem, scope_id);
-            }
-
-            AstTypeKind::Tuple(fields) => {
-                for &field in fields {
-                    self.resolve_type(field, scope_id);
-                }
-            }
-
-            AstTypeKind::Function { params, ret } => {
-                for &param in params {
-                    self.resolve_type(param, scope_id);
-                }
-                self.resolve_type(*ret, scope_id);
-            }
-
-            AstTypeKind::SelfType => {
-                if self.table.find_impl_scope(scope_id).is_none() {
-                    self.error(ResolveError::SelfOutsideImpl { span: ty.span });
-                }
-            }
-
-            AstTypeKind::Infer => {}
-
-            AstTypeKind::AnonStruct(fields) => {
-                for field in fields {
-                    self.resolve_type(field.ty, scope_id);
-                }
-            }
-
-            AstTypeKind::AnonUnion(fields) => {
-                for field in fields {
-                    self.resolve_type(field.ty, scope_id);
-                }
-            }
-
-            AstTypeKind::AnonEnum(variants) => {
-                for variant in variants {
-                    if let Some(value) = variant.value {
-                        self.resolve_expr(value, scope_id);
-                    }
-                }
-            }
-        }
-    }
-
-    // ========================================================================
-    // Expressions
-    // ========================================================================
-
-    fn resolve_expr(&mut self, expr_id: ExprId, scope_id: ScopeId) {
+    fn resolve_expr(&mut self, expr_id: ExprId, scope: ScopeId) {
         let expr = &self.ast.exprs[expr_id];
 
         match &expr.kind {
-            ExprKind::Int(_)
-            | ExprKind::Uint(_)
-            | ExprKind::Float(_)
-            | ExprKind::Bool(_)
+            ExprKind::IntLit(_)
+            | ExprKind::FloatLit(_)
+            | ExprKind::True
+            | ExprKind::False
             | ExprKind::Char(_)
-            | ExprKind::Cstr(_)
-            | ExprKind::Void => {}
+            | ExprKind::StrLit(_)
+            | ExprKind::Null
+            | ExprKind::Void
+            | ExprKind::Continue
+            | ExprKind::WildcardType => {}
 
-            ExprKind::Path(path) => {
-                self.resolve_path(path, scope_id);
-            }
-
-            ExprKind::Group(inner) => {
-                self.resolve_expr(*inner, scope_id);
-            }
-
-            ExprKind::ArrayLit(elems) => {
-                for &elem in elems {
-                    self.resolve_expr(elem, scope_id);
+            ExprKind::Ident(name) => {
+                if self.table.lookup(*name, scope).is_none() {
+                    self.error(ResolveError::UndefinedSymbol {
+                        name: *name,
+                        span: expr.span,
+                    })
                 }
             }
 
+            ExprKind::ArrayLit(elems) => elems.iter().for_each(|&e| self.resolve_expr(e, scope)),
             ExprKind::ArrayRepeat { value, count } => {
-                self.resolve_expr(*value, scope_id);
-                self.resolve_expr(*count, scope_id);
+                self.resolve_expr(*value, scope);
+                self.resolve_expr(*count, scope);
             }
-
-            ExprKind::StructLit { path, fields } => {
-                self.resolve_path(path, scope_id);
+            ExprKind::StructLit { ty, fields } => {
+                self.resolve_expr(*ty, scope);
                 for field in fields {
-                    if let Some(value) = field.value {
-                        self.resolve_expr(value, scope_id);
-                    }
+                    self.resolve_expr(field.value, scope);
                 }
             }
-
-            ExprKind::AnonStructLit { fields } => {
-                for field in fields {
-                    if let Some(value) = field.value {
-                        self.resolve_expr(value, scope_id);
-                    }
-                }
-            }
-
-            ExprKind::UnionLit { path, field } => {
-                self.resolve_path(path, scope_id);
-                if let Some(value) = field.value {
-                    self.resolve_expr(value, scope_id);
-                }
-            }
-
-            ExprKind::AnonUnionLit { field } => {
-                if let Some(value) = field.value {
-                    self.resolve_expr(value, scope_id);
-                }
-            }
-
-            ExprKind::TupleLit(elems) => {
-                for &elem in elems {
-                    self.resolve_expr(elem, scope_id);
-                }
-            }
-
-            ExprKind::Unary { expr, .. } => {
-                self.resolve_expr(*expr, scope_id);
-            }
-
+            ExprKind::TupleLit(elems) => elems.iter().for_each(|&e| self.resolve_expr(e, scope)),
+            ExprKind::ScopeAccess { ty, .. } => self.resolve_expr(*ty, scope),
+            ExprKind::Group(expr) => self.resolve_expr(*expr, scope),
+            ExprKind::Unary { expr, .. } => self.resolve_expr(*expr, scope),
             ExprKind::Binary { lhs, rhs, .. } => {
-                self.resolve_expr(*lhs, scope_id);
-                self.resolve_expr(*rhs, scope_id);
+                self.resolve_expr(*lhs, scope);
+                self.resolve_expr(*rhs, scope);
             }
-
-            ExprKind::Assign { target, value, .. } => {
-                self.resolve_expr(*target, scope_id);
-                self.resolve_expr(*value, scope_id);
+            ExprKind::Assign { tgt, val, .. } => {
+                self.resolve_expr(*tgt, scope);
+                self.resolve_expr(*val, scope);
             }
-
             ExprKind::Cast { expr, ty } => {
-                self.resolve_expr(*expr, scope_id);
-                self.resolve_type(*ty, scope_id);
+                self.resolve_expr(*expr, scope);
+                self.resolve_expr(*ty, scope);
             }
-
             ExprKind::If {
                 cond,
                 then_branch,
                 else_branch,
             } => {
-                self.resolve_expr(*cond, scope_id);
-                self.resolve_expr(*then_branch, scope_id);
-                if let Some(else_br) = else_branch {
-                    self.resolve_expr(*else_br, scope_id);
+                self.resolve_expr(*cond, scope);
+                self.resolve_expr(*then_branch, scope);
+                if let Some(e) = else_branch {
+                    self.resolve_expr(*e, scope);
                 }
             }
-
             ExprKind::Match { scrutinee, arms } => {
-                self.resolve_expr(*scrutinee, scope_id);
+                self.resolve_expr(*scrutinee, scope);
+
                 for arm in arms {
-                    // Each arm gets its own scope for pattern bindings
-                    let arm_scope = ScopeId::Expr(expr_id);
-                    self.table
-                        .new_scope(arm_scope, ScopeKind::Block, Some(scope_id));
-
-                    self.resolve_pattern(arm.pattern, arm_scope);
-                    self.add_pattern_bindings(arm.pattern, arm_scope);
-
-                    if let Some(guard) = arm.guard {
-                        self.resolve_expr(guard, arm_scope);
-                    }
-                    self.resolve_expr(arm.body, arm_scope);
+                    self.add_pattern_bindings(arm.pattern, scope);
                 }
             }
-
             ExprKind::While { cond, body } => {
-                self.resolve_expr(*cond, scope_id);
-
-                let loop_scope = ScopeId::Expr(expr_id);
-                self.table
-                    .new_scope(loop_scope, ScopeKind::Loop, Some(scope_id));
-                self.resolve_expr(*body, loop_scope);
+                self.resolve_expr(*cond, scope);
+                self.resolve_expr(*body, scope);
             }
-
-            ExprKind::Loop(body) => {
-                let loop_scope = ScopeId::Expr(expr_id);
-                self.table
-                    .new_scope(loop_scope, ScopeKind::Loop, Some(scope_id));
-                self.resolve_expr(*body, loop_scope);
-            }
-
+            ExprKind::Loop(body) => self.resolve_expr(*body, scope),
             ExprKind::For {
                 pattern,
                 iter,
                 body,
             } => {
-                self.resolve_expr(*iter, scope_id);
-
-                let loop_scope = ScopeId::Expr(expr_id);
-                self.table
-                    .new_scope(loop_scope, ScopeKind::Loop, Some(scope_id));
-
-                self.resolve_pattern(*pattern, loop_scope);
-                self.add_pattern_bindings(*pattern, loop_scope);
-                self.resolve_expr(*body, loop_scope);
+                self.resolve_pattern(*pattern, scope);
+                self.resolve_expr(*iter, scope);
+                self.resolve_expr(*body, scope);
             }
-
             ExprKind::Block(stmts) => {
-                let block_scope = ScopeId::Expr(expr_id);
-                self.table
-                    .new_scope(block_scope, ScopeKind::Block, Some(scope_id));
-
-                for &stmt_id in stmts {
-                    self.resolve_stmt(stmt_id, block_scope);
+                let scope = ScopeId::Expr(expr_id);
+                self.table.scope(scope, ScopeKind::Block, Some(scope));
+                for stmt in stmts {
+                    self.resolve_stmt(*stmt, scope);
                 }
             }
-
-            ExprKind::Return(value) => {
-                if let Some(val) = value {
-                    self.resolve_expr(*val, scope_id);
-                }
-                if self.table.find_function_scope(scope_id).is_none() {
-                    self.error(ResolveError::ReturnOutsideFunction { span: expr.span });
+            ExprKind::Return(expr_id) | ExprKind::Break(expr_id) => {
+                if let Some(expr_id) = expr_id {
+                    self.resolve_expr(*expr_id, scope);
                 }
             }
-
-            ExprKind::Break(value) => {
-                if let Some(val) = value {
-                    self.resolve_expr(*val, scope_id);
-                }
-                if self.table.find_loop_scope(scope_id).is_none() {
-                    self.error(ResolveError::BreakOutsideLoop { span: expr.span });
-                }
-            }
-
-            ExprKind::Continue => {
-                if self.table.find_loop_scope(scope_id).is_none() {
-                    self.error(ResolveError::ContinueOutsideLoop { span: expr.span });
-                }
-            }
-
             ExprKind::Call { callee, args } => {
-                self.resolve_expr(*callee, scope_id);
-                for &arg in args {
-                    self.resolve_expr(arg, scope_id);
+                self.resolve_expr(*callee, scope);
+                for arg in args {
+                    self.resolve_expr(*arg, scope);
                 }
             }
-
-            ExprKind::MethodCall {
-                receiver,
-                type_args,
-                args,
-                ..
-            } => {
-                self.resolve_expr(*receiver, scope_id);
-                for &ty_arg in type_args {
-                    self.resolve_type(ty_arg, scope_id);
-                }
-                for &arg in args {
-                    self.resolve_expr(arg, scope_id);
-                }
-            }
-
-            ExprKind::Field { object, .. } => {
-                self.resolve_expr(*object, scope_id);
-            }
-
-            ExprKind::OptionalChain { object, .. } => {
-                self.resolve_expr(*object, scope_id);
+            ExprKind::Field { object, .. } | ExprKind::OptionalField { object, .. } => {
+                self.resolve_expr(*object, scope);
             }
 
             ExprKind::Index { object, index } => {
-                self.resolve_expr(*object, scope_id);
-                self.resolve_expr(*index, scope_id);
+                self.resolve_expr(*object, scope);
+                self.resolve_expr(*index, scope);
             }
-
             ExprKind::Range { start, end, .. } => {
-                if let Some(s) = start {
-                    self.resolve_expr(*s, scope_id);
+                if let Some(start) = start {
+                    self.resolve_expr(*start, scope);
                 }
-                if let Some(e) = end {
-                    self.resolve_expr(*e, scope_id);
+
+                if let Some(end) = end {
+                    self.resolve_expr(*end, scope);
                 }
             }
-
-            ExprKind::Unwrap(inner) => {
-                self.resolve_expr(*inner, scope_id);
+            ExprKind::Unwrap(expr_id) | ExprKind::Const(expr_id) => {
+                self.resolve_expr(*expr_id, scope);
             }
+            ExprKind::StructType(fields) | ExprKind::UnionType(fields) => {
+                self.resolve_fields(fields, scope);
+            }
+            ExprKind::EnumType(variants) => {
+                self.resolve_variants(variants, scope);
+            }
+            ExprKind::ArrayType { elem, size } => {
+                self.resolve_expr(*elem, scope);
+                self.resolve_expr(*size, scope);
+            }
+            ExprKind::SliceType(expr_id) | ExprKind::OptionType(expr_id) => {
+                self.resolve_expr(*expr_id, scope);
+            }
+            ExprKind::PointerType { pointee, .. } => {
+                self.resolve_expr(*pointee, scope);
+            }
+            ExprKind::FunctionType { params, ret } => {
+                for &param in params {
+                    self.resolve_expr(param, scope);
+                }
 
-            ExprKind::Comptime(inner) => {
-                self.resolve_expr(*inner, scope_id);
+                if let Some(ret) = ret {
+                    self.resolve_expr(*ret, scope);
+                }
+            }
+            ExprKind::ModuleType(decls) => {
+                self.resolve_module(expr_id, &decls, Some(scope));
             }
         }
     }
-
-    // ========================================================================
-    // Statements
-    // ========================================================================
 
     fn resolve_stmt(&mut self, stmt_id: StmtId, scope_id: ScopeId) {
         let stmt = &self.ast.stmts[stmt_id];
@@ -684,86 +423,65 @@ impl<'a> NameResolver<'a> {
         match &stmt.kind {
             StmtKind::Let { pattern, ty, value } => {
                 if let Some(ty) = ty {
-                    self.resolve_type(*ty, scope_id);
+                    self.resolve_expr(*ty, scope_id);
                 }
                 self.resolve_expr(*value, scope_id);
                 self.add_pattern_bindings(*pattern, scope_id);
             }
 
-            StmtKind::Expr { expr, .. } => {
-                self.resolve_expr(*expr, scope_id);
-            }
-
+            StmtKind::Expr { expr, .. } => self.resolve_expr(*expr, scope_id),
             StmtKind::Empty => {}
         }
     }
 
-    // ========================================================================
-    // Patterns
-    // ========================================================================
-
-    fn resolve_pattern(&mut self, pattern_id: PatternId, scope_id: ScopeId) {
+    fn resolve_pattern(&mut self, pattern_id: PatternId, scope: ScopeId) {
         let pattern = &self.ast.patterns[pattern_id];
 
         match &pattern.kind {
-            PatternKind::Wildcard | PatternKind::Binding { .. } => {}
-
-            PatternKind::Int(_)
+            PatternKind::Wildcard
+            | PatternKind::Int(_)
             | PatternKind::Float(_)
             | PatternKind::Bool(_)
             | PatternKind::Char(_)
-            | PatternKind::CStr(_) => {}
+            | PatternKind::CStr(_)
+            | PatternKind::Rest => {}
 
-            PatternKind::Path(path) => {
-                self.resolve_path(path, scope_id);
-            }
-
-            PatternKind::Struct { path, fields, .. } => {
-                self.resolve_path(path, scope_id);
-                for field in fields {
-                    self.resolve_pattern(field.pattern, scope_id);
+            PatternKind::Identifier { ident, .. } => {
+                if self.table.lookup(*ident, scope).is_none() {
+                    self.error(ResolveError::UndefinedSymbol {
+                        name: *ident,
+                        span: pattern.span,
+                    })
                 }
             }
 
-            PatternKind::AnonStruct { fields, .. } => {
-                for field in fields {
-                    self.resolve_pattern(field.pattern, scope_id);
+            PatternKind::Struct { ty, fields, .. } => {
+                self.resolve_expr(*ty, scope);
+                for pattern in fields.iter().filter_map(|f| f.pattern) {
+                    self.resolve_pattern(pattern, scope);
                 }
             }
-
-            PatternKind::Union { path, field } => {
-                self.resolve_path(path, scope_id);
-                self.resolve_pattern(field.pattern, scope_id);
-            }
-
-            PatternKind::AnonUnion { field } => {
-                self.resolve_pattern(field.pattern, scope_id);
-            }
-
             PatternKind::Tuple(elems) => {
                 for &elem in elems {
-                    self.resolve_pattern(elem, scope_id);
+                    self.resolve_pattern(elem, scope);
                 }
             }
-
             PatternKind::Array(elems) => {
                 for &elem in elems {
-                    self.resolve_pattern(elem, scope_id);
+                    self.resolve_pattern(elem, scope);
                 }
             }
-
             PatternKind::Or(patterns) => {
                 for &pat in patterns {
-                    self.resolve_pattern(pat, scope_id);
+                    self.resolve_pattern(pat, scope);
                 }
             }
-
             PatternKind::Range { start, end, .. } => {
                 if let Some(s) = start {
-                    self.resolve_expr(*s, scope_id);
+                    self.resolve_expr(*s, scope);
                 }
                 if let Some(e) = end {
-                    self.resolve_expr(*e, scope_id);
+                    self.resolve_expr(*e, scope);
                 }
             }
         }
@@ -774,33 +492,29 @@ impl<'a> NameResolver<'a> {
 
         match &pattern.kind {
             PatternKind::Wildcard
-            | PatternKind::Path(_)
             | PatternKind::Int(_)
             | PatternKind::Float(_)
             | PatternKind::Bool(_)
             | PatternKind::Char(_)
             | PatternKind::CStr(_)
-            | PatternKind::Range { .. } => {}
+            | PatternKind::Range { .. }
+            | PatternKind::Rest => {}
 
-            PatternKind::Binding { name, .. } => {
+            PatternKind::Identifier { ident, .. } => {
                 self.define(
                     Symbol {
                         kind: SymbolKind::Variable,
-                        name: *name,
+                        name: *ident,
                         span: pattern.span,
                     },
                     scope_id,
                 );
             }
 
-            PatternKind::Struct { fields, .. } | PatternKind::AnonStruct { fields, .. } => {
-                for field in fields {
-                    self.add_pattern_bindings(field.pattern, scope_id);
+            PatternKind::Struct { fields, .. } => {
+                for pattern in fields.iter().filter_map(|f| f.pattern) {
+                    self.add_pattern_bindings(pattern, scope_id);
                 }
-            }
-
-            PatternKind::Union { field, .. } | PatternKind::AnonUnion { field } => {
-                self.add_pattern_bindings(field.pattern, scope_id);
             }
 
             PatternKind::Tuple(elems) | PatternKind::Array(elems) => {
@@ -818,36 +532,7 @@ impl<'a> NameResolver<'a> {
         }
     }
 
-    // ========================================================================
-    // Paths
-    // ========================================================================
-
-    fn resolve_path(&mut self, path: &Path, scope_id: ScopeId) {
-        // Resolve first segment as a name lookup
-        if let Some(first) = path.segments.first() {
-            if self.table.lookup(first.name, scope_id).is_none() {
-                self.error(ResolveError::UndefinedSymbol {
-                    name: first.name,
-                    span: first.span,
-                });
-            }
-
-            // Resolve type arguments in all segments
-            for segment in &path.segments {
-                for ty_arg in &segment.args {
-                    match ty_arg {
-                        GenericArg::Type(ty) => self.resolve_type(*ty, scope_id),
-                        GenericArg::Const(expr) => self.resolve_expr(*expr, scope_id),
-                    }
-                }
-            }
-        }
-
-        // Note: subsequent segments (a::b::c) are resolved during type checking,
-        // not name resolution, because we need to know what 'a' is first
-    }
-
-    fn resolve_fields(&mut self, fields: &[Field], scope_id: ScopeId) {
+    fn resolve_fields(&mut self, fields: &[AstField], scope_id: ScopeId) {
         let mut seen: AHashMap<Ident, Span> = AHashMap::new();
         for field in fields {
             match seen.entry(field.name) {
@@ -862,11 +547,11 @@ impl<'a> NameResolver<'a> {
                     entry.insert(field.span);
                 }
             }
-            self.resolve_type(field.ty, scope_id);
+            self.resolve_expr(field.ty, scope_id);
         }
     }
 
-    fn resolve_variants(&mut self, variants: &[Variant], scope_id: ScopeId) {
+    fn resolve_variants(&mut self, variants: &[AstVariant], scope_id: ScopeId) {
         let mut seen: AHashMap<Ident, Span> = AHashMap::new();
         for variant in variants {
             match seen.entry(variant.name) {
@@ -887,12 +572,4 @@ impl<'a> NameResolver<'a> {
             }
         }
     }
-}
-
-pub fn resolve(
-    ast: &AstArena,
-    interner: &Interner,
-    root: ItemId,
-) -> (SymbolTable, Vec<ResolveError>) {
-    NameResolver::new(ast, interner).resolve(root)
 }

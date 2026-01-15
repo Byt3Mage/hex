@@ -80,6 +80,7 @@ pub(crate) enum TokenType {
     Import,
     In,
     Int,
+    Let,
     Loop,
     Macro,
     Match,
@@ -87,6 +88,7 @@ pub(crate) enum TokenType {
     Mut,
     Null,
     Or,
+    Package,
     Pub,
     Return,
     SelfTy,
@@ -96,9 +98,8 @@ pub(crate) enum TokenType {
     Trait,
     True,
     Type,
+    Union,
     Use,
-    Val,
-    Var,
     Void,
     While,
 
@@ -335,6 +336,9 @@ macro_rules! tt {
     (int) => {
         $crate::compiler::tokens::TokenType::Int
     };
+    (let) => {
+        $crate::compiler::tokens::TokenType::Let
+    };
     (loop) => {
         $crate::compiler::tokens::TokenType::Loop
     };
@@ -356,13 +360,16 @@ macro_rules! tt {
     (or) => {
         $crate::compiler::tokens::TokenType::Or
     };
+    (package) => {
+        $crate::compiler::tokens::TokenType::Package
+    };
     (pub) => {
         $crate::compiler::tokens::TokenType::Pub
     };
     (return) => {
         $crate::compiler::tokens::TokenType::Return
     };
-    (Self) => {
+    (self) => {
         $crate::compiler::tokens::TokenType::SelfTy
     };
     (static) => {
@@ -383,14 +390,11 @@ macro_rules! tt {
     (type) => {
         $crate::compiler::tokens::TokenType::Type
     };
+    (union) => {
+        $crate::compiler::tokens::TokenType::Union
+    };
     (use) => {
         $crate::compiler::tokens::TokenType::Use
-    };
-    (val) => {
-        $crate::compiler::tokens::TokenType::Val
-    };
-    (var) => {
-        $crate::compiler::tokens::TokenType::Var
     };
     (void) => {
         $crate::compiler::tokens::TokenType::Void

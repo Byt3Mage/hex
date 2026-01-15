@@ -1,24 +1,22 @@
-use std::sync::Arc;
-
 use thiserror::Error;
 
 use crate::vm::{
-    async_runtime::{Scheduler, Task, WaitReason},
+    async_runtime::{Scheduler, Task, TaskState},
     heap::{GCPtr, Heap},
     instruction::*,
-    object::{AsValue, GCTask, Value},
-    unit::{CallInfo, FuncInfo, NativeFuncInfo, Unit},
+    memory::PageAllocator,
+    object::{AsValue, GCBuffer, GCTask, Value, try_get_ptr},
+    program::{CallInfo, FunctionId, NativeFunctionInfo, Program},
 };
 
-pub mod allocator;
-pub mod async_runtime;
+mod async_runtime;
 pub mod function;
-pub mod heap;
+mod heap;
 pub mod instruction;
 mod memory;
+pub mod name;
 pub mod object;
-pub mod safepoint;
-pub mod unit;
+pub mod program;
 
 #[derive(Debug, Copy, Clone, Error)]
 pub enum VMError {
@@ -36,54 +34,56 @@ pub enum VMError {
     PCOutOfBounds,
     #[error("Invalid conversion")]
     ValueConversionFailed,
+    #[error("Heap allocation failed")]
+    AllocFailed,
+    #[error("Buffer index out of bounds")]
+    IndexOutOfBounds,
 }
 
 pub type VMResult<T> = Result<T, VMError>;
 
 struct CallerInfo {
-    /// Owner compilation unit of our caller
-    unit: Arc<Unit>,
     /// PC in caller instructions to return to
     ret_pc: usize,
+
     /// Caller registers base offset
     base_reg: usize,
+
     /// Start register in caller to put return value
     ret_reg: u8,
 }
 
 struct Frame {
-    /// Saved caller state. None means we are a top level function with no caller
+    /// Caller function metadata.
+    /// `None` means top-level function with no caller
     caller_info: Option<CallerInfo>,
-    callee_info: CallInfo,
+
+    /// Current function metadata,
+    call_info: CallInfo,
 }
 
-pub struct VM {
-    // VM state
+pub struct VM<'a, A: PageAllocator> {
     regs: Vec<Value>,
     call_stack: Vec<Frame>,
     native_call_ret: Box<[Value; u8::MAX as usize]>,
-    heap: Heap,
+    heap: Heap<A>,
+    scheduler: Scheduler,
 
     pc: usize,
     base_reg: usize,
 
-    // Async runtime
-    scheduler: Scheduler,
-
-    // execution context
-    unit: Arc<Unit>,
-    bytecode: Arc<[Instruction]>,
-    constants: Arc<[Value]>,
-    functions: Arc<[FuncInfo]>,
-    native_functions: Arc<[NativeFuncInfo]>,
+    program: &'a Program,
 }
 
-impl VM {
+impl<'a, A: PageAllocator> VM<'a, A> {
     pub fn reset(&mut self) {
+        self.base_reg = 0;
+        self.pc = 0;
+
         self.regs.clear();
         self.call_stack.clear();
-        self.base_reg = 0;
-        todo!("reset heap");
+        self.heap.reset();
+        self.scheduler.reset();
     }
 
     #[inline(always)]
@@ -112,13 +112,18 @@ impl VM {
     }
 
     #[inline(always)]
+    fn last_frame_mut(&mut self) -> VMResult<&mut Frame> {
+        self.call_stack.last_mut().ok_or(VMError::EmptyCallStack)
+    }
+
+    #[inline(always)]
     fn exec_mov(&mut self, i: Instruction) {
         self.set_reg_raw(i.a(), self.reg(i.b()));
     }
 
     #[inline(always)]
-    fn exec_load(&mut self, i: Instruction) {
-        self.set_reg_raw(i.a(), self.constants[i.bx() as usize]);
+    fn exec_const(&mut self, i: Instruction) {
+        self.set_reg_raw(i.a(), self.program.constants[i.bx() as usize]);
     }
 
     #[inline(always)]
@@ -175,31 +180,31 @@ impl VM {
     #[inline(always)]
     fn exec_iadd_imm(&mut self, i: Instruction) {
         let dst = self.reg_mut(i.a());
-        dst.set(dst.get::<i64>() + i.imm_i16());
+        dst.set(dst.get::<i64>() + i.bx_i64());
     }
 
     #[inline(always)]
     fn exec_isub_imm(&mut self, i: Instruction) {
         let dst = self.reg_mut(i.a());
-        dst.set(dst.get::<i64>() - i.imm_i16());
+        dst.set(dst.get::<i64>() - i.bx_i64());
     }
 
     #[inline(always)]
     fn exec_imul_imm(&mut self, i: Instruction) {
         let dst = self.reg_mut(i.a());
-        dst.set(dst.get::<i64>() * i.imm_i16());
+        dst.set(dst.get::<i64>() * i.bx_i64());
     }
 
     #[inline(always)]
     fn exec_idiv_imm(&mut self, i: Instruction) {
         let dst = self.reg_mut(i.a());
-        dst.set(dst.get::<i64>() / i.imm_i16());
+        dst.set(dst.get::<i64>() / i.bx_i64());
     }
 
     #[inline(always)]
     fn exec_irem_imm(&mut self, i: Instruction) {
         let dst = self.reg_mut(i.a());
-        dst.set(dst.get::<i64>() % i.imm_i16());
+        dst.set(dst.get::<i64>() % i.bx_i64());
     }
 
     #[inline(always)]
@@ -283,117 +288,75 @@ impl VM {
         }
     }
 
-    fn exec_call(&mut self, i: Instruction) {
-        let func = &self.functions[i.bx() as usize];
-        let cinfo = &func.call_info;
-
-        // create register window
+    #[inline(always)]
+    fn call(&mut self, ret_reg: u8, cinfo: CallInfo) {
+        // Create register window
         let base = self.regs.len();
         self.regs.resize(base + cinfo.nreg as usize, Value::zero());
 
         // Copy args from caller into callee registers
         // Call convention: args are in caller registers[ret..ret + narg]
-        let ret_reg = i.a();
         let start = self.base_reg + ret_reg as usize;
         let end = start + cinfo.narg as usize;
         self.regs.copy_within(start..end, base);
 
+        // Create new call frame and save caller info
         self.call_stack.push(Frame {
             caller_info: Some(CallerInfo {
-                unit: Arc::clone(&self.unit),
                 ret_pc: self.pc,
                 base_reg: self.base_reg,
                 ret_reg,
             }),
-            callee_info: cinfo.clone(),
+            call_info: cinfo,
         });
 
+        // Jump to function code
         self.base_reg = base;
         self.pc = cinfo.entry_pc;
-
-        // Switch context if calling external function
-        if let Some(id) = func.unit_id {
-            self.unit = Arc::clone(&self.unit.imports[id]);
-            self.bytecode = Arc::clone(&self.unit.bytecode);
-            self.constants = Arc::clone(&self.unit.constants);
-            self.functions = Arc::clone(&self.unit.functions);
-            self.native_functions = Arc::clone(&self.unit.native_functions);
-        }
     }
 
-    fn exec_tail_call(&mut self, i: Instruction) -> VMResult<()> {
-        let func = &self.functions[i.bx() as usize];
-        let cinfo = &func.call_info;
+    #[inline(always)]
+    fn exec_call(&mut self, i: Instruction) {
+        let ret_reg = i.a();
+        let cinfo = self.program.functions[i.bx() as usize].call_info;
+        self.call(ret_reg, cinfo);
+    }
+
+    #[inline(always)]
+    fn exec_callr(&mut self, i: Instruction) {
+        let ret_reg = i.a();
+        let func = self.reg(i.b()).get::<FunctionId>() as usize;
+        let cinfo = self.program.functions[func as usize].call_info;
+        self.call(ret_reg, cinfo);
+    }
+
+    fn exec_callt(&mut self, i: Instruction) -> VMResult<()> {
+        let ret_reg = i.a();
+        let cinfo = self.program.functions[i.bx() as usize].call_info;
 
         // Reuse register window: shrink or grow in-place
         let base = self.base_reg;
         self.regs.resize(base + cinfo.nreg as usize, Value::zero());
 
         // copy args into the same window
-        let start = self.base_reg + i.a() as usize;
+        let start = self.base_reg + ret_reg as usize;
         let end = start + cinfo.narg as usize;
         self.regs.copy_within(start..end, base);
 
         // Reuse current frame and update the callee info.
-        let frame = self.call_stack.last_mut().ok_or(VMError::EmptyCallStack)?;
-        frame.callee_info = cinfo.clone();
-
-        self.base_reg = base; // redundant, but the consistency makes me feel better
+        self.last_frame_mut()?.call_info = cinfo;
         self.pc = cinfo.entry_pc;
-
-        // if cross-unit tailcall, switch context
-        if let Some(id) = func.unit_id {
-            self.unit = Arc::clone(&self.unit.imports[id]);
-            self.bytecode = Arc::clone(&self.unit.bytecode);
-            self.constants = Arc::clone(&self.unit.constants);
-            self.functions = Arc::clone(&self.unit.functions);
-            self.native_functions = Arc::clone(&self.unit.native_functions);
-        }
-
         Ok(())
     }
 
-    fn exec_ret(&mut self) -> VMResult<Option<Frame>> {
-        let frame = self.call_stack.pop().ok_or(VMError::EmptyCallStack)?;
-
-        match frame.caller_info {
-            // No caller means top level function, exit run loop
-            None => Ok(Some(frame)),
-            // return to caller
-            Some(caller_info) => {
-                // copy return values to caller's registers
-                let start = self.base_reg + frame.callee_info.ret_reg as usize;
-                let range = start..(start + frame.callee_info.nret as usize);
-                self.regs.copy_within(range, caller_info.ret_reg as usize);
-
-                // clear register window
-                self.regs.truncate(self.base_reg);
-
-                // If we just returned from external function, switch context
-                if !Arc::ptr_eq(&self.unit, &caller_info.unit) {
-                    self.unit = caller_info.unit;
-                    self.bytecode = Arc::clone(&self.unit.bytecode);
-                    self.constants = Arc::clone(&self.unit.constants);
-                    self.functions = Arc::clone(&self.unit.functions);
-                    self.native_functions = Arc::clone(&self.unit.native_functions);
-                }
-
-                self.base_reg = caller_info.base_reg;
-                self.pc = caller_info.ret_pc;
-
-                Ok(None)
-            }
-        }
-    }
-
-    fn exec_call_native(&mut self, i: Instruction) -> VMResult<()> {
-        let func = &self.unit.native_functions[i.bx() as usize];
+    #[inline(always)]
+    fn calln(&mut self, ret_reg: u8, func: &NativeFunctionInfo) -> VMResult<()> {
         let narg = func.narg as usize;
         let nret = func.nret as usize;
 
         // Immutably borrow args from caller registers
         // Call convention: args are in caller registers[ret..ret + narg]
-        let ret = self.base_reg + i.a() as usize;
+        let ret = self.base_reg + ret_reg as usize;
         let args = &self.regs[ret..ret + narg];
         let results = &mut self.native_call_ret[..nret];
 
@@ -402,57 +365,157 @@ impl VM {
 
         // Copy results back into caller registers
         self.regs[ret..ret + nret].copy_from_slice(results);
-
         Ok(())
     }
 
-    fn exec_spawn_task(&mut self, i: Instruction) {
-        let dst = i.a();
-        let func = &self.functions[i.bx() as usize];
-        let cinfo = func.call_info.clone();
+    #[inline(always)]
+    fn exec_calln(&mut self, i: Instruction) -> VMResult<()> {
+        let ret_reg = i.a();
+        let func = &self.program.native_functions[i.bx() as usize];
+        self.calln(ret_reg, func)
+    }
 
+    #[inline(always)]
+    fn exec_callnr(&mut self, i: Instruction) -> VMResult<()> {
+        let ret_reg = i.a();
+        let func_id = self.reg(i.b()).get::<FunctionId>() as usize;
+        let func = &self.program.native_functions[func_id];
+        self.calln(ret_reg, func)
+    }
+
+    fn exec_ret(&mut self) -> VMResult<Option<Frame>> {
+        let frame = self.call_stack.pop().ok_or(VMError::EmptyCallStack)?;
+
+        match &frame.caller_info {
+            // No caller means top level function, exit run loop
+            None => Ok(Some(frame)),
+
+            // Return to caller
+            Some(caller_info) => {
+                // Copy return values to caller's registers
+                let start = self.base_reg + frame.call_info.ret_reg as usize;
+                let range = start..(start + frame.call_info.nret as usize);
+                self.regs.copy_within(range, caller_info.ret_reg as usize);
+
+                // Clear register window
+                self.regs.truncate(self.base_reg);
+                self.base_reg = caller_info.base_reg;
+                self.pc = caller_info.ret_pc;
+                Ok(None)
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn exec_alloc_buf(&mut self, i: Instruction) -> VMResult<()> {
+        let len = self.reg(i.b()).get::<u64>() as usize;
+        let ptr = self.heap.alloc_buff(len, 0).ok_or(VMError::AllocFailed)?;
+        self.set_reg(i.a(), ptr);
+        Ok(())
+    }
+
+    fn exec_alloc_dyn(&mut self, i: Instruction) -> VMResult<()> {
+        let ptr = self.heap.alloc_dyn_buff(0).ok_or(VMError::AllocFailed)?;
+        self.set_reg(i.a(), ptr);
+        Ok(())
+    }
+
+    fn exec_alloc_str(&mut self, i: Instruction) -> VMResult<()> {
+        let ptr = self.heap.alloc_str(0).ok_or(VMError::AllocFailed)?;
+        self.set_reg(i.a(), ptr);
+        Ok(())
+    }
+
+    fn exec_load(&mut self, i: Instruction) {
+        let ptr = self.reg(i.b()).get::<GCPtr>();
+        let offset = self.reg(i.c()).get::<u64>() as usize;
+        self.set_reg_raw(i.a(), ptr.as_ref::<GCBuffer>().get(offset));
+    }
+
+    fn exec_store(&mut self, i: Instruction) {
+        let mut ptr = self.reg(i.a()).get::<GCPtr>();
+        let offset = self.reg(i.b()).get::<u64>() as usize;
+        ptr.as_mut::<GCBuffer>().set(offset, self.reg(i.c()));
+    }
+
+    fn exec_barrier_fwd(&mut self, i: Instruction) {
+        let parent: GCPtr = self.reg(i.a()).get();
+        let child: GCPtr = self.reg(i.b()).get();
+        self.heap.barrier_forward(parent, child);
+    }
+
+    fn exec_barrier_back(&mut self, i: Instruction) {
+        let obj: GCPtr = self.reg(i.a()).get();
+        self.heap.barrier_back(obj);
+    }
+
+    fn exec_spawn_task(&mut self, i: Instruction) -> VMResult<()> {
+        let dst = i.a();
+        let cinfo = self.program.functions[i.bx() as usize].call_info;
         let start = self.base_reg + dst as usize;
         let args = &self.regs[start..start + cinfo.narg as usize];
-        let ptr = self.heap.alloc_task(Task::new(cinfo, args));
+        let task = Task::new(cinfo, args);
+        let ptr = self.heap.alloc_task(task, 0).ok_or(VMError::AllocFailed)?;
 
-        self.scheduler.ready_queue.push_back(ptr);
         self.set_reg(dst, ptr);
+        Ok(())
     }
 
     pub fn exec_await(&mut self, i: Instruction) -> VMResult<bool> {
-        let mut ptr = self.scheduler.current_task.ok_or(VMError::IllegalAwait)?;
+        let mut current = self.scheduler.current().ok_or(VMError::IllegalAwait)?;
 
-        if ptr.as_ref::<GCTask>().get().is_cancelled() {
+        if current.as_ref::<GCTask>().get().is_cancelled() {
             return Err(VMError::TaskCancelled);
         }
 
-        let task: GCPtr = self.reg(i.b()).get();
+        let task: GCPtr = self.reg(i.a()).get();
 
         if task.as_ref::<GCTask>().get().is_complete() {
             //TODO: copy results into caller registers
             return Ok(true);
         }
 
-        self.scheduler.suspend(ptr, WaitReason::AwaitingTask(task));
+        self.scheduler.await_task(current, task);
 
-        let task = ptr.as_mut::<GCTask>().get_mut();
-        std::mem::swap(&mut self.regs, &mut task.registers);
-        std::mem::swap(&mut self.call_stack, &mut task.call_stack);
-        task.base_reg = self.base_reg;
-        task.pc = self.pc - 1; // pc pushed back so await is retried on resume
+        let waiter = current.as_mut::<GCTask>().get_mut();
+        std::mem::swap(&mut self.regs, &mut waiter.registers);
+        std::mem::swap(&mut self.call_stack, &mut waiter.call_stack);
+        waiter.base_reg = self.base_reg;
+        waiter.pc = self.pc - 1; // pc pushed back so await is retried on resume
 
         Ok(false)
     }
 
+    fn exec_join(&mut self, tasks: &[GCPtr]) -> VMResult<()> {
+        // Start all pending tasks
+        for &task_ptr in tasks {
+            let task = task_ptr.as_ref::<GCTask>().get();
+            if task.state == TaskState::Pending {
+                self.scheduler.run(task_ptr);
+            }
+        }
+
+        // Run until all joined tasks complete
+        while !tasks
+            .iter()
+            .all(|&t| t.as_ref::<GCTask>().get().state == TaskState::Completed)
+        {
+            self.run::<false>()?;
+        }
+
+        // Results are now in each task's registers
+        Ok(())
+    }
+
     fn run<const SYNC: bool>(&mut self) -> VMResult<Option<Frame>> {
-        while self.pc < self.bytecode.len() {
-            let i = self.bytecode[self.pc];
+        while self.pc < self.program.bytecode.len() {
+            let i = self.program.bytecode[self.pc];
             self.pc += 1;
 
             match i.op() {
                 // Move operations
                 Opcode::MOV => self.exec_mov(i),
-                Opcode::LOAD => self.exec_load(i),
+                Opcode::CONST => self.exec_const(i),
 
                 // Unary operations
                 Opcode::NOT => self.exec_not(i),
@@ -493,14 +556,24 @@ impl VM {
                 Opcode::JMP_F => self.exec_jump_false(i),
 
                 Opcode::CALL => self.exec_call(i),
-                Opcode::TAIL_CALL => self.exec_tail_call(i)?,
-                Opcode::CALL_NATIVE => self.exec_call_native(i)?,
+                Opcode::CALLT => self.exec_callt(i)?,
+                Opcode::CALLN => self.exec_calln(i)?,
+                Opcode::CALLR => self.exec_callr(i),
+                Opcode::CALLNR => self.exec_callnr(i)?,
                 Opcode::RET => {
                     if let Some(frame) = self.exec_ret()? {
                         return Ok(Some(frame));
                     }
                 }
-                Opcode::SPAWN => self.exec_spawn_task(i),
+
+                Opcode::ALLOC_BUF => self.exec_alloc_buf(i)?,
+                Opcode::ALLOC_DYN => self.exec_alloc_dyn(i)?,
+                Opcode::ALLOC_STR => self.exec_alloc_str(i)?,
+
+                Opcode::LOAD => self.exec_load(i),
+                Opcode::STORE => self.exec_store(i),
+
+                Opcode::SPAWN => self.exec_spawn_task(i)?,
                 Opcode::AWAIT => {
                     if SYNC {
                         return Err(VMError::IllegalAwait);
@@ -518,44 +591,42 @@ impl VM {
         Err(VMError::PCOutOfBounds)
     }
 
-    pub fn execute(&mut self, func_id: u16, args: &[Value]) -> VMResult<&[Value]> {
+    pub fn execute(&mut self, func_id: FunctionId, args: &[Value]) -> VMResult<&[Value]> {
         // Reset VM state before running top level function.
         self.reset();
 
-        let func = &self.functions[func_id as usize];
-        let cinfo = &func.call_info;
+        let call_info = self.program.functions[func_id as usize].call_info;
         let argc = args.len() as u8;
 
-        if cinfo.narg != argc {
+        if call_info.narg != argc {
             return Err(VMError::InvalidArgCount {
-                exp: cinfo.narg,
+                exp: call_info.narg,
                 got: argc,
             });
         }
 
-        self.regs.resize(cinfo.nreg as usize, Value::zero());
-        self.regs[..argc as usize].copy_from_slice(args);
-
+        self.regs.resize(call_info.nreg as usize, Value::zero());
+        self.regs[..args.len()].copy_from_slice(args);
         self.base_reg = 0;
-        self.pc = cinfo.entry_pc;
+        self.pc = call_info.entry_pc;
 
         // Push synthetic frame
         self.call_stack.push(Frame {
             caller_info: None,
-            callee_info: cinfo.clone(),
+            call_info,
         });
 
         match self.run::<true>()? {
+            None => Err(VMError::EmptyCallStack),
             Some(frame) => {
-                let start = self.base_reg + frame.callee_info.ret_reg as usize;
-                let range = start..(start + frame.callee_info.nret as usize);
+                let start = self.base_reg + frame.call_info.ret_reg as usize;
+                let range = start..(start + frame.call_info.nret as usize);
                 Ok(&self.regs[range])
             }
-            None => todo!("handle missing frame"),
         }
     }
 
     fn collect_roots(&self) -> Vec<GCPtr> {
-        self.regs.iter().filter_map(|v| v.try_get()).collect()
+        self.regs.iter().filter_map(try_get_ptr).collect()
     }
 }

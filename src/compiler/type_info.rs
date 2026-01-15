@@ -1,14 +1,20 @@
 use std::rc::Rc;
 
-use crate::arena::{Arena, Ident};
+use ahash::AHashMap;
+
+use crate::{
+    arena::{Arena, Ident},
+    compiler::{ast::DeclId, sema::ConstValue},
+};
 
 slotmap::new_key_type! {
     pub struct TypeId;
 }
 
 #[derive(Debug, Clone)]
-pub enum TypeValue {
+pub enum Type {
     // Primitives
+    Type,
     Int,
     Uint,
     Float,
@@ -16,6 +22,7 @@ pub enum TypeValue {
     Char,
     Str,
     Cstr,
+    Null,
     Void,
     Never,
 
@@ -30,6 +37,7 @@ pub enum TypeValue {
     Struct(StructInfo),
     Union(UnionInfo),
     Enum(EnumInfo),
+    Module(ModuleInfo),
 
     // Functions
     Function { params: Rc<[TypeId]>, ret: TypeId },
@@ -38,38 +46,46 @@ pub enum TypeValue {
     Incomplete,
 }
 
+type Name = Ident;
+
+#[derive(Debug, Clone)]
+pub struct ModuleInfo {
+    pub name: Option<Name>,
+    pub decls: AHashMap<Name, DeclId>,
+}
+
 #[derive(Debug, Clone)]
 pub struct StructInfo {
-    pub name: Ident,
+    pub name: Option<Name>,
     pub fields: Rc<[FieldInfo]>,
 }
 
 #[derive(Debug, Clone)]
 pub struct UnionInfo {
-    pub name: Ident,
+    pub name: Option<Name>,
     pub fields: Rc<[FieldInfo]>,
 }
 
 #[derive(Debug, Clone)]
 pub struct EnumInfo {
-    pub name: Ident,
+    pub name: Option<Name>,
     pub variants: Rc<[VariantInfo]>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FieldInfo {
-    pub name: Ident,
-    pub ty: TypeId,
+    pub name: Name,
+    pub ty: ConstValue,
 }
 
 #[derive(Debug, Clone)]
 pub struct VariantInfo {
-    pub name: Ident,
-    pub value: i64, // resolved discriminant value
+    pub name: Name,
+    pub value: ConstValue, // resolved discriminant value
 }
 
 pub struct TypeArena {
-    types: Arena<TypeId, TypeValue>,
+    types: Arena<TypeId, Type>,
 }
 
 impl TypeArena {
@@ -79,15 +95,15 @@ impl TypeArena {
         }
     }
 
-    pub fn insert(&mut self, ty: TypeValue) -> TypeId {
+    pub fn insert(&mut self, ty: Type) -> TypeId {
         self.types.insert(ty)
     }
 
-    pub fn get(&self, id: TypeId) -> &TypeValue {
+    pub fn get(&self, id: TypeId) -> &Type {
         &self.types[id]
     }
 
-    pub fn get_mut(&mut self, id: TypeId) -> &mut TypeValue {
+    pub fn get_mut(&mut self, id: TypeId) -> &mut Type {
         &mut self.types[id]
     }
 }

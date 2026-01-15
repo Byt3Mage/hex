@@ -1,100 +1,165 @@
-use std::{alloc::Layout, ptr::NonNull};
+use std::{ptr::NonNull, usize};
 
-use crate::vm::{
-    allocator::{Allocator, BumpAllocator},
-    async_runtime::Task,
-    object::*,
-};
+use crate::vm::{async_runtime::Task, memory::*, object::*};
+
+const WHITE0_BIT: u8 = 1 << 0;
+const WHITE1_BIT: u8 = 1 << 1;
+const BLACK_BIT: u8 = 1 << 2;
+const FIXED_BIT: u8 = 1 << 3;
+const WHITE_BITS: u8 = WHITE0_BIT | WHITE1_BIT;
+const MASK_MARKS: u8 = !(BLACK_BIT | WHITE_BITS);
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GCColor {
-    Gray = 0b000,
-    White0 = 0b001,
-    White1 = 0b010,
-    Black = 0b100,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlockType {
+    /// Freed object block, skip during sweep
+    Free = 0,
+    /// Fixed-size buffer for arrays, structs, ...
+    Buffer,
+    /// Dynamically-sized buffer for vectors
+    DynBuffer,
+    /// String data
+    String,
+    /// Async task
+    Task,
 }
 
-impl GCColor {
-    #[inline]
-    pub const fn is_white(self) -> bool {
-        matches!(self, GCColor::White0 | GCColor::White1)
-    }
-
-    #[inline]
-    pub const fn is_black(self) -> bool {
-        matches!(self, GCColor::Black)
-    }
-
-    #[inline]
-    pub const fn is_gray(self) -> bool {
-        matches!(self, GCColor::Gray)
-    }
-
-    #[inline]
-    pub const fn other_white(self) -> GCColor {
-        match self {
-            GCColor::White0 => GCColor::White1,
-            GCColor::White1 => GCColor::White0,
-            _ => panic!("other_white called on non-white color"),
-        }
-    }
-}
-
+#[derive(Clone, Copy)]
 pub struct GCHeader {
-    color: GCColor,
-    obj_type: ObjType,
-    next: Option<GCPtr>,
-    layout: Layout,
+    pub marked: u8,
+    pub tt: BlockType,
+    pub memcat: u8,
+    _pad: [u8; 5],
+    payload: [u8; 0],
 }
 
 impl GCHeader {
+    pub const MIN_BLOCK_SIZE: usize = size_of::<Self>() + size_of::<*mut u8>();
+
+    #[inline]
+    fn payload_ptr(&self) -> *mut u8 {
+        self.payload.as_ptr().cast_mut()
+    }
+
+    /// Check if this block has been freed.
+    /// Freed blocks have type set to Free and should be skipped during sweep.
     #[inline(always)]
-    pub fn ty(&self) -> ObjType {
-        self.obj_type
+    pub fn is_free(&self) -> bool {
+        self.tt == BlockType::Free
+    }
+
+    /// Mark this block as freed.
+    /// Called when returning a block to the page freelist.
+    #[inline(always)]
+    pub fn mark_free(&mut self) {
+        self.tt = BlockType::Free;
+    }
+
+    #[inline]
+    pub unsafe fn freelist_next(&self) -> Option<NonNull<GCHeader>> {
+        unsafe { *self.payload_ptr().cast() }
+    }
+
+    #[inline]
+    pub unsafe fn set_freelist_next(&mut self, next: Option<NonNull<GCHeader>>) {
+        unsafe { *self.payload_ptr().cast() = next };
+    }
+
+    #[inline]
+    pub fn is_white(&self) -> bool {
+        (self.marked & WHITE_BITS) != 0
+    }
+
+    #[inline]
+    pub fn is_black(&self) -> bool {
+        (self.marked & BLACK_BIT) != 0
+    }
+
+    #[inline]
+    pub fn is_gray(&self) -> bool {
+        (self.marked & (WHITE_BITS | BLACK_BIT)) == 0
+    }
+
+    #[inline]
+    pub fn is_fixed(&self) -> bool {
+        (self.marked & FIXED_BIT) != 0
+    }
+
+    #[inline]
+    pub fn set_fixed(&mut self) {
+        self.marked |= FIXED_BIT;
+    }
+
+    #[inline(always)]
+    const fn reset_bit(&mut self, mask: u8) {
+        self.marked &= !mask
+    }
+
+    #[inline(always)]
+    const fn reset_2_bits(&mut self, b1: u8, b2: u8) {
+        self.reset_bit(b1 | b2);
+    }
+
+    const fn white_to_gray(&mut self) {
+        self.reset_bit(WHITE_BITS);
+    }
+
+    const fn black_to_gray(&mut self) {
+        self.reset_bit(BLACK_BIT);
+    }
+
+    const fn string_mark(&mut self) {
+        self.reset_2_bits(WHITE0_BIT, WHITE1_BIT);
     }
 }
 
+const _: () = assert!(std::mem::size_of::<GCHeader>() == 8);
+const _: () = assert!(GCHeader::MIN_BLOCK_SIZE == 16);
+
 #[repr(transparent)]
-#[derive(Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct GCPtr(NonNull<GCHeader>);
 
 impl GCPtr {
     #[inline(always)]
-    pub(super) fn new(ptr: NonNull<u8>) -> Self {
-        Self(ptr.cast())
+    pub fn as_ptr(&self) -> NonNull<GCHeader> {
+        self.0
     }
 
     #[inline(always)]
-    pub(super) fn as_ptr<T>(self) -> NonNull<T> {
-        self.0.cast()
+    fn obj_ptr<T>(&self) -> *mut T {
+        self.hdr().payload_ptr().cast()
     }
 
     #[inline(always)]
-    pub(super) fn hdr(&self) -> &GCHeader {
+    pub fn hdr(&self) -> &GCHeader {
         unsafe { self.0.as_ref() }
     }
 
     #[inline(always)]
-    pub(super) fn hdr_mut(&mut self) -> &mut GCHeader {
+    pub fn hdr_mut(&mut self) -> &mut GCHeader {
         unsafe { self.0.as_mut() }
     }
 
     #[inline(always)]
-    pub(super) fn ty(&self) -> ObjType {
-        self.hdr().ty()
+    pub(super) fn ty(&self) -> BlockType {
+        self.hdr().tt
     }
 
     pub(super) fn as_ref<T>(&self) -> &T {
-        unsafe { self.0.cast().as_ref() }
+        unsafe { &*self.obj_ptr() }
     }
 
     pub(super) fn as_mut<T>(&mut self) -> &mut T {
-        unsafe { self.0.cast().as_mut() }
+        unsafe { &mut *self.obj_ptr() }
     }
 }
 
-const MAX_THRESHOLD: usize = 1024 * 1024;
+const GC_GOAL: usize = 200; // 200% - allow heap to double
+const GC_STEP_MUL: usize = 200; // GC runs at 2x allocation speed
+const GC_STEP_SIZE: usize = 1024; // GC step size in bytes
+const GC_SWEEP_PAGE_STEP_COST: usize = 16;
+const GC_THRESHOLD_DEFAULT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GCState {
@@ -105,390 +170,593 @@ enum GCState {
     Sweep,
 }
 
-impl GCState {
-    #[inline(always)]
-    fn keep_invariant(self) -> bool {
-        matches!(self, Self::Propagate | Self::PropagateAgain | Self::Atomic)
-    }
+const MEM_CATEGORY_COUNT: usize = 256;
+
+pub struct MemCategoryStats {
+    pub bytes: usize,
+    pub objects: usize,
 }
 
-pub struct Heap<A: Allocator = BumpAllocator> {
-    allocator: A,
-    objects: Option<GCPtr>,
+pub struct Heap<A: PageAllocator> {
+    pages: PageManager<A>,
+
+    // Gray lists for marking
     gray: Option<GCPtr>,
     gray_again: Option<GCPtr>,
-    bytes_allocated: usize,
-    gc_threshold: usize,
+
     gc_state: GCState,
-    current_white: GCColor,
+    current_white: u8,
+    sweep_page: Option<PagePtr>,
+
+    gc_threshold: usize,
+
+    memcat_stats: Box<[MemCategoryStats; MEM_CATEGORY_COUNT]>,
 }
 
-impl Heap {
-    pub fn new() -> Self {
+impl<A: PageAllocator> Heap<A> {
+    pub fn new(allocator: A) -> Self {
         Self {
-            allocator: BumpAllocator::new(),
-            objects: None,
+            pages: PageManager::new(allocator),
             gray: None,
             gray_again: None,
-            bytes_allocated: 0,
-            gc_threshold: MAX_THRESHOLD,
             gc_state: GCState::Pause,
-            current_white: GCColor::White0,
+            current_white: WHITE0_BIT,
+            sweep_page: None,
+            gc_threshold: GC_THRESHOLD_DEFAULT,
+            memcat_stats: Box::new(
+                [const {
+                    MemCategoryStats {
+                        bytes: 0,
+                        objects: 0,
+                    }
+                }; MEM_CATEGORY_COUNT],
+            ),
         }
     }
 
     #[inline]
-    pub(super) fn alloc_buffer(&mut self, size: usize) -> GCPtr {
-        let obj_size = size_of::<GCBuffer>() + (size * size_of::<Value>());
-        let layout = Layout::from_size_align(obj_size, align_of::<GCBuffer>()).unwrap();
-
-        unsafe {
-            let ptr = self.allocator.alloc(layout).cast();
-
-            ptr.write(GCBuffer::new(
-                GCHeader {
-                    color: self.current_white,
-                    obj_type: ObjType::Buffer,
-                    next: self.objects,
-                    layout,
-                },
-                size,
-            ));
-
-            let ptr = GCPtr::new(ptr.cast());
-            self.objects = Some(ptr);
-            self.bytes_allocated += size;
-
-            ptr
-        }
+    fn track_alloc(&mut self, memcat: u8, size: usize) {
+        let stats = &mut self.memcat_stats[memcat as usize];
+        stats.bytes += size;
+        stats.objects += 1;
     }
 
     #[inline]
-    pub(super) fn alloc_dyn_buffer(&mut self) -> GCPtr {
-        let layout = Layout::new::<GCDynBuffer>();
-
-        unsafe {
-            let ptr = self.allocator.alloc(layout).cast();
-
-            ptr.write(GCDynBuffer::new(GCHeader {
-                color: self.current_white,
-                obj_type: ObjType::DynBuffer,
-                layout,
-                next: self.objects,
-            }));
-
-            let ptr = GCPtr::new(ptr.cast());
-            self.objects = Some(ptr);
-            self.bytes_allocated += layout.size();
-
-            ptr
-        }
+    fn track_free(&mut self, memcat: u8, size: usize) {
+        let stats = &mut self.memcat_stats[memcat as usize];
+        stats.bytes -= size;
+        stats.objects -= 1;
     }
 
+    pub fn memcat_stats(&self, memcat: u8) -> &MemCategoryStats {
+        &self.memcat_stats[memcat as usize]
+    }
+
+    pub fn alloc_buff(&mut self, len: usize, memcat: u8) -> Option<GCPtr> {
+        let size = GCBuffer::block_size(len);
+        let block = self.pages.alloc(size)?;
+
+        unsafe {
+            block.write(GCHeader {
+                marked: self.current_white,
+                tt: BlockType::Buffer,
+                memcat,
+                _pad: [0; 5],
+                payload: [],
+            });
+
+            let buffer = block.as_ref().payload_ptr().cast::<GCBuffer>();
+            buffer.write(GCBuffer::new(len));
+        }
+
+        self.track_alloc(memcat, size);
+        Some(GCPtr(block))
+    }
+
+    pub fn alloc_dyn_buff(&mut self, memcat: u8) -> Option<GCPtr> {
+        let size = GCDynBuffer::block_size();
+        let block = self.pages.alloc(size)?;
+
+        unsafe {
+            block.write(GCHeader {
+                marked: self.current_white,
+                tt: BlockType::DynBuffer,
+                memcat,
+                _pad: [0; 5],
+                payload: [],
+            });
+
+            let buffer = block.as_ref().payload_ptr().cast::<GCDynBuffer>();
+            buffer.write(GCDynBuffer::new());
+        }
+
+        self.track_alloc(memcat, size);
+        Some(GCPtr(block))
+    }
+
+    pub fn alloc_str(&mut self, memcat: u8) -> Option<GCPtr> {
+        let size = GCString::block_size();
+        let block = self.pages.alloc(size)?;
+
+        unsafe {
+            block.write(GCHeader {
+                marked: self.current_white,
+                tt: BlockType::String,
+                memcat,
+                _pad: [0; 5],
+                payload: [],
+            });
+
+            let string = block.as_ref().payload_ptr().cast::<GCString>();
+            string.write(GCString::new());
+        }
+
+        self.track_alloc(memcat, size);
+        Some(GCPtr(block))
+    }
+
+    pub fn alloc_task(&mut self, task: Task, memcat: u8) -> Option<GCPtr> {
+        let size = GCTask::block_size();
+        let block = self.pages.alloc(size)?;
+
+        unsafe {
+            block.write(GCHeader {
+                marked: self.current_white,
+                tt: BlockType::Task,
+                memcat,
+                _pad: [0; 5],
+                payload: [],
+            });
+
+            let task_ptr = block.as_ref().payload_ptr().cast::<GCTask>();
+            task_ptr.write(GCTask::new(task));
+        }
+
+        self.track_alloc(memcat, size);
+        Some(GCPtr(block))
+    }
+
+    /// Returns the "other" white (dead white from previous cycle)
+    #[inline(always)]
+    const fn other_white(&self) -> u8 {
+        self.current_white ^ WHITE_BITS
+    }
+
+    /// Check if an object is alive (should not be swept)
     #[inline]
-    pub(super) fn alloc_string(&mut self) -> GCPtr {
-        let layout = Layout::new::<GCString>();
-
-        unsafe {
-            let ptr = self.allocator.alloc(layout).cast();
-
-            ptr.write(GCString::new(GCHeader {
-                color: self.current_white,
-                obj_type: ObjType::String,
-                layout,
-                next: self.objects,
-            }));
-
-            let ptr = GCPtr::new(ptr.cast());
-            self.objects = Some(ptr);
-            self.bytes_allocated += layout.size();
-
-            ptr
-        }
+    fn is_alive(&self, hdr: &GCHeader) -> bool {
+        // Fixed objects are always alive
+        // OR
+        // Object is alive if it doesn't have the dead (other) white
+        hdr.is_fixed() || (hdr.marked ^ WHITE_BITS) & self.other_white() != 0
     }
 
-    #[inline]
-    pub(super) fn alloc_task(&mut self, data: Task) -> GCPtr {
-        let layout = Layout::new::<GCTask>();
-
-        unsafe {
-            let ptr = self.allocator.alloc(layout).cast();
-
-            ptr.write(GCTask::new(
-                GCHeader {
-                    color: self.current_white,
-                    obj_type: ObjType::Task,
-                    layout,
-                    next: self.objects,
-                },
-                data,
-            ));
-
-            let ptr = GCPtr::new(ptr.cast());
-            self.objects = Some(ptr);
-            self.bytes_allocated += layout.size();
-
-            ptr
-        }
-    }
-
-    fn mark_roots(&mut self, roots: &[GCPtr]) {
+    fn mark_roots(&mut self, roots: &[Value]) {
         self.gray = None;
         self.gray_again = None;
-        roots.iter().for_each(|&r| self.mark_object(r));
-        self.gc_state = GCState::Propagate;
+
+        for o in roots.iter().filter_map(try_get_ptr) {
+            self.mark_object(o);
+        }
+
+        self.gc_state = GCState::Propagate
     }
 
     fn mark_object(&mut self, mut obj: GCPtr) {
-        let header = obj.hdr_mut();
+        let hdr = obj.hdr_mut();
 
-        if !header.color.is_white() {
+        if !hdr.is_white() {
             return;
         }
 
-        header.color = GCColor::Gray;
+        debug_assert!(self.is_alive(hdr), "attempted to mark dead object");
 
-        match header.obj_type {
-            ObjType::Buffer => {
-                obj.as_mut::<GCBuffer>().gc_list = self.gray;
-                self.gray = Some(obj);
-            }
-            ObjType::DynBuffer => {
-                obj.as_mut::<GCDynBuffer>().gc_list = self.gray;
-                self.gray = Some(obj);
-            }
-            ObjType::Task => todo!("mark task"),
-            ObjType::String => header.color = GCColor::Black,
+        hdr.white_to_gray();
+
+        match hdr.tt {
+            BlockType::Free => unreachable!("attempted to mark freed object"),
+            BlockType::String => hdr.marked |= BLACK_BIT,
+            BlockType::Buffer => obj.as_mut::<GCBuffer>().gc_list = self.gray.replace(obj),
+            BlockType::DynBuffer => obj.as_mut::<GCDynBuffer>().gc_list = self.gray.replace(obj),
+            BlockType::Task => obj.as_mut::<GCTask>().gc_list = self.gray.replace(obj),
         }
     }
 
-    fn propagate_mark(&mut self, mut obj: GCPtr) -> usize {
-        match obj.ty() {
-            ObjType::Buffer => {
+    /// Propagate mark: pop one gray object, mark it black, and mark its children.
+    /// Returns the approximate amount of work done (bytes traversed).
+    /// Returns 0 if there's no work to do.
+    fn propagate_mark(&mut self) -> usize {
+        let Some(mut obj) = self.gray else { return 0 };
+        let hdr = obj.hdr_mut();
+
+        debug_assert!(hdr.is_gray());
+
+        hdr.marked |= BLACK_BIT;
+
+        match hdr.tt {
+            BlockType::String | BlockType::Free => {
+                unreachable!("Non-gray-listable object on gray list")
+            }
+            BlockType::Buffer => {
                 let buff = obj.as_mut::<GCBuffer>();
-                self.gray = buff.gc_list;
+                self.gray = buff.gc_list.take();
+                self.mark_children(buff.as_slice());
+                GCBuffer::block_size(buff.len())
             }
-            ObjType::DynBuffer => {
-                let list = obj.as_mut::<GCDynBuffer>();
-                self.gray = list.gc_list;
+            BlockType::DynBuffer => {
+                let buff = obj.as_mut::<GCDynBuffer>();
+                self.gray = buff.gc_list.take();
+                self.mark_children(buff.get());
+                GCDynBuffer::block_size() + buff.get().len() * size_of::<Value>()
             }
-
-            ObjType::String | ObjType::Task => {
-                unreachable!("non-gray object in gray list")
+            BlockType::Task => {
+                let task = obj.as_mut::<GCTask>();
+                self.gray = task.gc_list.take();
+                self.mark_children(&task.get().registers);
+                GCTask::block_size() + task.get().registers.len() * size_of::<Value>()
             }
         }
-
-        obj.hdr_mut().color = GCColor::Black;
-        self.trace_children(obj);
-        obj.hdr().layout.size()
     }
 
-    fn propagate_all(&mut self) -> usize {
-        let mut work = 0;
-
-        while let Some(obj) = self.gray {
-            work += self.propagate_mark(obj);
+    fn mark_children(&mut self, children: &[Value]) {
+        for o in children.iter().filter_map(try_get_ptr) {
+            self.mark_object(o)
         }
+    }
 
+    /// Run propagation until gray list is empty.
+    /// Returns total work done.
+    pub fn propagate_all(&mut self) -> usize {
+        let mut work = 0;
+        while self.gray.is_some() {
+            work += self.propagate_mark();
+        }
         work
     }
 
-    fn trace_children(&mut self, obj: GCPtr) {
-        match obj.ty() {
-            ObjType::Buffer => {
-                obj.as_ref::<GCBuffer>()
-                    .iter()
-                    .filter_map(|v| v.try_get())
-                    .for_each(|p| self.mark_object(p));
-            }
-            ObjType::DynBuffer => {
-                obj.as_ref::<GCDynBuffer>()
-                    .iter()
-                    .filter_map(|v| v.try_get())
-                    .for_each(|p| self.mark_object(p));
-            }
-            ObjType::Task => todo!("trace task children"),
-            ObjType::String => {}
-        }
-    }
-
-    fn atomic(&mut self, roots: &[GCPtr]) -> usize {
-        let mut work = 0;
-
-        roots.iter().for_each(|&r| self.mark_object(r));
-
-        // TODO: remark upvalues
-        // traverse objects caught by write barrier.
-        work += self.propagate_all();
-
-        // remark gray again
-        std::mem::swap(&mut self.gray, &mut self.gray_again);
-        work += self.propagate_all();
-
-        self.current_white = self.current_white.other_white();
-        self.gc_state = GCState::Sweep;
-
-        work
-    }
-
-    fn sweep(&mut self, limit: usize) -> usize {
-        const SWEEP_COST: usize = 16; // Cost per object swept
-
-        let mut work = 0;
-        let mut prev = None;
-        let mut curr = self.objects;
-
-        while let Some(mut obj) = curr
-            && work < limit
-        {
-            let next = obj.hdr().next;
-            let color = obj.hdr().color;
-
-            if color == self.current_white.other_white() {
-                self.free_object(obj, prev);
-            } else {
-                obj.hdr_mut().color = self.current_white;
-                prev = Some(obj);
-            }
-
-            curr = next;
-            work += SWEEP_COST;
-        }
-
-        if curr.is_none() {
-            self.gc_state = GCState::Pause;
-        }
-
-        work
-    }
-
-    fn free_object(&mut self, obj: GCPtr, prev: Option<GCPtr>) -> usize {
-        match prev {
-            Some(mut prev) => prev.hdr_mut().next = obj.hdr().next,
-            None => self.objects = obj.hdr().next,
-        }
-
-        let layout = obj.hdr().layout;
-        let size = layout.size();
-
-        unsafe {
-            // Safety: The object is cast to the correct type before dropping
-            match obj.ty() {
-                ObjType::Buffer => obj.as_ptr::<GCBuffer>().drop_in_place(),
-                ObjType::DynBuffer => obj.as_ptr::<GCDynBuffer>().drop_in_place(),
-                ObjType::String => obj.as_ptr::<GCString>().drop_in_place(),
-                ObjType::Task => obj.as_ptr::<GCTask>().drop_in_place(),
-            }
-
-            // Safety:
-            // This pointer came from this allocator.
-            // The layout of this memory block is cached in the header.
-            self.allocator.free(obj.as_ptr(), layout);
-        }
-
-        self.bytes_allocated = self.bytes_allocated.saturating_sub(size);
-        size
-    }
-
-    fn step_gc(&mut self, roots: &[GCPtr], limit: usize) -> usize {
+    /// Perform one incremental GC step.
+    /// `limit` is the target amount of work to do in bytes.
+    ///
+    /// Returns the actual work done.
+    pub fn gc_step(&mut self, roots: &[Value], limit: usize) -> usize {
         let mut cost = 0;
 
         match self.gc_state {
-            GCState::Pause => self.mark_roots(roots),
+            GCState::Pause => {
+                self.mark_roots(roots);
+            }
             GCState::Propagate => {
-                while let Some(obj) = self.gray
-                    && cost < limit
-                {
-                    cost += self.propagate_mark(obj)
+                while self.gray.is_some() && cost < limit {
+                    cost += self.propagate_mark();
                 }
 
                 if self.gray.is_none() {
-                    std::mem::swap(&mut self.gray, &mut self.gray_again);
+                    self.gray = self.gray_again.take();
                     self.gc_state = GCState::PropagateAgain;
                 }
             }
             GCState::PropagateAgain => {
-                while let Some(obj) = self.gray
-                    && cost < limit
-                {
-                    cost += self.propagate_mark(obj)
+                while self.gray.is_some() && cost < limit {
+                    cost += self.propagate_mark();
                 }
 
                 if self.gray.is_none() {
                     self.gc_state = GCState::Atomic;
                 }
             }
-            GCState::Atomic => cost = self.atomic(roots),
-            GCState::Sweep => cost = self.sweep(limit),
-        }
-
-        cost
-    }
-
-    /// Forward barrier - marks the child object to maintain invariant
-    /// Used when: black object gets a new white child reference
-    pub fn barrier_forward(&mut self, parent: GCPtr, child: GCPtr) {
-        if self.gc_state.keep_invariant()
-            && parent.hdr().color.is_black()
-            && child.hdr().color.is_white()
-        {
-            self.mark_object(child);
-        }
-    }
-
-    /// Backward barrier - marks parent gray again
-    /// Used for: buffer/dyn_buffer writes during Propagate phase
-    pub fn barrier_back(&mut self, mut parent: GCPtr) {
-        if self.gc_state == GCState::Pause || !parent.hdr().color.is_black() {
-            return;
-        }
-
-        parent.hdr_mut().color = GCColor::Gray;
-
-        match parent.ty() {
-            ObjType::Buffer => {
-                parent.as_mut::<GCBuffer>().gc_list = self.gray_again;
-                self.gray_again = Some(parent);
+            GCState::Atomic => {
+                cost = self.atomic(roots);
             }
-            ObjType::DynBuffer => {
-                parent.as_mut::<GCDynBuffer>().gc_list = self.gray_again;
-                self.gray_again = Some(parent);
+            GCState::Sweep => {
+                while let Some(page_ptr) = self.sweep_page
+                    && cost < limit
+                {
+                    // Page sweep might destroy the page
+                    let next = unsafe { page_ptr.as_ref().pagelist_next() };
+                    let steps = self.sweep_gco_page(page_ptr);
+
+                    self.sweep_page = next;
+                    cost += steps * GC_SWEEP_PAGE_STEP_COST;
+                }
+
+                // Nothing more to sweep?
+                if self.sweep_page.is_none() {
+                    // End collection
+                    self.gc_state = GCState::Pause
+                }
             }
-            ObjType::String => {}
-            ObjType::Task => todo!("task barrier_back"),
         }
+
+        return cost;
     }
 
-    /// Buffer barrier - special handling for PropagateAgain phase
-    /// During PropagateAgain, use forward barrier; otherwise backward
-    pub fn barrier_buffer(&mut self, parent: GCPtr, child: GCPtr) {
-        if self.gc_state == GCState::Pause {
-            return;
+    fn atomic(&mut self, roots: &[Value]) -> usize {
+        let mut work = 0;
+
+        // Re-mark roots, they may have changed during incremental marking
+        for o in roots.iter().filter_map(try_get_ptr) {
+            self.mark_object(o);
         }
 
-        if self.gc_state == GCState::PropagateAgain {
-            self.barrier_forward(parent, child);
-        } else {
-            self.barrier_back(parent);
-        }
-    }
+        // Remark occasional upvalues of possibly dead threads
+        // TODO: work += self.remark_upvals();
 
-    /// Public GC step function - performs incremental GC work
-    /// Returns the amount of work done
-    pub fn gc_step(&mut self, roots: &[GCPtr], limit: usize) -> usize {
-        // Check if we should start a new cycle
-        if self.gc_state == GCState::Pause && self.bytes_allocated > self.gc_threshold {
-            self.step_gc(roots, limit);
-        }
+        // Traverse any new gray objects from re-marking roots
+        work += self.propagate_all();
 
-        // Perform one GC step
-        let work = self.step_gc(roots, limit);
+        // Remark gray again (objects modified by write barriers)
+        self.gray = self.gray_again.take();
+        work += self.propagate_all();
 
-        // Update threshold when cycle completes
-        if self.gc_state == GCState::Pause {
-            self.gc_threshold = (self.bytes_allocated * 2).max(MAX_THRESHOLD);
-        }
+        // Close orphaned live upvalues of dead threads and clear dead upvalues
+        // TODO: work += self.clear_upvals()
+
+        self.current_white = self.other_white();
+        self.sweep_page = self.pages.gco_pages();
+        self.gc_state = GCState::Sweep;
 
         work
+    }
+
+    fn sweep_gco_page(&mut self, page_ptr: PagePtr) -> usize {
+        let page = unsafe { page_ptr.as_ref() };
+        let walk_info = page.walk_info();
+
+        if walk_info.busy_blocks == 0 {
+            return 0;
+        }
+
+        let new_white = self.current_white;
+        let mut count = 0;
+
+        for mut block in page.blocks() {
+            let hdr = unsafe { block.as_mut() };
+
+            // Skip freed blocks
+            if hdr.is_free() {
+                continue;
+            }
+
+            count += 1;
+
+            // Is the object alive?
+            if self.is_alive(hdr) {
+                // Alive: recolor to current white for next cycle
+                hdr.marked = (hdr.marked & MASK_MARKS) | new_white;
+            } else {
+                self.free_object(block, page_ptr)
+            }
+        }
+
+        count
+    }
+
+    /// Free a dead object, dropping any owned resources
+    fn free_object(&mut self, block: NonNull<GCHeader>, page_ptr: PagePtr) {
+        let hdr = unsafe { block.as_ref() };
+        let memcat = hdr.memcat;
+
+        let size = match hdr.tt {
+            BlockType::Free => unreachable!("Attempting to free already freed block"),
+            BlockType::Buffer => {
+                let buff = unsafe { &*(hdr.payload_ptr().cast::<GCBuffer>()) };
+                GCBuffer::block_size(buff.len())
+            }
+            BlockType::DynBuffer => {
+                let obj_ptr = hdr.payload_ptr().cast::<GCDynBuffer>();
+                unsafe { std::ptr::drop_in_place(obj_ptr) };
+                GCDynBuffer::block_size()
+            }
+            BlockType::String => {
+                let obj_ptr = hdr.payload_ptr().cast::<GCString>();
+                unsafe { std::ptr::drop_in_place(obj_ptr) };
+                GCString::block_size()
+            }
+            BlockType::Task => {
+                let obj_ptr = hdr.payload_ptr().cast::<GCTask>();
+                unsafe { std::ptr::drop_in_place(obj_ptr) };
+                GCTask::block_size()
+            }
+        };
+
+        self.track_free(memcat, size);
+        unsafe { self.pages.free(block, page_ptr) };
+    }
+
+    #[inline]
+    fn keep_invariant(&self) -> bool {
+        matches!(
+            self.gc_state,
+            GCState::Propagate | GCState::PropagateAgain | GCState::Atomic
+        )
+    }
+
+    /// Forward barrier: when a black object `parent` receives a reference to white object `child`.
+    /// Either marks the child (during mark phases) or whitens the parent (during sweep).
+    pub fn barrier_forward(&mut self, mut parent: GCPtr, child: GCPtr) {
+        let parent_hdr = parent.hdr_mut();
+        let child_hdr = child.hdr();
+
+        // Only trigger if black -> white
+        if !parent_hdr.is_black() || !child_hdr.is_white() {
+            return;
+        }
+
+        debug_assert!(self.is_alive(parent_hdr) && self.is_alive(child_hdr));
+        debug_assert!(self.gc_state != GCState::Pause);
+
+        if self.keep_invariant() {
+            // Mark child to restore invariant
+            self.mark_object(child);
+        } else {
+            // During sweep: just make parent white to avoid repeated barriers
+            parent_hdr.marked = (parent_hdr.marked & MASK_MARKS) | self.current_white;
+        }
+    }
+
+    /// Backward barrier: when a black object is modified, turn it gray and add to grayagain.
+    /// Used for container objects like buffers.
+    pub fn barrier_back(&mut self, mut obj: GCPtr) {
+        let hdr = obj.hdr_mut();
+
+        if !hdr.is_black() {
+            return;
+        }
+
+        debug_assert!(self.is_alive(hdr));
+        debug_assert!(self.gc_state != GCState::Pause);
+
+        hdr.black_to_gray();
+
+        match hdr.tt {
+            BlockType::Free | BlockType::String => unreachable!("back bariier on non-container"),
+            BlockType::Buffer => obj.as_mut::<GCBuffer>().gc_list = self.gray.replace(obj),
+            BlockType::DynBuffer => obj.as_mut::<GCDynBuffer>().gc_list = self.gray.replace(obj),
+            BlockType::Task => obj.as_mut::<GCTask>().gc_list = self.gray.replace(obj),
+        }
+    }
+
+    /// Check if GC needs to run
+    #[inline]
+    pub fn needs_gc(&self) -> bool {
+        self.pages.total_bytes() >= self.gc_threshold
+    }
+
+    /// Run a GC step if needed. Call this after allocations.
+    /// Returns work done (0 if no GC was needed).
+    pub fn check_gc(&mut self, roots: &[Value]) -> usize {
+        if self.needs_gc() { self.step(roots) } else { 0 }
+    }
+
+    /// Run one GC step.
+    /// Returns work done.
+    pub fn step(&mut self, roots: &[Value]) -> usize {
+        let limit = GC_STEP_SIZE * GC_STEP_MUL / 100;
+        let debt = self.pages.total_bytes().saturating_sub(self.gc_threshold);
+
+        let work = self.gc_step(roots, limit);
+        let actual_step_size = work * 100 / GC_STEP_MUL;
+
+        if self.gc_state == GCState::Pause {
+            // Cycle just finished - set threshold for next cycle
+            let live_bytes = self.pages.total_bytes();
+            let heap_goal = (live_bytes / 100) * GC_GOAL;
+
+            // Start next cycle when we've allocated halfway to the goal
+            self.gc_threshold = live_bytes + (heap_goal - live_bytes) / 2;
+        } else {
+            // Mid-cycle, allow some allocation before next step
+            self.gc_threshold = self.pages.total_bytes() + actual_step_size;
+            self.gc_threshold = self.gc_threshold.saturating_sub(debt);
+        }
+
+        actual_step_size
+    }
+
+    /// Run a full GC cycle (non-incremental).
+    pub fn full_gc(&mut self, roots: &[Value]) {
+        // If in the middle of a cycle, finish it
+        while self.gc_state != GCState::Pause {
+            self.gc_step(roots, usize::MAX);
+        }
+
+        // Run a complete new cycle
+        self.gc_step(roots, usize::MAX);
+
+        while self.gc_state != GCState::Pause {
+            self.gc_step(roots, usize::MAX);
+        }
+
+        // Set threshold based on live size
+        let live_bytes = self.pages.total_bytes();
+        let heap_goal = (live_bytes / 100) * GC_GOAL;
+        self.gc_threshold = live_bytes + (heap_goal - live_bytes) / 2;
+    }
+
+    /// Reset the heap to initial state, freeing all objects.
+    /// The heap can be reused after this call.
+    ///
+    /// **⚠️ Note:** All pointers to any objects in this heap become invalid
+    pub fn reset(&mut self) {
+        let mut sweep_page = self.pages.gco_pages();
+
+        while let Some(page_ptr) = sweep_page {
+            let page = unsafe { page_ptr.as_ref() };
+
+            sweep_page = page.pagelist_next();
+
+            for block in page.blocks() {
+                let hdr = unsafe { block.as_ref() };
+
+                if hdr.is_free() {
+                    continue;
+                }
+
+                match hdr.tt {
+                    BlockType::Free | BlockType::Buffer => {}
+                    BlockType::DynBuffer => {
+                        let obj_ptr = hdr.payload_ptr().cast::<GCDynBuffer>();
+                        unsafe { std::ptr::drop_in_place(obj_ptr) };
+                    }
+                    BlockType::String => {
+                        let obj_ptr = hdr.payload_ptr().cast::<GCString>();
+                        unsafe { std::ptr::drop_in_place(obj_ptr) };
+                    }
+                    BlockType::Task => {
+                        let obj_ptr = hdr.payload_ptr().cast::<GCTask>();
+                        unsafe { std::ptr::drop_in_place(obj_ptr) };
+                    }
+                }
+            }
+        }
+
+        self.pages.reset();
+        self.gray = None;
+        self.gray_again = None;
+        self.gc_state = GCState::Pause;
+        self.current_white = WHITE0_BIT;
+        self.sweep_page = None;
+        self.gc_threshold = GC_THRESHOLD_DEFAULT;
+
+        for stats in self.memcat_stats.iter_mut() {
+            stats.bytes = 0;
+            stats.objects = 0;
+        }
+    }
+}
+
+// In heap.rs
+
+impl<A: PageAllocator> Drop for Heap<A> {
+    fn drop(&mut self) {
+        let mut page_opt = self.pages.gco_pages();
+        while let Some(page_ptr) = page_opt {
+            let page = unsafe { page_ptr.as_ref() };
+            page_opt = page.pagelist_next();
+
+            for block in page.blocks() {
+                let hdr = unsafe { block.as_ref() };
+
+                if hdr.is_free() {
+                    continue;
+                }
+
+                match hdr.tt {
+                    BlockType::Free | BlockType::Buffer => {}
+                    BlockType::DynBuffer => {
+                        let obj_ptr = hdr.payload_ptr().cast::<GCDynBuffer>();
+                        unsafe { std::ptr::drop_in_place(obj_ptr) };
+                    }
+                    BlockType::String => {
+                        let obj_ptr = hdr.payload_ptr().cast::<GCString>();
+                        unsafe { std::ptr::drop_in_place(obj_ptr) };
+                    }
+                    BlockType::Task => {
+                        let obj_ptr = hdr.payload_ptr().cast::<GCTask>();
+                        unsafe { std::ptr::drop_in_place(obj_ptr) };
+                    }
+                }
+            }
+        }
     }
 }

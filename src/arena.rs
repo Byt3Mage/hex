@@ -7,22 +7,22 @@ pub type Arena<K, T> = SlotMap<K, T>;
 
 pub struct Interner {
     interner: StringInterner<StringBackend<StrSymbol>>,
-    anon_name: Ident,
+    infer_name: Ident,
 }
 
 impl Interner {
     pub fn new() -> Self {
         let mut interner = StringInterner::new();
-        let anon_name = interner.get_or_intern_static("<anon>");
+        let infer_name = interner.get_or_intern_static("_");
 
         Self {
             interner,
-            anon_name,
+            infer_name,
         }
     }
 
-    pub fn anon_name(&self) -> Ident {
-        self.anon_name
+    pub fn infer_name(&self) -> Ident {
+        self.infer_name
     }
 
     pub fn resolve(&self, symbol: StrSymbol) -> Option<&str> {

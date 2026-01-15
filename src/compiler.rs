@@ -1,48 +1,44 @@
+use crate::compiler::{ast::ExprKind, name_resolver::NameResolver};
+
 mod ast;
+mod ast_op;
 mod lexer;
 mod name_resolver;
 mod parse_rules;
 mod parser;
+mod sema;
+mod sema_error;
 mod tokens;
-mod type_checker;
-mod type_error;
 mod type_info;
-
-#[cfg(test)]
-use crate::{
-    arena::Interner,
-    compiler::{ast::AstArena, lexer::Lexer, parser::Parser},
-};
 
 #[test]
 fn test_all() {
+    use crate::{
+        arena::Interner,
+        compiler::{ast::AstArena, lexer::Lexer, parser::Parser},
+    };
+
     let source = r#"
-        struct Point {
-            x: float,
-            y: float,
-            debug: str,
-        }
+        const Point = struct {
+            x: flt,
+            ptr: @mut Point,
+        };
 
-        fn add(var a: int, var b: int, c: float) -> int {
-            a += 5;
-
-            loop {
-                if (a % 2) == 0 {
-                    b += 6;
-                }
-
-                if (b % 7) == 0 {
-                    break;
-                }
-            }
-
-            a + b + c
-        }
+        const Alias = Point;
     "#;
 
+    let mut lexer = Lexer::new(source);
     let mut interner = Interner::new();
     let mut ast = AstArena::new();
-    let mut lexer = Lexer::new(source);
     let mut parser = Parser::new(&mut lexer, &mut interner, &mut ast).unwrap();
     let module = parser.parse_source().unwrap();
+    let resolver = NameResolver::new(&ast, &interner);
+
+    if let ExprKind::ModuleType(decls) = &ast.exprs[module].kind {
+        let (_, errors) = resolver.resolve(module, decls);
+
+        for error in errors {
+            println!("Resolve Error: {error:?}")
+        }
+    }
 }

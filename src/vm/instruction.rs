@@ -1,3 +1,5 @@
+use crate::vm::program::FunctionId;
+
 macro_rules! define_opcodes {
     ($($name:ident = $value:expr),* $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,12 +21,13 @@ macro_rules! define_opcodes {
 define_opcodes! {
     // Move between registers
     MOV = 0,
-    // Load from value in constants table
-    LOAD = 1,
+
+    // Get value from constants table
+    CONST = 1,
 
     //Unary operations
-    NOT  = 3,
-    INEG = 4,
+    NOT  = 2,
+    INEG = 3,
     FNEG = 5,
 
     // Integer arithmetic
@@ -65,28 +68,33 @@ define_opcodes! {
     FGE = 40,
 
     // Jumps
-    JMP      = 50,  // Unconditional jump
-    JMP_T    = 51,  // Conditional: jump if rA is true
+    JMP   = 50,  // Unconditional jump
+    JMP_T = 51,  // Conditional: jump if rA is true
     JMP_F = 52,  // Conditional: jump if rA is false
 
     // Call and return
-    RET         = 60,
-    CALL        = 61,
-    TAIL_CALL   = 62,
-    CALL_NATIVE = 63,
+    RET    = 60,
+    CALL   = 61,
+    CALLT  = 62,
+    CALLN  = 63,
+    // CALL/CALLN (register)
+    CALLR  = 64,
+    CALLNR = 65,
 
-    // Heap
-    ALLOC   = 70,
-    PTR_GET = 71,
-    PTR_SET = 72,
-    PTR_GET_IMM = 73,
-    PTR_SET_IMM = 74,
+    // Heap allocations
+    ALLOC_BUF = 70,
+    ALLOC_DYN = 71,
+    ALLOC_STR = 72,
+
+    // Heap operations
+    LOAD  = 73,
+    STORE = 74,
 
     SPAWN = 80,
     AWAIT = 81,
 
     // End program
-    HALT = 255,
+    HALT = 82,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -126,6 +134,16 @@ impl Instruction {
     }
 
     #[inline(always)]
+    pub const fn bx_u64(self) -> u64 {
+        self.bx() as u64
+    }
+
+    #[inline(always)]
+    pub const fn bx_i64(self) -> i64 {
+        self.bx() as i16 as i64
+    }
+
+    #[inline(always)]
     pub const fn encode_abx(Opcode(op): Opcode, a: u8, bx: u16) -> Self {
         Instruction((op as u32) | ((a as u32) << 8) | ((bx as u32) << 16))
     }
@@ -138,24 +156,8 @@ impl Instruction {
 
     #[inline(always)]
     pub const fn encode_ax(Opcode(op): Opcode, ax: u32) -> Self {
-        debug_assert!(ax <= 0xFFFFFF, "Ax field must fit in 24 bits");
+        debug_assert!(ax <= 0xFFFFFF, "ax field must fit in 24 bits");
         Instruction((op as u32) | (ax << 8))
-    }
-
-    // --- ABi16 Format ---
-    #[inline(always)]
-    pub const fn imm_u16(self) -> u64 {
-        ((self.0 >> 16) & 0xFFFF) as u16 as u64
-    }
-
-    #[inline(always)]
-    pub const fn imm_i16(self) -> i64 {
-        self.imm_u16() as i16 as i64
-    }
-
-    #[inline(always)]
-    pub const fn encode_imm(Opcode(op): Opcode, a: u8, imm: u16) -> Self {
-        Instruction((op as u32) | ((a as u32) << 8) | ((imm as u32) << 16))
     }
 }
 
@@ -165,8 +167,8 @@ pub const fn mov(r_dst: u8, r_src: u8) -> Instruction {
 }
 
 #[inline(always)]
-pub const fn load(r_dst: u8, idx: u16) -> Instruction {
-    Instruction::encode_abx(Opcode::LOAD, r_dst, idx)
+pub const fn konst(r_dst: u8, idx: u16) -> Instruction {
+    Instruction::encode_abx(Opcode::CONST, r_dst, idx)
 }
 
 // Unary ops
@@ -214,27 +216,27 @@ pub fn irem(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
 // Immediate integer arithmetic
 #[inline(always)]
 pub fn iadd_imm(r_dst: u8, imm: i16) -> Instruction {
-    Instruction::encode_imm(Opcode::IADD_IMM, r_dst, imm as u16)
+    Instruction::encode_abx(Opcode::IADD_IMM, r_dst, imm as u16)
 }
 
 #[inline(always)]
 pub fn isub_imm(r_dst: u8, imm: i16) -> Instruction {
-    Instruction::encode_imm(Opcode::ISUB_IMM, r_dst, imm as u16)
+    Instruction::encode_abx(Opcode::ISUB_IMM, r_dst, imm as u16)
 }
 
 #[inline(always)]
 pub fn imul_imm(r_dst: u8, imm: i16) -> Instruction {
-    Instruction::encode_imm(Opcode::IMUL_IMM, r_dst, imm as u16)
+    Instruction::encode_abx(Opcode::IMUL_IMM, r_dst, imm as u16)
 }
 
 #[inline(always)]
 pub fn idiv_imm(r_dst: u8, imm: i16) -> Instruction {
-    Instruction::encode_imm(Opcode::IDIV_IMM, r_dst, imm as u16)
+    Instruction::encode_abx(Opcode::IDIV_IMM, r_dst, imm as u16)
 }
 
 #[inline(always)]
 pub fn irem_imm(r_dst: u8, imm: i16) -> Instruction {
-    Instruction::encode_imm(Opcode::IREM_IMM, r_dst, imm as u16)
+    Instruction::encode_abx(Opcode::IREM_IMM, r_dst, imm as u16)
 }
 
 // Integer comparisons
@@ -348,44 +350,53 @@ pub fn ret() -> Instruction {
 }
 
 #[inline(always)]
-pub fn call(r_ret: u8, func: u16) -> Instruction {
+pub fn call(r_ret: u8, func: FunctionId) -> Instruction {
     Instruction::encode_abx(Opcode::CALL, r_ret, func)
 }
 
 #[inline(always)]
-pub fn tail_call(func: u32) -> Instruction {
-    Instruction::encode_ax(Opcode::TAIL_CALL, func)
+pub fn callr(r_ret: u8, r_func: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::CALLR, r_ret, r_func, 0)
 }
 
 #[inline(always)]
-pub fn call_native(r_ret: u8, func: u16) -> Instruction {
-    Instruction::encode_abx(Opcode::CALL_NATIVE, r_ret, func)
-}
-
-// Heap access
-#[inline(always)]
-pub fn alloc(r_dst: u8, r_tid: u8, r_len: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::ALLOC, r_dst, r_tid, r_len)
+pub fn calln(r_ret: u8, func: FunctionId) -> Instruction {
+    Instruction::encode_abx(Opcode::CALLN, r_ret, func)
 }
 
 #[inline(always)]
-pub fn ptr_get(r_dst: u8, r_ptr: u8, r_off: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::PTR_GET, r_dst, r_ptr, r_off)
+pub fn callnr(r_ret: u8, func: FunctionId) -> Instruction {
+    Instruction::encode_abx(Opcode::CALLN, r_ret, func)
 }
 
 #[inline(always)]
-pub fn ptr_set(r_ptr: u8, r_off: u8, r_src: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::PTR_SET, r_ptr, r_off, r_src)
+pub fn tcall(r_ret: u8, func: FunctionId) -> Instruction {
+    Instruction::encode_abx(Opcode::CALLT, r_ret, func)
 }
 
 #[inline(always)]
-pub fn ptr_get_imm(r_dst: u8, r_ptr: u8, off: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::PTR_GET_IMM, r_dst, r_ptr, off)
+pub const fn alloc_buf(r_dst: u8, r_len: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::ALLOC_BUF, r_dst, r_len, 0)
 }
 
 #[inline(always)]
-pub fn ptr_set_imm(r_ptr: u8, off: u8, r_src: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::PTR_SET_IMM, r_ptr, off, r_src)
+pub const fn alloc_dyn(r_dst: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::ALLOC_DYN, r_dst, 0, 0)
+}
+
+#[inline(always)]
+pub const fn alloc_str(r_dst: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::ALLOC_STR, r_dst, 0, 0)
+}
+
+#[inline(always)]
+pub const fn load(r_dst: u8, r_ptr: u8, r_off: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::LOAD, r_dst, r_ptr, r_off)
+}
+
+#[inline(always)]
+pub const fn store(r_ptr: u8, r_off: u8, r_src: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::STORE, r_ptr, r_off, r_src)
 }
 
 // End program

@@ -1,9 +1,9 @@
-use std::{fmt::Debug, slice::Iter};
+use std::slice::Iter;
 
 use crate::vm::{
     Task,
     heap::{GCHeader, GCPtr},
-    object::private::Sealed,
+    program::FunctionId,
 };
 
 macro_rules! value {
@@ -11,6 +11,8 @@ macro_rules! value {
         mod private {
             pub trait Sealed {}
         }
+
+        use self::private::Sealed;
 
         pub trait AsValue: Sealed + Sized {
             const TYPE: ValueType;
@@ -59,6 +61,11 @@ macro_rules! value {
             pub fn set(&mut self, v: impl AsValue) {
                 *self = v.into_value();
             }
+
+            #[inline(always)]
+            pub fn ty(&self) -> ValueType {
+                self.ty
+            }
         }
 
         $(
@@ -91,25 +98,22 @@ value! {
     Uint: u64,
     Bool: bool,
     Float: f64,
+    Func: FunctionId,
     // Niche values that can live in a single register
     OptPtr: Option<GCPtr>,
     OptBool: Option<bool>,
 }
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ObjType {
-    /// Used to indicate that the object block is free
-    //Null,
-    Buffer,
-    DynBuffer,
-    String,
-    Task,
+pub fn try_get_ptr(value: &Value) -> Option<GCPtr> {
+    match value.ty {
+        ValueType::Ptr => Some(value.get::<GCPtr>()),
+        ValueType::OptPtr => value.get::<Option<GCPtr>>(),
+        _ => None,
+    }
 }
 
 #[repr(C)]
 pub struct GCBuffer {
-    header: GCHeader,
     pub gc_list: Option<GCPtr>,
     size: usize,
     data: [Value; 0],
@@ -118,13 +122,16 @@ pub struct GCBuffer {
 impl GCBuffer {
     const _ASSERT: () = assert!(align_of::<Self>() == align_of::<Value>());
 
-    pub fn new(header: GCHeader, size: usize) -> Self {
+    pub fn new(size: usize) -> Self {
         Self {
-            header,
             gc_list: None,
             size,
             data: [],
         }
+    }
+
+    pub fn block_size(len: usize) -> usize {
+        size_of::<GCHeader>() + size_of::<Self>() + (len * size_of::<Value>())
     }
 
     #[inline(always)]
@@ -150,19 +157,27 @@ impl GCBuffer {
     pub fn iter(&'_ self) -> Iter<'_, Value> {
         self.as_slice().iter()
     }
+
+    #[inline(always)]
+    pub fn get(&self, offset: usize) -> Value {
+        unsafe { *self.data().add(offset) }
+    }
+
+    #[inline(always)]
+    pub fn set(&mut self, offset: usize, value: Value) {
+        unsafe { *self.data().add(offset) = value }
+    }
 }
 
 #[repr(C)]
 pub(super) struct GCDynBuffer {
-    header: GCHeader,
     pub gc_list: Option<GCPtr>,
     data: Vec<Value>,
 }
 
 impl GCDynBuffer {
-    pub fn new(header: GCHeader) -> Self {
+    pub fn new() -> Self {
         Self {
-            header,
             gc_list: None,
             data: vec![],
         }
@@ -182,18 +197,20 @@ impl GCDynBuffer {
     pub fn iter(&self) -> Iter<'_, Value> {
         self.data.iter()
     }
+
+    pub fn block_size() -> usize {
+        size_of::<GCHeader>() + size_of::<Self>()
+    }
 }
 
 #[repr(C)]
 pub(super) struct GCString {
-    header: GCHeader,
     data: String,
 }
 
 impl GCString {
-    pub fn new(header: GCHeader) -> Self {
+    pub fn new() -> Self {
         Self {
-            header,
             data: String::new(),
         }
     }
@@ -207,17 +224,24 @@ impl GCString {
     pub(super) fn get_mut(&mut self) -> &mut String {
         &mut self.data
     }
+
+    pub fn block_size() -> usize {
+        size_of::<GCHeader>() + size_of::<Self>()
+    }
 }
 
 #[repr(C)]
 pub(super) struct GCTask {
-    pub(super) header: GCHeader,
-    pub(super) data: Task,
+    pub gc_list: Option<GCPtr>,
+    data: Task,
 }
 
 impl GCTask {
-    pub fn new(header: GCHeader, data: Task) -> Self {
-        Self { header, data }
+    pub fn new(data: Task) -> Self {
+        Self {
+            gc_list: None,
+            data,
+        }
     }
 
     #[inline(always)]
@@ -228,5 +252,9 @@ impl GCTask {
     #[inline(always)]
     pub(super) fn get_mut(&mut self) -> &mut Task {
         &mut self.data
+    }
+
+    pub fn block_size() -> usize {
+        size_of::<GCHeader>() + size_of::<Self>()
     }
 }

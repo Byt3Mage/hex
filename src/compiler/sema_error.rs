@@ -1,33 +1,10 @@
-use crate::{
-    arena::Ident,
-    compiler::{tokens::Span, type_info::TypeId},
-};
+use crate::{arena::Ident, compiler::tokens::Span, compiler::type_info::TypeId};
 
 #[derive(Debug, Clone)]
-pub enum TypeError {
+pub enum SemaError {
     TypeMismatch {
-        expected: TypeId,
-        found: TypeId,
-        span: Span,
-    },
-    UndefinedType {
-        name: Ident,
-        span: Span,
-    },
-    NotAType {
-        span: Span,
-    },
-    NotAStruct {
-        ty: TypeId,
-        span: Span,
-    },
-    NotAUnion {
-        ty: TypeId,
-        span: Span,
-    },
-    WrongNumberOfTypeArgs {
-        expected: usize,
-        found: usize,
+        exp: TypeId,
+        got: TypeId,
         span: Span,
     },
     InvalidArrayLength {
@@ -48,25 +25,11 @@ pub enum TypeError {
         first_def: Span,
         dupe_def: Span,
     },
-    SelfOutsideImpl {
-        span: Span,
-    },
     CannotInfer {
         span: Span,
     },
-    GenericParamWithArgs {
-        span: Span,
-    },
-    NotAModule {
-        span: Span,
-    },
-    TypeArgsOnModule {
-        span: Span,
-    },
-    TypeArgsOnConst {
-        span: Span,
-    },
-    NotConstExpr {
+
+    NotDeclScope {
         span: Span,
     },
     InvalidConstOp {
@@ -83,11 +46,24 @@ pub enum TypeError {
     NotImplemented {
         span: Span,
     },
-    UndefinedVariable {
+    Undefined {
+        name: Ident,
+        span: Span,
+    },
+    CycleDetected {
+        name: Ident,
+        span: Span,
+    },
+    InvalidAssignment {
         name: Ident,
         span: Span,
     },
     TypeUsedAsValue {
+        span: Span,
+    },
+    ItemNotFound {
+        module: TypeId,
+        item_name: Ident,
         span: Span,
     },
 }

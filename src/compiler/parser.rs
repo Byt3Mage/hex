@@ -1,10 +1,8 @@
 use simple_ternary::tnr;
 
 use super::{
-    ast::{
-        AssignOp, AstArena, BinaryOp, Expr, ExprKind, Item, ItemKind, Param,
-        Stmt, StmtKind, UnaryOp,
-    },
+    ast::{AstArena, Expr, ExprKind, Param, Stmt, StmtKind},
+    ast_op::{AssignOp, BinaryOp, UnaryOp},
     lexer::{LexError, Lexer},
     parse_rules::{InfixRule, ParseRule, Precedence, PrefixRule},
     tokens::{Span, Token, TokenType},
@@ -12,7 +10,7 @@ use super::{
 
 use crate::{
     arena::Interner,
-    compiler::ast::{ItemId, Pattern, Visibility},
+    compiler::ast::{AstField, AstVariant, Decl, DeclKind, ExprId, Pattern, Visibility},
     tt,
 };
 
@@ -91,81 +89,52 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub fn parse_source(&mut self) -> ParseResult<ItemId> {
+    pub fn parse_source(&mut self) -> ParseResult<ExprId> {
         let mut items = vec![];
 
         while !self.check(tt![eof]) {
-            let item = self.parse_item()?;
-            items.push(self.ast.items.insert(item));
+            let decl = self.parse_decl()?;
+            items.push(self.ast.decls.insert(decl));
         }
 
-        let item = Item {
-            vis: Visibility::Public,
-            name: self.interner.get_or_intern_static("<package>"),
-            kind: ItemKind::Module { decls: items },
+        let module = Expr {
+            kind: ExprKind::ModuleType(items),
             span: Span::default().merge(self.current.span),
         };
 
-        Ok(self.ast.items.insert(item))
+        Ok(self.ast.exprs.insert(module))
     }
 
-    fn parse_item(&mut self) -> ParseResult<Item> {
+    fn parse_decl(&mut self) -> ParseResult<Decl> {
         let is_pub = self.advance_if(tt![pub])?;
         let vis = tnr! { is_pub => Visibility::Public : Visibility::Private};
 
         match self.current.ty {
-            tt![mod] => self.parse_module(vis),
             tt![fn] => self.parse_function(vis),
-            tt![struct] => self.parse_struct(vis),
-            tt![type] => todo!("parse_type_alias(vis)"),
+            tt![const] => self.parse_const(vis),
             tt => Err(ParseError {
-                msg: format!("Expected item, found {tt:?}"),
+                msg: format!("Expected 'const' or 'fn', found {tt:?}"),
                 span: self.current.span,
             }),
         }
     }
 
-    fn parse_module(&mut self, vis: Visibility) -> ParseResult<Item> {
-        let mod_token = self.expect(tt![mod])?;
-        let name = self.expect(tt![ident])?;
-        self.expect(tt!['{'])?;
-
-        let mut items = vec![];
-
-        while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
-            let item = self.parse_item()?;
-            items.push(self.ast.items.insert(item));
-        }
-
-        let r_brace = self.expect(tt!['}'])?;
-
-        Ok(Item {
-            vis,
-            name: self.interner.get_or_intern(name.lexeme),
-            kind: ItemKind::Module { decls: items },
-            span: mod_token.span.merge(r_brace.span),
-        })
-    }
-
-    fn parse_function(&mut self, is_pub: bool) -> ParseResult<Item> {
+    fn parse_function(&mut self, visibility: Visibility) -> ParseResult<Decl> {
         let fn_token = self.expect(tt![fn])?;
         let func_name = self.expect(tt![ident])?;
 
-        le
         self.expect(tt!['('])?;
-
-        let mut generics
 
         let mut params = vec![];
         while !matches!(self.current.ty, tt![')'] | tt![eof]) {
             let pattern = self.parse_pattern()?;
             self.expect(tt![:])?;
-            let ty = self.parse_type()?;
+            let ty = self.parse_expr()?;
 
             params.push(Param {
                 span: pattern.span.merge(ty.span),
                 pattern: self.ast.patterns.insert(pattern),
-                ty: self.ast.types.insert(ty),
+                ty: self.ast.exprs.insert(ty),
             });
 
             if !self.advance_if(tt![,])? {
@@ -173,58 +142,92 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let r_paren = self.expect(tt![')'])?;
+        self.expect(tt![')'])?;
 
         let ret = if self.advance_if(tt![->])? {
-            self.parse_type()?
+            let ret = self.parse_expr()?;
+            Some(self.ast.exprs.insert(ret))
         } else {
-            Type {
-                kind: TypeKind::Void,
-                span: r_paren.span,
-            }
+            None
         };
 
         let body = self.parse_block()?;
 
-        Ok(Item {
-            vis,
+        Ok(Decl {
+            visibility,
             name: self.interner.get_or_intern(func_name.lexeme),
             span: fn_token.span.merge(body.span),
-            kind: ItemKind::Function {
+            kind: DeclKind::Function {
                 params,
-                ret: self.ast.types.insert(ret),
+                ret,
                 body: self.ast.exprs.insert(body),
             },
         })
     }
 
-    fn parse_struct(&mut self, is_pub: bool) -> ParseResult<Item> {
-        let struct_token = self.expect(tt![struct])?;
-        let struct_name = self.expect(tt![ident])?;
+    fn parse_const(&mut self, visibility: Visibility) -> ParseResult<Decl> {
+        let const_token = self.expect(tt![const])?;
+        let const_name = self.expect(tt![ident])?;
 
-        if self.check(tt![;]) {
-            let semi = self.consume()?;
+        let ty = if self.advance_if(tt![:])? {
+            let ty = self.parse_expr()?;
+            Some(self.ast.exprs.insert(ty))
+        } else {
+            None
+        };
 
-            return Ok(Item {
-                is_pub,
-                name: self.interner.get_or_intern(struct_name.lexeme),
-                kind: ItemKind::DataType { fields: vec![] },
-                span: struct_token.span.merge(semi.span),
-            });
+        self.expect(tt![=])?;
+
+        let value = self.parse_expr()?;
+        let semi = self.expect(tt![;])?;
+
+        Ok(Decl {
+            visibility,
+            name: self.interner.get_or_intern(const_name.lexeme),
+            kind: DeclKind::Const {
+                ty,
+                value: self.ast.exprs.insert(value),
+            },
+            span: const_token.span.merge(semi.span),
+        })
+    }
+
+    fn parse_module_type(&mut self) -> ParseResult<Expr> {
+        let mod_token = self.expect(tt![mod])?;
+        self.expect(tt!['{'])?;
+
+        let mut items = vec![];
+
+        while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
+            let item = self.parse_decl()?;
+            items.push(self.ast.decls.insert(item));
         }
+
+        let r_brace = self.expect(tt!['}'])?;
+
+        Ok(Expr {
+            kind: ExprKind::ModuleType(items),
+            span: mod_token.span.merge(r_brace.span),
+        })
+    }
+
+    fn parse_struct_type(&mut self) -> ParseResult<Expr> {
+        let struct_token = self.expect(tt![struct])?;
 
         self.expect(tt!['{'])?;
 
         let mut fields = vec![];
         while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
-            let name = self.expect(tt![ident])?;
+            let vis = tnr! {self.advance_if(tt![pub])? => Visibility::Public : Visibility::Private};
+            let field_name = self.expect(tt![ident])?;
             self.expect(tt![:])?;
-            let ty = self.parse_type()?;
+            let field_ty = self.parse_expr()?;
 
-            fields.push(NamedField {
-                span: name.span.merge(ty.span),
-                name: self.interner.get_or_intern(name.lexeme),
-                ty: self.ast.types.insert(ty),
+            fields.push(AstField {
+                visibility: vis,
+                span: field_name.span.merge(field_ty.span),
+                name: self.interner.get_or_intern(field_name.lexeme),
+                ty: self.ast.exprs.insert(field_ty),
             });
 
             if !self.advance_if(tt![,])? {
@@ -234,11 +237,86 @@ impl<'a> Parser<'a> {
 
         let r_brace = self.expect(tt!['}'])?;
 
-        Ok(Item {
-            is_pub,
-            name: self.interner.get_or_intern(struct_name.lexeme),
-            kind: ItemKind::DataType { fields },
+        Ok(Expr {
+            kind: ExprKind::StructType(fields),
             span: struct_token.span.merge(r_brace.span),
+        })
+    }
+
+    fn parse_union_type(&mut self) -> ParseResult<Expr> {
+        let union_token = self.expect(tt![union])?;
+
+        self.expect(tt!['{'])?;
+
+        let mut fields = vec![];
+        while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
+            let vis = tnr! {self.advance_if(tt![pub])? => Visibility::Public : Visibility::Private};
+            let field_name = self.expect(tt![ident])?;
+            self.expect(tt![:])?;
+            let field_ty = self.parse_expr()?;
+
+            fields.push(AstField {
+                visibility: vis,
+                span: field_name.span.merge(field_ty.span),
+                name: self.interner.get_or_intern(field_name.lexeme),
+                ty: self.ast.exprs.insert(field_ty),
+            });
+
+            if !self.advance_if(tt![,])? {
+                break;
+            }
+        }
+
+        let r_brace = self.expect(tt!['}'])?;
+
+        Ok(Expr {
+            kind: ExprKind::UnionType(fields),
+            span: union_token.span.merge(r_brace.span),
+        })
+    }
+
+    fn parse_enum_type(&mut self) -> ParseResult<Expr> {
+        let enum_token = self.expect(tt![enum])?;
+
+        self.expect(tt!['{'])?;
+
+        let mut variants = vec![];
+        while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
+            let variant_name = self.expect(tt![ident])?;
+            let mut span = variant_name.span;
+            let value = if self.advance_if(tt![=])? {
+                let val = self.parse_expr()?;
+                span = span.merge(val.span);
+                Some(self.ast.exprs.insert(val))
+            } else {
+                None
+            };
+
+            variants.push(AstVariant {
+                name: self.interner.get_or_intern(variant_name.lexeme),
+                value,
+                span,
+            });
+
+            if !self.advance_if(tt![,])? {
+                break;
+            }
+        }
+
+        let r_brace = self.expect(tt!['}'])?;
+
+        Ok(Expr {
+            kind: ExprKind::EnumType(variants),
+            span: enum_token.span.merge(r_brace.span),
+        })
+    }
+
+    fn parse_semi(&mut self) -> ParseResult<Stmt> {
+        let semi_token = self.expect(tt![;])?;
+
+        Ok(Stmt {
+            kind: StmtKind::Empty,
+            span: semi_token.span,
         })
     }
 
@@ -246,132 +324,35 @@ impl<'a> Parser<'a> {
         todo!("parse pattern")
     }
 
-    fn parse_semi(&mut self) -> ParseResult<Stmt> {
-        let semi_token = self.expect(tt![;])?;
-
-        Ok(Stmt {
-            kind: StmtKind::Semi,
-            span: semi_token.span,
-        })
-    }
-
-    fn parse_var_decl(&mut self, is_mut: bool) -> ParseResult<Stmt> {
-        let val_token = if is_mut {
-            self.expect(tt![var])?
-        } else {
-            self.expect(tt![val])?
-        };
-
-        let val_name = self.expect(tt![ident])?;
-
-        let ty = if self.advance_if(tt![:])? {
-            Some(self.parse_type()?)
-        } else {
-            None
-        };
+    fn parse_let(&mut self) -> ParseResult<Stmt> {
+        let pat = self.parse_pattern()?;
+        let ty = tnr! {self.advance_if(tt![:])? => Some(self.parse_expr()?) : None};
 
         self.expect(tt![=])?;
 
-        let val = self.parse_expr()?;
+        let value = self.parse_expr()?;
         let semi_token = self.expect(tt![;])?;
 
         Ok(Stmt {
-            kind: StmtKind::VarDecl {
-                mutable: is_mut,
-                name: self.interner.get_or_intern(val_name.lexeme),
-                ty: ty.map(|t| self.ast.types.insert(t)),
-                val: self.ast.exprs.insert(val),
+            span: pat.span.merge(semi_token.span),
+            kind: StmtKind::Let {
+                pattern: self.ast.patterns.insert(pat),
+                ty: ty.map(|t| self.ast.exprs.insert(t)),
+                value: self.ast.exprs.insert(value),
             },
-            span: val_token.span.merge(semi_token.span),
         })
     }
 
-    fn parse_type(&mut self) -> ParseResult<Type> {
-        let type_token = self.consume()?;
-        let mut span = type_token.span;
+    fn parse_expr_stmt(&mut self) -> ParseResult<Stmt> {
+        let expr = self.parse_expr()?;
 
-        let kind = match type_token.ty {
-            tt![any] => TypeKind::Any,
-            tt![!] => TypeKind::Never,
-            tt![int] => TypeKind::Int,
-            tt![float] => TypeKind::Float,
-            tt![str] => TypeKind::String,
-            tt![bool] => TypeKind::Bool,
-            tt![void] => TypeKind::Void,
-            tt![ident] => {
-                let path = self.expect(tt![ident])?;
-                TypeKind::Path(self.interner.get_or_intern(path.lexeme))
-            }
-            tt!['['] => {
-                let inner = self.parse_type()?;
-                let inner = self.ast.types.insert(inner);
-
-                let kind = if self.advance_if(tt![;])? {
-                    let len = self.parse_expr()?;
-
-                    TypeKind::Array {
-                        ty: inner,
-                        len: self.ast.exprs.insert(len),
-                    }
-                } else {
-                    TypeKind::DynArray(inner)
-                };
-
-                span = span.merge(self.expect(tt![']'])?.span);
-                kind
-            }
-            _ => {
-                return Err(ParseError {
-                    msg: format!("Expected type, found {:?}", type_token.ty),
-                    span: type_token.span,
-                });
-            }
-        };
-
-        let ty = Type { kind, span };
-
-        if self.check(tt![?]) {
-            let opt_token = self.consume()?;
-            span = span.merge(opt_token.span);
-
-            Ok(Type {
-                kind: TypeKind::Optional(self.ast.types.insert(ty)),
-                span,
-            })
-        } else {
-            Ok(ty)
-        }
-    }
-
-    fn parse_path(&mut self) -> ParseResult<Path> {
-        todo!("parse path")
-    }
-
-    #[inline]
-    fn can_start_expr(&self) -> bool {
-        matches!(
-            self.current.ty,
-            tt![int_lit]
-                | tt![float_lit]
-                | tt![str_lit]
-                | tt![true]
-                | tt![false]
-                | tt![null]
-                | tt![void]
-                | tt![ident]
-                | tt!['(']
-                | tt!['[']
-                | tt!['{']
-                | tt![if]
-                | tt![while]
-                | tt![loop]
-                | tt![match]
-                | tt![return]
-                | tt![break]
-                | tt![continue]
-                | tt![!]
-                | tt![-]
-        )
+        Ok(Stmt {
+            span: expr.span,
+            kind: StmtKind::Expr {
+                expr: self.ast.exprs.insert(expr),
+                has_semi: self.advance_if(tt![;])?,
+            },
+        })
     }
 
     fn parse_expr(&mut self) -> ParseResult<Expr> {
@@ -397,18 +378,15 @@ impl<'a> Parser<'a> {
 
     fn parse_prefix(&mut self, rule: PrefixRule) -> ParseResult<Expr> {
         match rule {
-            PrefixRule::None => Err(ParseError {
-                msg: format!("Expected expression, found {:?}", self.current.ty),
-                span: self.current.span,
-            }),
             PrefixRule::LiteralInt => self.parse_int(),
             PrefixRule::LiteralFloat => self.parse_float(),
             PrefixRule::LiteralString => self.parse_string(),
-            PrefixRule::LiteralBool => self.parse_bool(),
+            PrefixRule::True => self.parse_true(),
+            PrefixRule::False => self.parse_false(),
             PrefixRule::LiteralNull => self.parse_null(),
             PrefixRule::LiteralVoid => self.parse_void(),
             PrefixRule::LiteralArray => self.parse_array(),
-            PrefixRule::Identifier => self.parse_ident(),
+            PrefixRule::Identifier => self.parse_identifier(),
             PrefixRule::Grouping => self.parse_group(),
             PrefixRule::Unary => self.parse_unary(),
             PrefixRule::If => self.parse_if(),
@@ -419,6 +397,16 @@ impl<'a> Parser<'a> {
             PrefixRule::Return => self.parse_return(),
             PrefixRule::Break => self.parse_break(),
             PrefixRule::Continue => self.parse_continue(),
+            PrefixRule::LiteralStruct => todo!(),
+            PrefixRule::ModuleType => self.parse_module_type(),
+            PrefixRule::StructType => self.parse_struct_type(),
+            PrefixRule::UnionType => self.parse_union_type(),
+            PrefixRule::EnumType => self.parse_enum_type(),
+            PrefixRule::PointerType => self.parse_pointer_type(),
+            PrefixRule::None => Err(ParseError {
+                msg: format!("Expected expression, found {:?}", self.current.ty),
+                span: self.current.span,
+            }),
         }
     }
 
@@ -436,12 +424,21 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_identifier(&mut self) -> ParseResult<Expr> {
+        let ident_token = self.expect(tt![ident])?;
+
+        Ok(Expr {
+            kind: ExprKind::Ident(self.interner.get_or_intern(ident_token.lexeme)),
+            span: ident_token.span,
+        })
+    }
+
     fn parse_int(&mut self) -> ParseResult<Expr> {
         let int_token = self.expect(tt![int_lit])?;
 
-        match str::parse::<i64>(int_token.lexeme) {
+        match str::parse::<u64>(int_token.lexeme) {
             Ok(i) => Ok(Expr {
-                kind: ExprKind::Int(i),
+                kind: ExprKind::IntLit(i),
                 span: int_token.span,
             }),
             Err(err) => Err(ParseError {
@@ -456,7 +453,7 @@ impl<'a> Parser<'a> {
 
         match str::parse::<f64>(float_token.lexeme) {
             Ok(f) => Ok(Expr {
-                kind: ExprKind::Float(f),
+                kind: ExprKind::FloatLit(f),
                 span: float_token.span,
             }),
             Err(err) => Err(ParseError {
@@ -470,28 +467,26 @@ impl<'a> Parser<'a> {
         let str_token = self.expect(tt![str_lit])?;
 
         Ok(Expr {
-            kind: ExprKind::Cstr(self.interner.get_or_intern(str_token.lexeme)),
+            kind: ExprKind::StrLit(self.interner.get_or_intern(str_token.lexeme)),
             span: str_token.span,
         })
     }
 
-    fn parse_bool(&mut self) -> ParseResult<Expr> {
-        let bool_token = self.consume()?;
-
-        let value = match bool_token.ty {
-            tt![true] => true,
-            tt![false] => false,
-            _ => {
-                return Err(ParseError {
-                    msg: format!("Expected 'true' or 'false', found {:?}", self.current.ty),
-                    span: bool_token.span,
-                });
-            }
-        };
+    fn parse_true(&mut self) -> ParseResult<Expr> {
+        let true_token = self.expect(tt![true])?;
 
         Ok(Expr {
-            kind: ExprKind::Bool(value),
-            span: bool_token.span,
+            kind: ExprKind::True,
+            span: true_token.span,
+        })
+    }
+
+    fn parse_false(&mut self) -> ParseResult<Expr> {
+        let false_token = self.expect(tt![false])?;
+
+        Ok(Expr {
+            kind: ExprKind::False,
+            span: false_token.span,
         })
     }
 
@@ -532,15 +527,6 @@ impl<'a> Parser<'a> {
         Ok(Expr {
             kind: ExprKind::ArrayLit(elems),
             span: l_brkt.span.merge(r_brkt.span),
-        })
-    }
-
-    fn parse_ident(&mut self) -> ParseResult<Expr> {
-        let ident_token = self.expect(tt![ident])?;
-
-        Ok(Expr {
-            kind: ExprKind::Ident(self.interner.get_or_intern(ident_token.lexeme)),
-            span: ident_token.span,
         })
     }
 
@@ -588,12 +574,12 @@ impl<'a> Parser<'a> {
             tt![*] => BinaryOp::Mul,
             tt![/] => BinaryOp::Div,
             tt![%] => BinaryOp::Mod,
-            tt![==] => BinaryOp::Equal,
-            tt![!=] => BinaryOp::NotEqual,
-            tt![<] => BinaryOp::Less,
-            tt![<=] => BinaryOp::LessEqual,
-            tt![>] => BinaryOp::Greater,
-            tt![>=] => BinaryOp::GreaterEqual,
+            tt![==] => BinaryOp::Eq,
+            tt![!=] => BinaryOp::Ne,
+            tt![<] => BinaryOp::Lt,
+            tt![<=] => BinaryOp::Le,
+            tt![>] => BinaryOp::Gt,
+            tt![>=] => BinaryOp::Ge,
             _ => {
                 return Err(ParseError {
                     msg: format!("Unsupported binary operator: {:?}", op_token.ty),
@@ -649,42 +635,13 @@ impl<'a> Parser<'a> {
         let mut stmts = vec![];
 
         while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
-            match self.current.ty {
-                tt![;] => {
-                    let stmt = self.parse_semi()?;
-                    stmts.push(self.ast.stmts.insert(stmt))
-                }
-                tt![val] => {
-                    let stmt = self.parse_var_decl(false)?;
-                    stmts.push(self.ast.stmts.insert(stmt))
-                }
-                tt![var] => {
-                    let stmt = self.parse_var_decl(true)?;
-                    stmts.push(self.ast.stmts.insert(stmt))
-                }
-                _ => {
-                    let expr = self.parse_expr()?;
-                    let mut span = expr.span;
+            let stmt = match self.current.ty {
+                tt![;] => self.parse_semi()?,
+                tt![let] => self.parse_let()?,
+                _ => self.parse_expr_stmt()?,
+            };
 
-                    let has_semi = if self.check(tt![;]) {
-                        let semi_token = self.consume()?;
-                        span = span.merge(semi_token.span);
-                        true
-                    } else {
-                        false
-                    };
-
-                    let stmt = Stmt {
-                        kind: StmtKind::Expr {
-                            expr: self.ast.exprs.insert(expr),
-                            has_semi,
-                        },
-                        span,
-                    };
-
-                    stmts.push(self.ast.stmts.insert(stmt));
-                }
-            }
+            stmts.push(self.ast.stmts.insert(stmt))
         }
 
         let r_brace = self.expect(tt!['}'])?;
@@ -749,39 +706,43 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn can_start_expr(&self) -> bool {
+        ParseRule::get(self.current.ty).prefix != PrefixRule::None
+    }
+
     fn parse_return(&mut self) -> ParseResult<Expr> {
         let return_token = self.expect(tt![return])?;
+        let mut span = return_token.span;
 
         let expr = if self.can_start_expr() {
-            self.parse_expr()?
+            let expr = self.parse_expr()?;
+            span = span.merge(expr.span);
+            Some(self.ast.exprs.insert(expr))
         } else {
-            Expr {
-                kind: ExprKind::Void,
-                span: return_token.span,
-            }
+            None
         };
 
         Ok(Expr {
-            span: return_token.span.merge(expr.span),
-            kind: ExprKind::Return(self.ast.exprs.insert(expr)),
+            kind: ExprKind::Return(expr),
+            span,
         })
     }
 
     fn parse_break(&mut self) -> ParseResult<Expr> {
         let break_token = self.expect(tt![break])?;
+        let mut span = break_token.span;
 
         let expr = if self.can_start_expr() {
-            self.parse_expr()?
+            let expr = self.parse_expr()?;
+            span = span.merge(expr.span);
+            Some(self.ast.exprs.insert(expr))
         } else {
-            Expr {
-                kind: ExprKind::Void,
-                span: break_token.span,
-            }
+            None
         };
 
         Ok(Expr {
-            span: break_token.span.merge(expr.span),
-            kind: ExprKind::Break(self.ast.exprs.insert(expr)),
+            kind: ExprKind::Break(expr),
+            span,
         })
     }
 
@@ -842,6 +803,19 @@ impl<'a> Parser<'a> {
                 object: self.ast.exprs.insert(object),
                 index: self.ast.exprs.insert(index),
             },
+        })
+    }
+
+    fn parse_pointer_type(&mut self) -> ParseResult<Expr> {
+        let at_token = self.expect(tt![@])?;
+        let mutable = self.advance_if(tt![mut])?;
+        let pointee = self.parse_expr()?;
+        let span = at_token.span.merge(pointee.span);
+        let pointee = self.ast.exprs.insert(pointee);
+
+        Ok(Expr {
+            kind: ExprKind::PointerType { mutable, pointee },
+            span,
         })
     }
 }
