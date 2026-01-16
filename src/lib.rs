@@ -1,4 +1,5 @@
 mod arena;
+pub mod codegen;
 pub mod compiler;
-pub mod ssa_ir;
+pub mod mir;
 pub mod vm;

@@ -1,5 +1,3 @@
-use crate::compiler::{ast::ExprKind, name_resolver::NameResolver};
-
 mod ast;
 mod ast_op;
 mod lexer;
@@ -15,7 +13,12 @@ mod type_info;
 fn test_all() {
     use crate::{
         arena::Interner,
-        compiler::{ast::AstArena, lexer::Lexer, parser::Parser},
+        compiler::{
+            ast::{AstArena, ExprKind},
+            lexer::Lexer,
+            name_resolver::NameResolver,
+            parser::Parser,
+        },
     };
 
     let source = r#"

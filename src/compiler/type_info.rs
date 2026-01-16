@@ -12,7 +12,7 @@ slotmap::new_key_type! {
 }
 
 #[derive(Debug, Clone)]
-pub enum Type {
+pub enum TypeValue {
     // Primitives
     Type,
     Int,
@@ -85,7 +85,7 @@ pub struct VariantInfo {
 }
 
 pub struct TypeArena {
-    types: Arena<TypeId, Type>,
+    types: Arena<TypeId, TypeValue>,
 }
 
 impl TypeArena {
@@ -95,15 +95,15 @@ impl TypeArena {
         }
     }
 
-    pub fn insert(&mut self, ty: Type) -> TypeId {
+    pub fn insert(&mut self, ty: TypeValue) -> TypeId {
         self.types.insert(ty)
     }
 
-    pub fn get(&self, id: TypeId) -> &Type {
+    pub fn get(&self, id: TypeId) -> &TypeValue {
         &self.types[id]
     }
 
-    pub fn get_mut(&mut self, id: TypeId) -> &mut Type {
+    pub fn get_mut(&mut self, id: TypeId) -> &mut TypeValue {
         &mut self.types[id]
     }
 }

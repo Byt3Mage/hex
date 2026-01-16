@@ -98,6 +98,7 @@ value! {
     Uint: u64,
     Bool: bool,
     Float: f64,
+    Char: char,
     Func: FunctionId,
     // Niche values that can live in a single register
     OptPtr: Option<GCPtr>,

@@ -59,7 +59,7 @@ struct Frame {
     caller_info: Option<CallerInfo>,
 
     /// Current function metadata,
-    call_info: CallInfo,
+    callee_info: CallInfo,
 }
 
 pub struct VM<'a, A: PageAllocator> {
@@ -178,33 +178,57 @@ impl<'a, A: PageAllocator> VM<'a, A> {
     }
 
     #[inline(always)]
-    fn exec_iadd_imm(&mut self, i: Instruction) {
-        let dst = self.reg_mut(i.a());
-        dst.set(dst.get::<i64>() + i.bx_i64());
+    fn exec_uadd(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<u64>(i.b(), i.c());
+        self.set_reg(i.a(), a + b);
     }
 
     #[inline(always)]
-    fn exec_isub_imm(&mut self, i: Instruction) {
-        let dst = self.reg_mut(i.a());
-        dst.set(dst.get::<i64>() - i.bx_i64());
+    fn exec_usub(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<u64>(i.b(), i.c());
+        self.set_reg(i.a(), a - b);
     }
 
     #[inline(always)]
-    fn exec_imul_imm(&mut self, i: Instruction) {
-        let dst = self.reg_mut(i.a());
-        dst.set(dst.get::<i64>() * i.bx_i64());
+    fn exec_umul(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<u64>(i.b(), i.c());
+        self.set_reg(i.a(), a * b);
     }
 
     #[inline(always)]
-    fn exec_idiv_imm(&mut self, i: Instruction) {
-        let dst = self.reg_mut(i.a());
-        dst.set(dst.get::<i64>() / i.bx_i64());
+    fn exec_udiv(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<u64>(i.b(), i.c());
+        self.set_reg(i.a(), a / b);
     }
 
     #[inline(always)]
-    fn exec_irem_imm(&mut self, i: Instruction) {
-        let dst = self.reg_mut(i.a());
-        dst.set(dst.get::<i64>() % i.bx_i64());
+    fn exec_urem(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<u64>(i.b(), i.c());
+        self.set_reg(i.a(), a % b);
+    }
+
+    #[inline(always)]
+    fn exec_fadd(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<f64>(i.b(), i.c());
+        self.set_reg(i.a(), a + b);
+    }
+
+    #[inline(always)]
+    fn exec_fsub(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<f64>(i.b(), i.c());
+        self.set_reg(i.a(), a - b);
+    }
+
+    #[inline(always)]
+    fn exec_fmul(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<f64>(i.b(), i.c());
+        self.set_reg(i.a(), a * b);
+    }
+
+    #[inline(always)]
+    fn exec_fdiv(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<f64>(i.b(), i.c());
+        self.set_reg(i.a(), a / b);
     }
 
     #[inline(always)]
@@ -244,27 +268,39 @@ impl<'a, A: PageAllocator> VM<'a, A> {
     }
 
     #[inline(always)]
-    fn exec_fadd(&mut self, i: Instruction) {
-        let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-        self.set_reg(i.a(), a + b);
+    fn exec_ueq(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<u64>(i.b(), i.c());
+        self.set_reg(i.a(), a == b);
     }
 
     #[inline(always)]
-    fn exec_fsub(&mut self, i: Instruction) {
-        let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-        self.set_reg(i.a(), a - b);
+    fn exec_une(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<u64>(i.b(), i.c());
+        self.set_reg(i.a(), a != b);
     }
 
     #[inline(always)]
-    fn exec_fmul(&mut self, i: Instruction) {
-        let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-        self.set_reg(i.a(), a * b);
+    fn exec_ult(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<u64>(i.b(), i.c());
+        self.set_reg(i.a(), a < b);
     }
 
     #[inline(always)]
-    fn exec_fdiv(&mut self, i: Instruction) {
-        let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-        self.set_reg(i.a(), a / b);
+    fn exec_ule(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<u64>(i.b(), i.c());
+        self.set_reg(i.a(), a <= b);
+    }
+
+    #[inline(always)]
+    fn exec_ugt(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<u64>(i.b(), i.c());
+        self.set_reg(i.a(), a > b);
+    }
+
+    #[inline(always)]
+    fn exec_uge(&mut self, i: Instruction) {
+        let (a, b) = self.two_reg::<u64>(i.b(), i.c());
+        self.set_reg(i.a(), a >= b);
     }
 
     #[inline(always)]
@@ -307,7 +343,7 @@ impl<'a, A: PageAllocator> VM<'a, A> {
                 base_reg: self.base_reg,
                 ret_reg,
             }),
-            call_info: cinfo,
+            callee_info: cinfo,
         });
 
         // Jump to function code
@@ -344,7 +380,7 @@ impl<'a, A: PageAllocator> VM<'a, A> {
         self.regs.copy_within(start..end, base);
 
         // Reuse current frame and update the callee info.
-        self.last_frame_mut()?.call_info = cinfo;
+        self.last_frame_mut()?.callee_info = cinfo;
         self.pc = cinfo.entry_pc;
         Ok(())
     }
@@ -383,7 +419,7 @@ impl<'a, A: PageAllocator> VM<'a, A> {
         self.calln(ret_reg, func)
     }
 
-    fn exec_ret(&mut self) -> VMResult<Option<Frame>> {
+    fn exec_ret(&mut self, i: Instruction) -> VMResult<Option<Frame>> {
         let frame = self.call_stack.pop().ok_or(VMError::EmptyCallStack)?;
 
         match &frame.caller_info {
@@ -393,8 +429,8 @@ impl<'a, A: PageAllocator> VM<'a, A> {
             // Return to caller
             Some(caller_info) => {
                 // Copy return values to caller's registers
-                let start = self.base_reg + frame.call_info.ret_reg as usize;
-                let range = start..(start + frame.call_info.nret as usize);
+                let start = self.base_reg + i.a() as usize;
+                let range = start..(start + frame.callee_info.nret as usize);
                 self.regs.copy_within(range, caller_info.ret_reg as usize);
 
                 // Clear register window
@@ -522,21 +558,27 @@ impl<'a, A: PageAllocator> VM<'a, A> {
                 Opcode::INEG => self.exec_ineg(i),
                 Opcode::FNEG => self.exec_fneg(i),
 
-                // Integer arithmetic
+                // Signed integer arithmetic
                 Opcode::IADD => self.exec_iadd(i),
                 Opcode::ISUB => self.exec_isub(i),
                 Opcode::IMUL => self.exec_imul(i),
                 Opcode::IDIV => self.exec_idiv(i),
                 Opcode::IREM => self.exec_irem(i),
 
-                // Immediate integer arithmetic
-                Opcode::IADD_IMM => self.exec_iadd_imm(i),
-                Opcode::ISUB_IMM => self.exec_isub_imm(i),
-                Opcode::IMUL_IMM => self.exec_imul_imm(i),
-                Opcode::IDIV_IMM => self.exec_idiv_imm(i),
-                Opcode::IREM_IMM => self.exec_irem_imm(i),
+                // Unsigned integer arithmetic
+                Opcode::UADD => self.exec_uadd(i),
+                Opcode::USUB => self.exec_usub(i),
+                Opcode::UMUL => self.exec_umul(i),
+                Opcode::UDIV => self.exec_udiv(i),
+                Opcode::UREM => self.exec_urem(i),
 
-                // Integer comparisons
+                // Floating point arithmetic
+                Opcode::FADD => self.exec_fadd(i),
+                Opcode::FSUB => self.exec_fsub(i),
+                Opcode::FMUL => self.exec_fmul(i),
+                Opcode::FDIV => self.exec_fdiv(i),
+
+                // Signed integer comparisons
                 Opcode::IEQ => self.exec_ieq(i),
                 Opcode::INE => self.exec_ine(i),
                 Opcode::ILT => self.exec_ilt(i),
@@ -544,11 +586,13 @@ impl<'a, A: PageAllocator> VM<'a, A> {
                 Opcode::ILE => self.exec_ile(i),
                 Opcode::IGE => self.exec_ige(i),
 
-                // Floating point arithmetic
-                Opcode::FADD => self.exec_fadd(i),
-                Opcode::FSUB => self.exec_fsub(i),
-                Opcode::FMUL => self.exec_fmul(i),
-                Opcode::FDIV => self.exec_fdiv(i),
+                // Unsigned integer comparisons
+                Opcode::UEQ => self.exec_ueq(i),
+                Opcode::UNE => self.exec_une(i),
+                Opcode::ULT => self.exec_ult(i),
+                Opcode::UGT => self.exec_ugt(i),
+                Opcode::ULE => self.exec_ule(i),
+                Opcode::UGE => self.exec_uge(i),
 
                 // Jump operations
                 Opcode::JMP => self.exec_jump(i),
@@ -561,7 +605,7 @@ impl<'a, A: PageAllocator> VM<'a, A> {
                 Opcode::CALLR => self.exec_callr(i),
                 Opcode::CALLNR => self.exec_callnr(i)?,
                 Opcode::RET => {
-                    if let Some(frame) = self.exec_ret()? {
+                    if let Some(frame) = self.exec_ret(i)? {
                         return Ok(Some(frame));
                     }
                 }
@@ -613,14 +657,14 @@ impl<'a, A: PageAllocator> VM<'a, A> {
         // Push synthetic frame
         self.call_stack.push(Frame {
             caller_info: None,
-            call_info,
+            callee_info: call_info,
         });
 
         match self.run::<true>()? {
             None => Err(VMError::EmptyCallStack),
             Some(frame) => {
-                let start = self.base_reg + frame.call_info.ret_reg as usize;
-                let range = start..(start + frame.call_info.nret as usize);
+                let start = self.base_reg;
+                let range = start..(start + frame.callee_info.nret as usize);
                 Ok(&self.regs[range])
             }
         }

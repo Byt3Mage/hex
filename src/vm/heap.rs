@@ -107,10 +107,6 @@ impl GCHeader {
     const fn black_to_gray(&mut self) {
         self.reset_bit(BLACK_BIT);
     }
-
-    const fn string_mark(&mut self) {
-        self.reset_2_bits(WHITE0_BIT, WHITE1_BIT);
-    }
 }
 
 const _: () = assert!(std::mem::size_of::<GCHeader>() == 8);
@@ -354,11 +350,11 @@ impl<A: PageAllocator> Heap<A> {
         hdr.white_to_gray();
 
         match hdr.tt {
-            BlockType::Free => unreachable!("attempted to mark freed object"),
             BlockType::String => hdr.marked |= BLACK_BIT,
             BlockType::Buffer => obj.as_mut::<GCBuffer>().gc_list = self.gray.replace(obj),
             BlockType::DynBuffer => obj.as_mut::<GCDynBuffer>().gc_list = self.gray.replace(obj),
             BlockType::Task => obj.as_mut::<GCTask>().gc_list = self.gray.replace(obj),
+            BlockType::Free => unreachable!("attempted to mark freed object"),
         }
     }
 
@@ -459,9 +455,7 @@ impl<A: PageAllocator> Heap<A> {
                     cost += steps * GC_SWEEP_PAGE_STEP_COST;
                 }
 
-                // Nothing more to sweep?
                 if self.sweep_page.is_none() {
-                    // End collection
                     self.gc_state = GCState::Pause
                 }
             }

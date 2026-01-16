@@ -11,7 +11,7 @@ use crate::{
         sema_error::SemaError,
         tokens::Span,
         type_info::{
-            EnumInfo, FieldInfo, ModuleInfo, StructInfo, Type, TypeArena, TypeId, UnionInfo,
+            EnumInfo, FieldInfo, ModuleInfo, StructInfo, TypeArena, TypeId, TypeValue, UnionInfo,
             VariantInfo,
         },
     },
@@ -235,7 +235,7 @@ impl<'a> Sema<'a> {
             mod_decls.insert(self.ast.decls[decl_id].name, decl_id);
         }
 
-        let ty = self.types.insert(Type::Module(ModuleInfo {
+        let ty = self.types.insert(TypeValue::Module(ModuleInfo {
             name: None,
             decls: mod_decls,
         }));
@@ -246,21 +246,27 @@ impl<'a> Sema<'a> {
     pub fn eval_struct(&mut self, fields: &[AstField], scope: ScopeId) -> SemaResult<ConstValue> {
         let fields = self.make_fields(fields, scope)?;
         let name = None;
-        let ty = self.types.insert(Type::Struct(StructInfo { name, fields }));
+        let ty = self
+            .types
+            .insert(TypeValue::Struct(StructInfo { name, fields }));
         Ok(ConstValue::Type(ty))
     }
 
     pub fn eval_union(&mut self, fields: &[AstField], scope: ScopeId) -> SemaResult<ConstValue> {
         let fields = self.make_fields(fields, scope)?;
         let name = None;
-        let ty = self.types.insert(Type::Union(UnionInfo { name, fields }));
+        let ty = self
+            .types
+            .insert(TypeValue::Union(UnionInfo { name, fields }));
         Ok(ConstValue::Type(ty))
     }
 
     pub fn eval_enum(&mut self, variants: &[AstVariant], scope: ScopeId) -> SemaResult<ConstValue> {
         let variants = self.make_variants(variants, scope)?;
         let name = None;
-        let ty = self.types.insert(Type::Enum(EnumInfo { name, variants }));
+        let ty = self
+            .types
+            .insert(TypeValue::Enum(EnumInfo { name, variants }));
         Ok(ConstValue::Type(ty))
     }
 
@@ -289,7 +295,7 @@ impl<'a> Sema<'a> {
     ) -> SemaResult<ConstValue> {
         if let ConstValue::Type(ty_id) = self.eval_expr(ty_expr, scope)? {
             match self.types.get(ty_id) {
-                Type::Module(info) => match info.decls.get(&name) {
+                TypeValue::Module(info) => match info.decls.get(&name) {
                     Some(decl_id) => self.eval_decl(*decl_id, ScopeId::Expr(ty_expr)),
                     None => Err(SemaError::ItemNotFound {
                         module: ty_id,
@@ -297,7 +303,7 @@ impl<'a> Sema<'a> {
                         span,
                     }),
                 },
-                Type::Enum(info) => todo!("enum value"),
+                TypeValue::Enum(info) => todo!("enum value"),
                 _ => Err(SemaError::NotDeclScope { span }),
             }
         } else {

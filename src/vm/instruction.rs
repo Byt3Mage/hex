@@ -38,26 +38,34 @@ define_opcodes! {
     IREM = 14,
 
     // Immediate integer arithmetic
-    IADD_IMM = 15,
-    ISUB_IMM = 16,
-    IMUL_IMM = 17,
-    IDIV_IMM = 18,
-    IREM_IMM = 19,
-
-    // Integer comparisons
-    IEQ = 20,
-    INE = 21,
-    ILT = 22,
-    IGT = 23,
-    ILE = 24,
-    IGE = 25,
+    UADD = 15,
+    USUB = 16,
+    UMUL = 17,
+    UDIV = 18,
+    UREM = 19,
 
     // Floating-point arithmetic
-    FADD = 30,
-    FSUB = 31,
-    FMUL = 32,
-    FDIV = 33,
-    FREM = 34,
+    FADD = 20,
+    FSUB = 21,
+    FMUL = 22,
+    FDIV = 23,
+    FREM = 24,
+
+    // Signed integer comparisons
+    IEQ = 25,
+    INE = 26,
+    ILT = 27,
+    IGT = 28,
+    ILE = 29,
+    IGE = 30,
+
+    // Unsigned integer comparisons
+    UEQ = 31,
+    UNE = 32,
+    ULT = 33,
+    UGT = 34,
+    ULE = 35,
+    UGE = 36,
 
     // Floating-point comparisons
     FEQ = 35,
@@ -187,7 +195,7 @@ pub const fn fneg(r_dst: u8) -> Instruction {
     Instruction::encode_abc(Opcode::FNEG, r_dst, 0, 0)
 }
 
-// Integer arithmetic
+// Signed integer arithmetic
 #[inline(always)]
 pub fn iadd(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
     Instruction::encode_abc(Opcode::IADD, r_dst, r_a, r_b)
@@ -213,33 +221,33 @@ pub fn irem(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
     Instruction::encode_abc(Opcode::IREM, r_dst, r_a, r_b)
 }
 
-// Immediate integer arithmetic
+// Unsigned integer arithmetic
 #[inline(always)]
-pub fn iadd_imm(r_dst: u8, imm: i16) -> Instruction {
-    Instruction::encode_abx(Opcode::IADD_IMM, r_dst, imm as u16)
+pub fn uadd(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::UADD, r_dst, r_a, r_b)
 }
 
 #[inline(always)]
-pub fn isub_imm(r_dst: u8, imm: i16) -> Instruction {
-    Instruction::encode_abx(Opcode::ISUB_IMM, r_dst, imm as u16)
+pub fn usub(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::USUB, r_dst, r_a, r_b)
 }
 
 #[inline(always)]
-pub fn imul_imm(r_dst: u8, imm: i16) -> Instruction {
-    Instruction::encode_abx(Opcode::IMUL_IMM, r_dst, imm as u16)
+pub fn umul(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::UMUL, r_dst, r_a, r_b)
 }
 
 #[inline(always)]
-pub fn idiv_imm(r_dst: u8, imm: i16) -> Instruction {
-    Instruction::encode_abx(Opcode::IDIV_IMM, r_dst, imm as u16)
+pub fn udiv(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::UDIV, r_dst, r_a, r_b)
 }
 
 #[inline(always)]
-pub fn irem_imm(r_dst: u8, imm: i16) -> Instruction {
-    Instruction::encode_abx(Opcode::IREM_IMM, r_dst, imm as u16)
+pub fn urem(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::UREM, r_dst, r_a, r_b)
 }
 
-// Integer comparisons
+// Signed integer comparisons
 #[inline(always)]
 pub fn ieq(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
     Instruction::encode_abc(Opcode::IEQ, r_dst, r_a, r_b)
@@ -268,6 +276,37 @@ pub fn ile(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
 #[inline(always)]
 pub fn ige(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
     Instruction::encode_abc(Opcode::IGE, r_dst, r_a, r_b)
+}
+
+// Unsigned integer comparisons
+#[inline(always)]
+pub fn ueq(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::UEQ, r_dst, r_a, r_b)
+}
+
+#[inline(always)]
+pub fn une(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::UNE, r_dst, r_a, r_b)
+}
+
+#[inline(always)]
+pub fn ult(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::ULT, r_dst, r_a, r_b)
+}
+
+#[inline(always)]
+pub fn ule(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::ULE, r_dst, r_a, r_b)
+}
+
+#[inline(always)]
+pub fn ugt(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::UGT, r_dst, r_a, r_b)
+}
+
+#[inline(always)]
+pub fn uge(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::UGE, r_dst, r_a, r_b)
 }
 
 // Floating-point arithmetic
@@ -334,21 +373,16 @@ pub fn jmp(target: u32) -> Instruction {
 }
 
 #[inline(always)]
-pub fn jmp_if(r_cond: u8, target: u16) -> Instruction {
+pub fn jmp_t(r_cond: u8, target: u16) -> Instruction {
     Instruction::encode_abx(Opcode::JMP_T, r_cond, target)
 }
 
 #[inline(always)]
-pub fn jmp_if_not(r_cond: u8, target: u16) -> Instruction {
+pub fn jmp_f(r_cond: u8, target: u16) -> Instruction {
     Instruction::encode_abx(Opcode::JMP_F, r_cond, target)
 }
 
 // Call and return
-#[inline(always)]
-pub fn ret() -> Instruction {
-    Instruction::encode_ax(Opcode::RET, 0)
-}
-
 #[inline(always)]
 pub fn call(r_ret: u8, func: FunctionId) -> Instruction {
     Instruction::encode_abx(Opcode::CALL, r_ret, func)
@@ -370,8 +404,13 @@ pub fn callnr(r_ret: u8, func: FunctionId) -> Instruction {
 }
 
 #[inline(always)]
-pub fn tcall(r_ret: u8, func: FunctionId) -> Instruction {
+pub fn callt(r_ret: u8, func: FunctionId) -> Instruction {
     Instruction::encode_abx(Opcode::CALLT, r_ret, func)
+}
+
+#[inline(always)]
+pub fn ret(r_src: u8) -> Instruction {
+    Instruction::encode_abc(Opcode::RET, r_src, 0, 0)
 }
 
 #[inline(always)]

@@ -31,7 +31,7 @@ pub struct CallInfo {
     /// Number of registers allocated for this function
     pub nreg: u8,
 
-    /// Number of arguments this function expects
+    /// Number of argument registers this function expects
     pub narg: u8,
 
     /// Number of registers used for return value
@@ -39,15 +39,12 @@ pub struct CallInfo {
 
     /// Number of captured values (0 for regular functions)
     pub ncap: u8,
-
-    /// Start register for return value
-    pub ret_reg: u8,
 }
 
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
     /// Function name with full path for debugging
-    pub name: Name,
+    pub name: String,
 
     /// Call metadata for the function
     pub call_info: CallInfo,
