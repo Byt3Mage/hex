@@ -69,7 +69,8 @@ pub(crate) enum TokenType {
     Comptime,
     Const,
     Continue,
-    Cstr,
+    CInt,
+    CStr,
     Else,
     Enum,
     False,
@@ -98,6 +99,7 @@ pub(crate) enum TokenType {
     Trait,
     True,
     Type,
+    Uint,
     Union,
     Use,
     Void,
@@ -303,8 +305,11 @@ macro_rules! tt {
     (continue) => {
         $crate::compiler::tokens::TokenType::Continue
     };
+    (cint) => {
+        $crate::compiler::tokens::TokenType::CInt
+    };
     (cstr) => {
-        $crate::compiler::tokens::TokenType::Cstr
+        $crate::compiler::tokens::TokenType::CStr
     };
     (else) => {
         $crate::compiler::tokens::TokenType::Else
@@ -389,6 +394,9 @@ macro_rules! tt {
     };
     (type) => {
         $crate::compiler::tokens::TokenType::Type
+    };
+    (uint) => {
+        $crate::compiler::tokens::TokenType::Uint
     };
     (union) => {
         $crate::compiler::tokens::TokenType::Union

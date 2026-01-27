@@ -10,7 +10,10 @@ use super::{
 
 use crate::{
     arena::Interner,
-    compiler::ast::{AstField, AstVariant, Decl, DeclKind, ExprId, Pattern, Visibility},
+    compiler::ast::{
+        AstType, AstTypeKind, Decl, DeclId, DeclKind, Field, Path, PathSegment, Pattern,
+        PatternKind, Variant, Visibility,
+    },
     tt,
 };
 
@@ -89,7 +92,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub fn parse_source(&mut self) -> ParseResult<ExprId> {
+    pub fn parse_source(&mut self) -> ParseResult<DeclId> {
         let mut items = vec![];
 
         while !self.check(tt![eof]) {
@@ -97,29 +100,32 @@ impl<'a> Parser<'a> {
             items.push(self.ast.decls.insert(decl));
         }
 
-        let module = Expr {
-            kind: ExprKind::ModuleType(items),
+        let module = Decl {
+            visibility: Visibility::Public,
+            name: self.interner.get_or_intern("<package>"),
+            kind: DeclKind::Module(items),
             span: Span::default().merge(self.current.span),
         };
 
-        Ok(self.ast.exprs.insert(module))
+        Ok(self.ast.decls.insert(module))
     }
 
     fn parse_decl(&mut self) -> ParseResult<Decl> {
-        let is_pub = self.advance_if(tt![pub])?;
-        let vis = tnr! { is_pub => Visibility::Public : Visibility::Private};
+        let vis = tnr! { self.advance_if(tt![pub])? => Visibility::Public : Visibility::Private};
 
         match self.current.ty {
-            tt![fn] => self.parse_function(vis),
-            tt![const] => self.parse_const(vis),
+            tt![mod] => self.parse_mod_decl(vis),
+            tt![fn] => self.parse_func_decl(vis),
+            tt![const] => self.parse_const_decl(vis),
+            tt![struct] => self.parse_struct_decl(vis),
             tt => Err(ParseError {
-                msg: format!("Expected 'const' or 'fn', found {tt:?}"),
+                msg: format!("Expected declaration, found {tt:?}"),
                 span: self.current.span,
             }),
         }
     }
 
-    fn parse_function(&mut self, visibility: Visibility) -> ParseResult<Decl> {
+    fn parse_func_decl(&mut self, visibility: Visibility) -> ParseResult<Decl> {
         let fn_token = self.expect(tt![fn])?;
         let func_name = self.expect(tt![ident])?;
 
@@ -129,12 +135,12 @@ impl<'a> Parser<'a> {
         while !matches!(self.current.ty, tt![')'] | tt![eof]) {
             let pattern = self.parse_pattern()?;
             self.expect(tt![:])?;
-            let ty = self.parse_expr()?;
+            let ty = self.parse_type()?;
 
             params.push(Param {
                 span: pattern.span.merge(ty.span),
                 pattern: self.ast.patterns.insert(pattern),
-                ty: self.ast.exprs.insert(ty),
+                ty: self.ast.types.insert(ty),
             });
 
             if !self.advance_if(tt![,])? {
@@ -145,8 +151,8 @@ impl<'a> Parser<'a> {
         self.expect(tt![')'])?;
 
         let ret = if self.advance_if(tt![->])? {
-            let ret = self.parse_expr()?;
-            Some(self.ast.exprs.insert(ret))
+            let ret = self.parse_type()?;
+            Some(self.ast.types.insert(ret))
         } else {
             None
         };
@@ -158,6 +164,7 @@ impl<'a> Parser<'a> {
             name: self.interner.get_or_intern(func_name.lexeme),
             span: fn_token.span.merge(body.span),
             kind: DeclKind::Function {
+                generics: vec![],
                 params,
                 ret,
                 body: self.ast.exprs.insert(body),
@@ -165,13 +172,13 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_const(&mut self, visibility: Visibility) -> ParseResult<Decl> {
+    fn parse_const_decl(&mut self, visibility: Visibility) -> ParseResult<Decl> {
         let const_token = self.expect(tt![const])?;
         let const_name = self.expect(tt![ident])?;
 
         let ty = if self.advance_if(tt![:])? {
-            let ty = self.parse_expr()?;
-            Some(self.ast.exprs.insert(ty))
+            let ty = self.parse_type()?;
+            Some(self.ast.types.insert(ty))
         } else {
             None
         };
@@ -192,27 +199,34 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_module_type(&mut self) -> ParseResult<Expr> {
+    fn parse_mod_decl(&mut self, visibility: Visibility) -> ParseResult<Decl> {
         let mod_token = self.expect(tt![mod])?;
+        let mod_name = self.expect(tt![ident])?;
+
         self.expect(tt!['{'])?;
 
-        let mut items = vec![];
+        let mut decls = vec![];
 
         while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
             let item = self.parse_decl()?;
-            items.push(self.ast.decls.insert(item));
+            decls.push(self.ast.decls.insert(item));
         }
 
         let r_brace = self.expect(tt!['}'])?;
 
-        Ok(Expr {
-            kind: ExprKind::ModuleType(items),
+        Ok(Decl {
+            visibility,
+            name: self.interner.get_or_intern(mod_name.lexeme),
+            kind: DeclKind::Module(decls),
             span: mod_token.span.merge(r_brace.span),
         })
     }
 
-    fn parse_struct_type(&mut self) -> ParseResult<Expr> {
+    fn parse_struct_decl(&mut self, visibility: Visibility) -> ParseResult<Decl> {
         let struct_token = self.expect(tt![struct])?;
+        let struct_name = self.expect(tt![ident])?;
+
+        // TODO: parse generics
 
         self.expect(tt!['{'])?;
 
@@ -221,13 +235,13 @@ impl<'a> Parser<'a> {
             let vis = tnr! {self.advance_if(tt![pub])? => Visibility::Public : Visibility::Private};
             let field_name = self.expect(tt![ident])?;
             self.expect(tt![:])?;
-            let field_ty = self.parse_expr()?;
+            let field_ty = self.parse_type()?;
 
-            fields.push(AstField {
+            fields.push(Field {
                 visibility: vis,
                 span: field_name.span.merge(field_ty.span),
                 name: self.interner.get_or_intern(field_name.lexeme),
-                ty: self.ast.exprs.insert(field_ty),
+                ty: self.ast.types.insert(field_ty),
             });
 
             if !self.advance_if(tt![,])? {
@@ -237,14 +251,20 @@ impl<'a> Parser<'a> {
 
         let r_brace = self.expect(tt!['}'])?;
 
-        Ok(Expr {
-            kind: ExprKind::StructType(fields),
+        Ok(Decl {
+            visibility,
+            name: self.interner.get_or_intern(struct_name.lexeme),
+            kind: DeclKind::Struct {
+                generics: vec![],
+                fields,
+            },
             span: struct_token.span.merge(r_brace.span),
         })
     }
 
-    fn parse_union_type(&mut self) -> ParseResult<Expr> {
+    fn parse_union_type(&mut self, visibility: Visibility) -> ParseResult<Decl> {
         let union_token = self.expect(tt![union])?;
+        let union_name = self.expect(tt![ident])?;
 
         self.expect(tt!['{'])?;
 
@@ -253,13 +273,13 @@ impl<'a> Parser<'a> {
             let vis = tnr! {self.advance_if(tt![pub])? => Visibility::Public : Visibility::Private};
             let field_name = self.expect(tt![ident])?;
             self.expect(tt![:])?;
-            let field_ty = self.parse_expr()?;
+            let field_ty = self.parse_type()?;
 
-            fields.push(AstField {
+            fields.push(Field {
                 visibility: vis,
                 span: field_name.span.merge(field_ty.span),
                 name: self.interner.get_or_intern(field_name.lexeme),
-                ty: self.ast.exprs.insert(field_ty),
+                ty: self.ast.types.insert(field_ty),
             });
 
             if !self.advance_if(tt![,])? {
@@ -269,14 +289,27 @@ impl<'a> Parser<'a> {
 
         let r_brace = self.expect(tt!['}'])?;
 
-        Ok(Expr {
-            kind: ExprKind::UnionType(fields),
+        Ok(Decl {
+            visibility,
+            name: self.interner.get_or_intern(union_name.lexeme),
+            kind: DeclKind::Union {
+                generics: vec![],
+                fields,
+            },
             span: union_token.span.merge(r_brace.span),
         })
     }
 
-    fn parse_enum_type(&mut self) -> ParseResult<Expr> {
+    fn parse_enum_type(&mut self, visibility: Visibility) -> ParseResult<Decl> {
         let enum_token = self.expect(tt![enum])?;
+        let enum_name = self.expect(tt![ident])?;
+        let mut base = None;
+
+        if self.advance_if(tt!['('])? {
+            let ty = self.parse_type()?;
+            base = Some(self.ast.types.insert(ty));
+            self.expect(tt![')'])?;
+        }
 
         self.expect(tt!['{'])?;
 
@@ -292,7 +325,7 @@ impl<'a> Parser<'a> {
                 None
             };
 
-            variants.push(AstVariant {
+            variants.push(Variant {
                 name: self.interner.get_or_intern(variant_name.lexeme),
                 value,
                 span,
@@ -305,9 +338,150 @@ impl<'a> Parser<'a> {
 
         let r_brace = self.expect(tt!['}'])?;
 
-        Ok(Expr {
-            kind: ExprKind::EnumType(variants),
+        Ok(Decl {
+            visibility,
+            name: self.interner.get_or_intern(enum_name.lexeme),
+            kind: DeclKind::Enum { base, variants },
             span: enum_token.span.merge(r_brace.span),
+        })
+    }
+
+    fn parse_type(&mut self) -> ParseResult<AstType> {
+        let ty_token = self.consume()?;
+        let mut span = ty_token.span;
+
+        let kind = match ty_token.ty {
+            tt![cint] => AstTypeKind::CInt,
+            tt![cstr] => AstTypeKind::CStr,
+            tt![int] => AstTypeKind::Int,
+            tt![uint] => AstTypeKind::Uint,
+            tt![float] => AstTypeKind::Float,
+            tt![bool] => AstTypeKind::Bool,
+            tt![char] => AstTypeKind::Char,
+            tt![str] => AstTypeKind::Str,
+            tt![void] => AstTypeKind::Void,
+            tt![!] => AstTypeKind::Never,
+            tt![ident] => {
+                let path = self.parse_path_w_first(ty_token)?;
+                span = path.span;
+                AstTypeKind::Path(self.ast.paths.insert(path))
+            }
+            tt![@] => {
+                let mutable = self.advance_if(tt![mut])?;
+                let pointee = self.parse_type()?;
+                span = span.merge(pointee.span);
+                AstTypeKind::Pointer {
+                    mutable,
+                    pointee: self.ast.types.insert(pointee),
+                }
+            }
+            tt![?] => {
+                let inner = self.parse_type()?;
+                span = span.merge(inner.span);
+                AstTypeKind::Optional(self.ast.types.insert(inner))
+            }
+            tt!['['] => {
+                let first = self.parse_type()?;
+                let kind = if self.advance_if(tt![;])? {
+                    let len = self.parse_expr()?;
+                    AstTypeKind::Array {
+                        elem: self.ast.types.insert(first),
+                        len: self.ast.exprs.insert(len),
+                    }
+                } else if self.advance_if(tt![,])? {
+                    let mut elems = vec![self.ast.types.insert(first)];
+                    while !matches!(self.current.ty, tt![']'] | tt![eof]) {
+                        let ty = self.parse_type()?;
+                        elems.push(self.ast.types.insert(ty));
+                        if !self.advance_if(tt![,])? {
+                            break;
+                        }
+                    }
+                    AstTypeKind::Tuple(elems)
+                } else {
+                    AstTypeKind::Slice(self.ast.types.insert(first))
+                };
+                span = span.merge(self.expect(tt![']'])?.span);
+                kind
+            }
+            tt![fn] => {
+                let mut params = vec![];
+                let mut ret = None;
+
+                self.expect(tt!['('])?;
+
+                while !matches!(self.current.ty, tt![')'] | tt![eof]) {
+                    let param = self.parse_type()?;
+                    params.push(self.ast.types.insert(param));
+                    if !self.advance_if(tt![,])? {
+                        break;
+                    }
+                }
+
+                span = span.merge(self.expect(tt![')'])?.span);
+
+                if self.advance_if(tt![->])? {
+                    let ret_ty = self.parse_type()?;
+                    span = span.merge(ret_ty.span);
+                    ret = Some(self.ast.types.insert(ret_ty));
+                }
+
+                AstTypeKind::Function { params, ret }
+            }
+            tt => {
+                return Err(ParseError {
+                    msg: format!("expected type, found: {tt:?}"),
+                    span,
+                });
+            }
+        };
+
+        Ok(AstType { kind, span })
+    }
+
+    fn parse_path(&mut self) -> ParseResult<Path> {
+        let first = self.parse_path_segment()?;
+        let mut span = first.span;
+
+        let mut rest = vec![];
+        while self.advance_if(tt![::])? {
+            let segment = self.parse_path_segment()?;
+            span = span.merge(segment.span);
+            rest.push(segment);
+        }
+
+        Ok(Path { first, rest, span })
+    }
+
+    fn parse_path_w_first(&mut self, first: Token) -> ParseResult<Path> {
+        let first = PathSegment {
+            name: self.interner.get_or_intern(first.lexeme),
+            generics: vec![], // TODO: generics
+            span: first.span,
+        };
+
+        let mut span = first.span;
+
+        let mut rest = vec![];
+        while self.advance_if(tt![::])? {
+            let segment = self.parse_path_segment()?;
+            span = span.merge(segment.span);
+            rest.push(segment);
+        }
+
+        Ok(Path { first, rest, span })
+    }
+
+    fn parse_path_segment(&mut self) -> ParseResult<PathSegment> {
+        let name_token = self.expect(tt![ident])?;
+        let span = name_token.span;
+
+        // TODO: generics
+
+        Ok(PathSegment {
+            name: self.interner.get_or_intern(name_token.lexeme),
+            generics: vec![],
+            span,
         })
     }
 
@@ -321,12 +495,21 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_pattern(&mut self) -> ParseResult<Pattern> {
-        todo!("parse pattern")
+        let mutable = self.advance_if(tt![mut])?;
+        let name_token = self.expect(tt![ident])?;
+
+        Ok(Pattern {
+            kind: PatternKind::Identifier {
+                mutable,
+                name: self.interner.get_or_intern(name_token.lexeme),
+            },
+            span: name_token.span,
+        })
     }
 
     fn parse_let(&mut self) -> ParseResult<Stmt> {
         let pat = self.parse_pattern()?;
-        let ty = tnr! {self.advance_if(tt![:])? => Some(self.parse_expr()?) : None};
+        let ty = tnr! {self.advance_if(tt![:])? => Some(self.parse_type()?) : None};
 
         self.expect(tt![=])?;
 
@@ -337,7 +520,7 @@ impl<'a> Parser<'a> {
             span: pat.span.merge(semi_token.span),
             kind: StmtKind::Let {
                 pattern: self.ast.patterns.insert(pat),
-                ty: ty.map(|t| self.ast.exprs.insert(t)),
+                ty: ty.map(|t| self.ast.types.insert(t)),
                 value: self.ast.exprs.insert(value),
             },
         })
@@ -386,7 +569,7 @@ impl<'a> Parser<'a> {
             PrefixRule::LiteralNull => self.parse_null(),
             PrefixRule::LiteralVoid => self.parse_void(),
             PrefixRule::LiteralArray => self.parse_array(),
-            PrefixRule::Identifier => self.parse_identifier(),
+            PrefixRule::Identifier => self.parse_path_expr(),
             PrefixRule::Grouping => self.parse_group(),
             PrefixRule::Unary => self.parse_unary(),
             PrefixRule::If => self.parse_if(),
@@ -398,11 +581,7 @@ impl<'a> Parser<'a> {
             PrefixRule::Break => self.parse_break(),
             PrefixRule::Continue => self.parse_continue(),
             PrefixRule::LiteralStruct => todo!(),
-            PrefixRule::ModuleType => self.parse_module_type(),
-            PrefixRule::StructType => self.parse_struct_type(),
-            PrefixRule::UnionType => self.parse_union_type(),
-            PrefixRule::EnumType => self.parse_enum_type(),
-            PrefixRule::PointerType => self.parse_pointer_type(),
+
             PrefixRule::None => Err(ParseError {
                 msg: format!("Expected expression, found {:?}", self.current.ty),
                 span: self.current.span,
@@ -424,12 +603,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_identifier(&mut self) -> ParseResult<Expr> {
-        let ident_token = self.expect(tt![ident])?;
+    fn parse_path_expr(&mut self) -> ParseResult<Expr> {
+        let path = self.parse_path()?;
 
         Ok(Expr {
-            kind: ExprKind::Ident(self.interner.get_or_intern(ident_token.lexeme)),
-            span: ident_token.span,
+            span: path.span,
+            kind: ExprKind::Path(self.ast.paths.insert(path)),
         })
     }
 
@@ -511,14 +690,42 @@ impl<'a> Parser<'a> {
     fn parse_array(&mut self) -> ParseResult<Expr> {
         let l_brkt = self.expect(tt!['['])?;
 
-        let mut elems = vec![];
+        // Parse empty array literal
+        if self.advance_if(tt![']'])? {
+            let r_brkt = self.expect(tt![']'])?;
 
-        while !matches!(self.current.ty, tt![']'] | tt![eof]) {
-            let elem = self.parse_expr()?;
-            elems.push(self.ast.exprs.insert(elem));
+            return Ok(Expr {
+                kind: ExprKind::ArrayLit(vec![]),
+                span: l_brkt.span.merge(r_brkt.span),
+            });
+        }
 
-            if !self.advance_if(tt![,])? {
-                break;
+        let first = self.parse_expr()?;
+
+        // Parse array repeat literal
+        if self.advance_if(tt![;])? {
+            let len = self.parse_expr()?;
+            let r_brkt = self.expect(tt![']'])?;
+
+            let value = self.ast.exprs.insert(first);
+            let count = self.ast.exprs.insert(len);
+
+            return Ok(Expr {
+                kind: ExprKind::ArrayRepeat { value, count },
+                span: l_brkt.span.merge(r_brkt.span),
+            });
+        }
+
+        let mut elems = vec![self.ast.exprs.insert(first)];
+
+        if self.advance_if(tt![,])? {
+            while !matches!(self.current.ty, tt![']'] | tt![eof]) {
+                let elem = self.parse_expr()?;
+                elems.push(self.ast.exprs.insert(elem));
+
+                if !self.advance_if(tt![,])? {
+                    break;
+                }
             }
         }
 
@@ -803,19 +1010,6 @@ impl<'a> Parser<'a> {
                 object: self.ast.exprs.insert(object),
                 index: self.ast.exprs.insert(index),
             },
-        })
-    }
-
-    fn parse_pointer_type(&mut self) -> ParseResult<Expr> {
-        let at_token = self.expect(tt![@])?;
-        let mutable = self.advance_if(tt![mut])?;
-        let pointee = self.parse_expr()?;
-        let span = at_token.span.merge(pointee.span);
-        let pointee = self.ast.exprs.insert(pointee);
-
-        Ok(Expr {
-            kind: ExprKind::PointerType { mutable, pointee },
-            span,
         })
     }
 }

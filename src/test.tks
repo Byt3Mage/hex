@@ -1,0 +1,11 @@
+struct Point {x: int, y: int, ptr: @Point}
+
+mod math {
+    const LEN: uint = 5;
+}
+
+struct Vector {data: @[uint; 5], len: uint, cap: uint}
+
+fn make_arr() -> [[uint; 5]; math::LEN] {
+    [[0; math::LEN]; math::LEN]
+}

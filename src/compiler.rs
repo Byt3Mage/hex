@@ -1,34 +1,28 @@
 mod ast;
 mod ast_op;
+mod error;
 mod lexer;
 mod name_resolver;
 mod parse_rules;
 mod parser;
-mod sema;
-mod sema_error;
+pub mod sema;
+pub mod sema_v2;
 mod tokens;
-mod type_info;
 
 #[test]
 fn test_all() {
     use crate::{
         arena::Interner,
         compiler::{
-            ast::{AstArena, ExprKind},
+            ast::{AstArena, DeclKind},
             lexer::Lexer,
             name_resolver::NameResolver,
             parser::Parser,
+            sema::Sema,
         },
     };
 
-    let source = r#"
-        const Point = struct {
-            x: flt,
-            ptr: @mut Point,
-        };
-
-        const Alias = Point;
-    "#;
+    let source = include_str!("test.tks");
 
     let mut lexer = Lexer::new(source);
     let mut interner = Interner::new();
@@ -37,11 +31,22 @@ fn test_all() {
     let module = parser.parse_source().unwrap();
     let resolver = NameResolver::new(&ast, &interner);
 
-    if let ExprKind::ModuleType(decls) = &ast.exprs[module].kind {
-        let (_, errors) = resolver.resolve(module, decls);
+    if let DeclKind::Module(decls) = &ast.decls[module].kind {
+        let (symbols, errors) = resolver.resolve(module, decls);
 
-        for error in errors {
+        for error in &errors {
             println!("Resolve Error: {error:?}")
+        }
+
+        if errors.is_empty() {
+            let mut sema = Sema::new(&ast, &symbols, &interner);
+
+            for &decl_id in decls {
+                let decl = &ast.decls[decl_id];
+                if let DeclKind::Function { .. } = &decl.kind {
+                    sema.analyze_function(decl_id).unwrap()
+                }
+            }
         }
     }
 }

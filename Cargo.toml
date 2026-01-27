@@ -3,13 +3,17 @@ name = "talkscript"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+doctest = false
+
 [dependencies]
 ahash = "0.8.12"
 simple-ternary = "0.3.0"
-thiserror = "2.0.17"
+thiserror = "2.0.18"
 const-assert = { git = "https://github.com/aquarius2019/const-assert.git" }
 string-interner = "0.19.0"
 slotmap = "1.1.1"
+typed-arena = "2.0.2"
 
 [dev-dependencies]
 criterion = "0.8.1"

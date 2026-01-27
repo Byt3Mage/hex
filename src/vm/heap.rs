@@ -670,7 +670,7 @@ impl<A: PageAllocator> Heap<A> {
     /// Reset the heap to initial state, freeing all objects.
     /// The heap can be reused after this call.
     ///
-    /// **⚠️ Note:** All pointers to any objects in this heap become invalid
+    /// **⚠️ Note:** All pointers to objects in this heap become invalid
     pub fn reset(&mut self) {
         let mut sweep_page = self.pages.gco_pages();
 

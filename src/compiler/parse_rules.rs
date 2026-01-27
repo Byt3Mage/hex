@@ -24,11 +24,6 @@ pub enum PrefixRule {
     Return,
     Break,
     Continue,
-    ModuleType,
-    StructType,
-    UnionType,
-    EnumType,
-    PointerType,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,36 +319,6 @@ static RULES: [ParseRule; TokenType::COUNT] = {
 
     rules[tt![continue] as usize] = ParseRule {
         prefix: PrefixRule::Continue,
-        infix: InfixRule::None,
-        precedence: Precedence::None,
-    };
-
-    rules[tt![mod] as usize] = ParseRule {
-        prefix: PrefixRule::ModuleType,
-        infix: InfixRule::None,
-        precedence: Precedence::None,
-    };
-
-    rules[tt![struct] as usize] = ParseRule {
-        prefix: PrefixRule::StructType,
-        infix: InfixRule::None,
-        precedence: Precedence::None,
-    };
-
-    rules[tt![union] as usize] = ParseRule {
-        prefix: PrefixRule::UnionType,
-        infix: InfixRule::None,
-        precedence: Precedence::None,
-    };
-
-    rules[tt![enum] as usize] = ParseRule {
-        prefix: PrefixRule::EnumType,
-        infix: InfixRule::None,
-        precedence: Precedence::None,
-    };
-
-    rules[tt![@] as usize] = ParseRule {
-        prefix: PrefixRule::PointerType,
         infix: InfixRule::None,
         precedence: Precedence::None,
     };

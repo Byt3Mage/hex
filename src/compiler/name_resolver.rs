@@ -1,17 +1,22 @@
 use std::collections::hash_map::Entry;
 
 use ahash::AHashMap;
+use slotmap::Key;
 
 use crate::{
-    arena::{Ident, Interner},
+    arena::{Arena, Ident, Interner},
     compiler::{
         ast::{
-            AstArena, AstField, AstVariant, DeclId, DeclKind, ExprId, ExprKind, PatternId,
-            PatternKind, StmtId, StmtKind,
+            AstArena, AstTypeId, AstTypeKind, DeclId, DeclKind, ExprId, ExprKind, Field, PathId,
+            PatternId, PatternKind, StmtId, StmtKind,
         },
         tokens::Span,
     },
 };
+
+slotmap::new_key_type! {
+    pub struct SymbolId;
+}
 
 #[derive(Debug, Clone)]
 pub enum ResolveError {
@@ -47,10 +52,14 @@ pub enum ResolveError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
-    Item(DeclId),
-    Variable,     // let bindings, function params
-    GenericType,  // <T>
-    GenericConst, // <const N: int>
+    Module(DeclId),
+    Function(DeclId),
+    Const(DeclId),
+    Enum(DeclId),
+    Struct(DeclId),
+    Union(DeclId),
+    Variable(bool),    // let (mutable) bindings, function params
+    Variant(SymbolId), // Parent enum symbol
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +79,7 @@ pub enum ScopeId {
 pub enum ScopeKind {
     Module,
     Function,
+    Enum,
     Block,
     Loop,
 }
@@ -77,7 +87,7 @@ pub enum ScopeKind {
 pub struct Scope {
     pub kind: ScopeKind,
     pub parent: Option<ScopeId>,
-    pub symbols: AHashMap<Ident, Symbol>,
+    pub symbols: AHashMap<Ident, SymbolId>,
 }
 
 impl Scope {
@@ -88,26 +98,18 @@ impl Scope {
             symbols: AHashMap::new(),
         }
     }
-
-    pub fn define(&mut self, symbol: Symbol) -> Result<(), Span> {
-        match self.symbols.entry(symbol.name) {
-            Entry::Occupied(entry) => Err(entry.get().span),
-            Entry::Vacant(entry) => {
-                entry.insert(symbol);
-                Ok(())
-            }
-        }
-    }
 }
 
 pub struct SymbolTable {
-    pub scopes: AHashMap<ScopeId, Scope>,
+    scopes: AHashMap<ScopeId, Scope>,
+    symbols: Arena<SymbolId, Symbol>,
 }
 
 impl SymbolTable {
     fn new() -> Self {
         Self {
             scopes: AHashMap::new(),
+            symbols: Arena::with_key(),
         }
     }
 
@@ -115,25 +117,30 @@ impl SymbolTable {
         self.scopes.insert(id, Scope::new(kind, parent));
     }
 
-    pub fn lookup_local(&self, name: Ident, scope_id: ScopeId) -> Option<&Symbol> {
-        self.scopes.get(&scope_id)?.symbols.get(&name)
+    pub fn get(&self, symbol_id: SymbolId) -> &Symbol {
+        &self.symbols[symbol_id]
     }
 
-    pub fn lookup(&self, name: Ident, mut scope_id: ScopeId) -> Option<(&Symbol, ScopeId)> {
+    pub fn lookup_local(&self, name: Ident, scope_id: ScopeId) -> Option<SymbolId> {
+        self.scopes.get(&scope_id)?.symbols.get(&name).copied()
+    }
+
+    pub fn lookup(&self, name: Ident, mut scope_id: ScopeId) -> Option<(SymbolId, ScopeId)> {
         loop {
             let scope = self.scopes.get(&scope_id)?;
-            if let Some(symbol) = scope.symbols.get(&name) {
-                return Some((symbol, scope_id));
+            match scope.symbols.get(&name) {
+                Some(symbol) => return Some((*symbol, scope_id)),
+                None => scope_id = scope.parent?,
             }
-            scope_id = scope.parent?;
         }
     }
 
-    fn define(&mut self, symbol: Symbol, scope_id: ScopeId) -> Result<(), Span> {
-        self.scopes
-            .get_mut(&scope_id)
-            .expect("scope not found")
-            .define(symbol)
+    fn define(&mut self, symbol: Symbol, scope_id: ScopeId) -> Result<SymbolId, Span> {
+        let scope = self.scopes.get_mut(&scope_id).expect("scope not found");
+        match scope.symbols.entry(symbol.name) {
+            Entry::Occupied(entry) => Err(self.symbols[*entry.get()].span),
+            Entry::Vacant(entry) => Ok(*entry.insert(self.symbols.insert(symbol))),
+        }
     }
 
     pub fn find_enclosing(&self, mut scope_id: ScopeId, kind: ScopeKind) -> Option<ScopeId> {
@@ -176,30 +183,29 @@ impl<'a> NameResolver<'a> {
         self.errors.push(err);
     }
 
-    fn define(&mut self, symbol: Symbol, scope_id: ScopeId) {
+    fn define(&mut self, symbol: Symbol, scope_id: ScopeId) -> SymbolId {
         let name = symbol.name;
         let span = symbol.span;
-        if let Err(first_def) = self.table.define(symbol, scope_id) {
-            self.error(ResolveError::DuplicateSymbol {
-                name,
-                first_def,
-                dupe_def: span,
-            });
+        match self.table.define(symbol, scope_id) {
+            Ok(symbol_id) => symbol_id,
+            Err(first_def) => {
+                self.error(ResolveError::DuplicateSymbol {
+                    name,
+                    first_def,
+                    dupe_def: span,
+                });
+                SymbolId::null()
+            }
         }
     }
 
     pub fn resolve(
         mut self,
-        expr_id: ExprId,
+        decl_id: DeclId,
         decls: &[DeclId],
     ) -> (SymbolTable, Vec<ResolveError>) {
-        self.resolve_module(expr_id, decls, None);
-        (self.table, self.errors)
-    }
-
-    fn resolve_module(&mut self, expr_id: ExprId, decls: &[DeclId], parent: Option<ScopeId>) {
-        let scope = ScopeId::Expr(expr_id);
-        self.table.scope(scope, ScopeKind::Module, parent);
+        let scope = ScopeId::Decl(decl_id);
+        self.table.scope(scope, ScopeKind::Module, None);
 
         // First pass: register all items
         for &decl_id in decls {
@@ -210,57 +216,148 @@ impl<'a> NameResolver<'a> {
         for &decl_id in decls {
             self.resolve_decl(decl_id, scope);
         }
+
+        (self.table, self.errors)
     }
 
-    fn register_decl(&mut self, item_id: DeclId, parent: ScopeId) {
-        let item = &self.ast.decls[item_id];
-
-        self.define(
-            Symbol {
-                kind: SymbolKind::Item(item_id),
-                name: item.name,
-                span: item.span,
-            },
-            parent,
-        );
+    fn register_decl(&mut self, decl_id: DeclId, scope: ScopeId) {
+        let item = &self.ast.decls[decl_id];
 
         match &item.kind {
-            DeclKind::Function { .. } => {
-                let scope = ScopeId::Decl(item_id);
-                self.table.scope(scope, ScopeKind::Function, Some(parent));
-            }
+            DeclKind::Module(decls) => {
+                self.define(
+                    Symbol {
+                        kind: SymbolKind::Module(decl_id),
+                        name: item.name,
+                        span: item.span,
+                    },
+                    scope,
+                );
 
-            DeclKind::Const { .. } => {}
+                let mod_scope = ScopeId::Decl(decl_id);
+                self.table.scope(mod_scope, ScopeKind::Module, Some(scope));
+
+                for &decl in decls {
+                    self.register_decl(decl, mod_scope);
+                }
+            }
+            DeclKind::Function { .. } => {
+                self.define(
+                    Symbol {
+                        kind: SymbolKind::Function(decl_id),
+                        name: item.name,
+                        span: item.span,
+                    },
+                    scope,
+                );
+
+                let fn_scope = ScopeId::Decl(decl_id);
+                self.table.scope(fn_scope, ScopeKind::Function, Some(scope));
+            }
+            DeclKind::Enum { variants, .. } => {
+                let enum_symbol = self.define(
+                    Symbol {
+                        kind: SymbolKind::Enum(decl_id),
+                        name: item.name,
+                        span: item.span,
+                    },
+                    scope,
+                );
+
+                let enum_scope = ScopeId::Decl(decl_id);
+                self.table.scope(enum_scope, ScopeKind::Enum, Some(scope));
+
+                for variant in variants {
+                    self.define(
+                        Symbol {
+                            kind: SymbolKind::Variant(enum_symbol),
+                            name: variant.name,
+                            span: variant.span,
+                        },
+                        enum_scope,
+                    );
+                }
+            }
+            DeclKind::Const { .. } => {
+                self.define(
+                    Symbol {
+                        kind: SymbolKind::Const(decl_id),
+                        name: item.name,
+                        span: item.span,
+                    },
+                    scope,
+                );
+            }
+            DeclKind::Struct { .. } => {
+                self.define(
+                    Symbol {
+                        kind: SymbolKind::Struct(decl_id),
+                        name: item.name,
+                        span: item.span,
+                    },
+                    scope,
+                );
+            }
+            DeclKind::Union { .. } => {
+                self.define(
+                    Symbol {
+                        kind: SymbolKind::Union(decl_id),
+                        name: item.name,
+                        span: item.span,
+                    },
+                    scope,
+                );
+            }
         }
     }
 
-    fn resolve_decl(&mut self, item_id: DeclId, parent_scope: ScopeId) {
-        let item = &self.ast.decls[item_id];
+    fn resolve_decl(&mut self, decl_id: DeclId, parent_scope: ScopeId) {
+        let item = &self.ast.decls[decl_id];
 
         match &item.kind {
-            DeclKind::Function { params, ret, body } => {
-                let scope = ScopeId::Decl(item_id);
+            DeclKind::Module(decls) => {
+                let scope = ScopeId::Decl(decl_id);
+
+                for &decl in decls {
+                    self.resolve_decl(decl, scope);
+                }
+            }
+            DeclKind::Function {
+                params, ret, body, ..
+            } => {
+                let scope = ScopeId::Decl(decl_id);
 
                 // Register function parameters
                 for param in params {
-                    self.resolve_expr(param.ty, scope);
+                    self.resolve_type(param.ty, scope);
                     self.add_pattern_bindings(param.pattern, scope);
                 }
 
                 // Resolve return type
                 if let Some(ret_ty) = ret {
-                    self.resolve_expr(*ret_ty, scope);
+                    self.resolve_type(*ret_ty, scope);
                 }
 
                 // Resolve body
                 self.resolve_expr(*body, scope);
             }
-
             DeclKind::Const { ty, value } => {
                 if let Some(ty) = ty {
-                    self.resolve_expr(*ty, parent_scope);
+                    self.resolve_type(*ty, parent_scope);
                 }
                 self.resolve_expr(*value, parent_scope);
+            }
+            DeclKind::Struct { fields, .. } => {
+                self.resolve_fields(fields, parent_scope);
+            }
+
+            DeclKind::Union { fields, .. } => {
+                self.resolve_fields(fields, parent_scope);
+            }
+            DeclKind::Enum { base, .. } => {
+                if let Some(base) = base {
+                    self.resolve_type(*base, parent_scope);
+                }
             }
         }
     }
@@ -277,17 +374,9 @@ impl<'a> NameResolver<'a> {
             | ExprKind::StrLit(_)
             | ExprKind::Null
             | ExprKind::Void
-            | ExprKind::Continue
-            | ExprKind::WildcardType => {}
+            | ExprKind::Continue => {}
 
-            ExprKind::Ident(name) => {
-                if self.table.lookup(*name, scope).is_none() {
-                    self.error(ResolveError::UndefinedSymbol {
-                        name: *name,
-                        span: expr.span,
-                    })
-                }
-            }
+            ExprKind::Path(path) => self.resolve_path(*path, scope),
 
             ExprKind::ArrayLit(elems) => elems.iter().for_each(|&e| self.resolve_expr(e, scope)),
             ExprKind::ArrayRepeat { value, count } => {
@@ -295,13 +384,12 @@ impl<'a> NameResolver<'a> {
                 self.resolve_expr(*count, scope);
             }
             ExprKind::StructLit { ty, fields } => {
-                self.resolve_expr(*ty, scope);
+                self.resolve_type(*ty, scope);
                 for field in fields {
                     self.resolve_expr(field.value, scope);
                 }
             }
-            ExprKind::TupleLit(elems) => elems.iter().for_each(|&e| self.resolve_expr(e, scope)),
-            ExprKind::ScopeAccess { ty, .. } => self.resolve_expr(*ty, scope),
+
             ExprKind::Group(expr) => self.resolve_expr(*expr, scope),
             ExprKind::Unary { expr, .. } => self.resolve_expr(*expr, scope),
             ExprKind::Binary { lhs, rhs, .. } => {
@@ -349,10 +437,11 @@ impl<'a> NameResolver<'a> {
                 self.resolve_expr(*body, scope);
             }
             ExprKind::Block(stmts) => {
-                let scope = ScopeId::Expr(expr_id);
-                self.table.scope(scope, ScopeKind::Block, Some(scope));
+                let blk_scope = ScopeId::Expr(expr_id);
+                self.table.scope(blk_scope, ScopeKind::Block, Some(scope));
+
                 for stmt in stmts {
-                    self.resolve_stmt(*stmt, scope);
+                    self.resolve_stmt(*stmt, blk_scope);
                 }
             }
             ExprKind::Return(expr_id) | ExprKind::Break(expr_id) => {
@@ -386,34 +475,6 @@ impl<'a> NameResolver<'a> {
             ExprKind::Unwrap(expr_id) | ExprKind::Const(expr_id) => {
                 self.resolve_expr(*expr_id, scope);
             }
-            ExprKind::StructType(fields) | ExprKind::UnionType(fields) => {
-                self.resolve_fields(fields, scope);
-            }
-            ExprKind::EnumType(variants) => {
-                self.resolve_variants(variants, scope);
-            }
-            ExprKind::ArrayType { elem, size } => {
-                self.resolve_expr(*elem, scope);
-                self.resolve_expr(*size, scope);
-            }
-            ExprKind::SliceType(expr_id) | ExprKind::OptionType(expr_id) => {
-                self.resolve_expr(*expr_id, scope);
-            }
-            ExprKind::PointerType { pointee, .. } => {
-                self.resolve_expr(*pointee, scope);
-            }
-            ExprKind::FunctionType { params, ret } => {
-                for &param in params {
-                    self.resolve_expr(param, scope);
-                }
-
-                if let Some(ret) = ret {
-                    self.resolve_expr(*ret, scope);
-                }
-            }
-            ExprKind::ModuleType(decls) => {
-                self.resolve_module(expr_id, &decls, Some(scope));
-            }
         }
     }
 
@@ -423,7 +484,7 @@ impl<'a> NameResolver<'a> {
         match &stmt.kind {
             StmtKind::Let { pattern, ty, value } => {
                 if let Some(ty) = ty {
-                    self.resolve_expr(*ty, scope_id);
+                    self.resolve_type(*ty, scope_id);
                 }
                 self.resolve_expr(*value, scope_id);
                 self.add_pattern_bindings(*pattern, scope_id);
@@ -446,14 +507,16 @@ impl<'a> NameResolver<'a> {
             | PatternKind::CStr(_)
             | PatternKind::Rest => {}
 
-            PatternKind::Identifier { ident, .. } => {
-                if self.table.lookup(*ident, scope).is_none() {
+            PatternKind::Identifier { name, .. } => {
+                if self.table.lookup(*name, scope).is_none() {
                     self.error(ResolveError::UndefinedSymbol {
-                        name: *ident,
+                        name: *name,
                         span: pattern.span,
                     })
                 }
             }
+
+            PatternKind::Path(path) => self.resolve_path(*path, scope),
 
             PatternKind::Struct { ty, fields, .. } => {
                 self.resolve_expr(*ty, scope);
@@ -498,13 +561,14 @@ impl<'a> NameResolver<'a> {
             | PatternKind::Char(_)
             | PatternKind::CStr(_)
             | PatternKind::Range { .. }
-            | PatternKind::Rest => {}
+            | PatternKind::Rest
+            | PatternKind::Path(_) => {}
 
-            PatternKind::Identifier { ident, .. } => {
+            PatternKind::Identifier { mutable, name } => {
                 self.define(
                     Symbol {
-                        kind: SymbolKind::Variable,
-                        name: *ident,
+                        kind: SymbolKind::Variable(*mutable),
+                        name: *name,
                         span: pattern.span,
                     },
                     scope_id,
@@ -532,7 +596,65 @@ impl<'a> NameResolver<'a> {
         }
     }
 
-    fn resolve_fields(&mut self, fields: &[AstField], scope_id: ScopeId) {
+    fn resolve_path(&mut self, path_id: PathId, scope: ScopeId) {
+        let path = &self.ast.paths[path_id];
+
+        if path.is_simple() {
+            if self.table.lookup(path.first.name, scope).is_none() {
+                self.error(ResolveError::UndefinedSymbol {
+                    name: path.first.name,
+                    span: path.span,
+                })
+            }
+        } else {
+            todo!("complex path")
+        }
+    }
+
+    fn resolve_type(&mut self, type_id: AstTypeId, scope: ScopeId) {
+        let ty = &self.ast.types[type_id];
+
+        match &ty.kind {
+            AstTypeKind::CInt
+            | AstTypeKind::CStr
+            | AstTypeKind::Bool
+            | AstTypeKind::Int
+            | AstTypeKind::Uint
+            | AstTypeKind::Float
+            | AstTypeKind::Char
+            | AstTypeKind::Str
+            | AstTypeKind::Never
+            | AstTypeKind::Void
+            | AstTypeKind::Inferred => {}
+
+            AstTypeKind::Path(path) => self.resolve_path(*path, scope),
+            AstTypeKind::Tuple(types) => {
+                for ty in types {
+                    self.resolve_type(*ty, scope);
+                }
+            }
+            AstTypeKind::Array { elem, len } => {
+                self.resolve_type(*elem, scope);
+                self.resolve_expr(*len, scope);
+            }
+            AstTypeKind::Slice(ty)
+            | AstTypeKind::Optional(ty)
+            | AstTypeKind::Pointer { pointee: ty, .. } => {
+                self.resolve_type(*ty, scope);
+            }
+            AstTypeKind::Function { params, ret } => {
+                for param in params {
+                    self.resolve_type(*param, scope);
+                }
+
+                if let Some(ret) = ret {
+                    self.resolve_type(*ret, scope);
+                }
+            }
+        }
+    }
+
+    fn resolve_fields(&mut self, fields: &[Field], scope_id: ScopeId) {
         let mut seen: AHashMap<Ident, Span> = AHashMap::new();
         for field in fields {
             match seen.entry(field.name) {
@@ -547,29 +669,7 @@ impl<'a> NameResolver<'a> {
                     entry.insert(field.span);
                 }
             }
-            self.resolve_expr(field.ty, scope_id);
-        }
-    }
-
-    fn resolve_variants(&mut self, variants: &[AstVariant], scope_id: ScopeId) {
-        let mut seen: AHashMap<Ident, Span> = AHashMap::new();
-        for variant in variants {
-            match seen.entry(variant.name) {
-                Entry::Occupied(entry) => {
-                    self.error(ResolveError::DuplicateField {
-                        name: variant.name,
-                        first_def: *entry.get(),
-                        dupe_def: variant.span,
-                    });
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(variant.span);
-                }
-            }
-
-            if let Some(value) = variant.value {
-                self.resolve_expr(value, scope_id);
-            }
+            self.resolve_type(field.ty, scope_id);
         }
     }
 }
