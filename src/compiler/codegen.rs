@@ -178,10 +178,10 @@ impl<'a> Codegen<'a> {
 
             Inst::BinOp {
                 dst,
-                op,
-                ty,
                 lhs,
                 rhs,
+                op,
+                ty,
             } => {
                 // We only allow scalar types for raw binary operations,
                 // so r_dst allocation is correct.

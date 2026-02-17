@@ -139,14 +139,11 @@ impl SymbolTable {
 
         match scope.symbols.entry(symbol.name) {
             Entry::Vacant(entry) => Ok(*entry.insert(self.symbols.insert(symbol))),
-            Entry::Occupied(entry) => {
-                let first_def = self.symbols[*entry.get()].span;
-                Err(DuplicateSymbol {
-                    name: symbol.name,
-                    first: first_def,
-                    duplicate: symbol.span,
-                })
-            }
+            Entry::Occupied(entry) => Err(DuplicateSymbol {
+                name: symbol.name,
+                first: self.symbols[*entry.get()].span,
+                duplicate: symbol.span,
+            }),
         }
     }
 
@@ -177,7 +174,6 @@ pub struct Sema<'a> {
     values: ValueArena,
     value_bindings: AHashMap<SymbolId, SemaValueId>,
     expr_types: AHashMap<ExprId, SemaTypeId>,
-    diverges: bool,
 }
 
 impl<'a> Sema<'a> {
@@ -190,7 +186,6 @@ impl<'a> Sema<'a> {
             values: ValueArena::new(),
             value_bindings: AHashMap::new(),
             expr_types: AHashMap::new(),
-            diverges: false,
         }
     }
 
@@ -1233,15 +1228,19 @@ impl<'a> Sema<'a> {
                     self.bind_variable_pattern(scope, *pattern, val_ty)?;
                 }
                 StmtKind::Semi(expr) => {
-                    // Evaluate expression type, but result is surpressed by semicolon
-                    self.check_expr(scope, *expr)?;
+                    // Evaluate expression type, but result is suppressed by semicolon
+                    let expr_ty = self.check_expr(scope, *expr)?;
+
+                    // Diverging expressions are always assigned to the block type.
+                    if matches!(self.types.get(expr_ty), SemaType::Never) {
+                        block_type = self.types.never
+                    }
                 }
                 StmtKind::Expr(expr) => {
                     let expr_type = self.check_expr(scope, *expr)?;
 
-                    // Expression without semicolon must be the last or coerce to void type
-                    // We use coerce instead of direct comparison to support never types
-                    // E.g. return, break, continue
+                    // Expression without semicolon must be the last or coerce to void type.
+                    // We use coerce instead of direct check to support diverging expressions.
                     if i == last {
                         block_type = expr_type;
                     } else {
