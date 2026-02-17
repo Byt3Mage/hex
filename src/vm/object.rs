@@ -3,7 +3,7 @@ use std::slice::Iter;
 use crate::vm::{
     Task,
     heap::{GCHeader, GCPtr},
-    program::FunctionId,
+    program::FunctionPtr,
 };
 
 macro_rules! value {
@@ -29,6 +29,7 @@ macro_rules! value {
 
         #[repr(C)]
         #[derive(Clone, Copy)]
+        #[allow(non_snake_case)]
         union ValueData {
             $($field: $ty),*
         }
@@ -99,7 +100,7 @@ value! {
     Bool: bool,
     Float: f64,
     Char: char,
-    Func: FunctionId,
+    Func: FunctionPtr,
     // Niche values that can live in a single register
     OptPtr: Option<GCPtr>,
     OptBool: Option<bool>,

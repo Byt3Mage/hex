@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use crate::{
     arena::{Arena, Ident},
     compiler::{ast::DeclId, sema::sema_value::SemaValueId},
@@ -10,8 +12,8 @@ slotmap::new_key_type! {
 #[derive(Debug)]
 pub enum SemaType {
     // Compile time primitives
-    CInt,
-    CStr,
+    Cint,
+    Cstr,
 
     // Primitives
     Int,
@@ -60,13 +62,13 @@ type Name = Ident;
 #[derive(Debug)]
 pub struct StructInfo {
     pub name: Option<Name>,
-    pub fields: Vec<FieldInfo>,
+    pub fields: Rc<[FieldInfo]>,
 }
 
 #[derive(Debug, Clone)]
 pub struct UnionInfo {
     pub name: Option<Name>,
-    pub fields: Vec<FieldInfo>,
+    pub fields: Rc<[FieldInfo]>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,8 +113,8 @@ impl TypeArena {
     pub fn new() -> Self {
         let mut types = Arena::with_key();
         Self {
-            cint: types.insert(SemaType::CInt),
-            cstr: types.insert(SemaType::CStr),
+            cint: types.insert(SemaType::Cint),
+            cstr: types.insert(SemaType::Cstr),
             int: types.insert(SemaType::Int),
             uint: types.insert(SemaType::Uint),
             float: types.insert(SemaType::Float),

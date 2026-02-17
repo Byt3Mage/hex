@@ -44,11 +44,11 @@ impl SizeClass {
     const S832: Self = Self(32);
     const S896: Self = Self(33);
     const S960: Self = Self(34);
-    pub const S1024: Self = Self(35);
-    pub const LARGE: Self = Self(0xFF);
+    const S1024: Self = Self(35);
+    const LARGE: Self = Self(0xFF);
 
-    pub const COUNT: usize = Self::S1024.0 as usize + 1;
-    pub const MAX_SMALL_SIZE: usize = 1024;
+    const COUNT: usize = Self::S1024.0 as usize + 1;
+    const MAX_SMALL_SIZE: usize = 1024;
 
     const BLOCK_SIZES: [usize; Self::COUNT] = [
         8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256,
@@ -60,81 +60,45 @@ impl SizeClass {
         let mut size = 1usize;
 
         while size <= Self::MAX_SMALL_SIZE {
-            let class = if size <= 8 {
-                0
-            } else if size <= 16 {
-                1
-            } else if size <= 24 {
-                2
-            } else if size <= 32 {
-                3
-            } else if size <= 40 {
-                4
-            } else if size <= 48 {
-                5
-            } else if size <= 56 {
-                6
-            } else if size <= 64 {
-                7
-            } else if size <= 80 {
-                8
-            } else if size <= 96 {
-                9
-            } else if size <= 112 {
-                10
-            } else if size <= 128 {
-                11
-            } else if size <= 144 {
-                12
-            } else if size <= 160 {
-                13
-            } else if size <= 176 {
-                14
-            } else if size <= 192 {
-                15
-            } else if size <= 208 {
-                16
-            } else if size <= 224 {
-                17
-            } else if size <= 240 {
-                18
-            } else if size <= 256 {
-                19
-            } else if size <= 288 {
-                20
-            } else if size <= 320 {
-                21
-            } else if size <= 352 {
-                22
-            } else if size <= 384 {
-                23
-            } else if size <= 416 {
-                24
-            } else if size <= 448 {
-                25
-            } else if size <= 480 {
-                26
-            } else if size <= 512 {
-                27
-            } else if size <= 576 {
-                28
-            } else if size <= 640 {
-                29
-            } else if size <= 704 {
-                30
-            } else if size <= 768 {
-                31
-            } else if size <= 832 {
-                32
-            } else if size <= 896 {
-                33
-            } else if size <= 960 {
-                34
-            } else {
-                35
+            table[size] = match size {
+                0..=8 => Self::S8,
+                9..=16 => Self::S16,
+                17..=24 => Self::S24,
+                25..=32 => Self::S32,
+                33..=40 => Self::S40,
+                41..=48 => Self::S48,
+                49..=56 => Self::S56,
+                57..=64 => Self::S64,
+                65..=80 => Self::S80,
+                81..=96 => Self::S96,
+                97..=112 => Self::S112,
+                113..=128 => Self::S128,
+                129..=144 => Self::S144,
+                145..=160 => Self::S160,
+                161..=176 => Self::S176,
+                177..=192 => Self::S192,
+                193..=208 => Self::S208,
+                209..=224 => Self::S224,
+                225..=240 => Self::S240,
+                241..=256 => Self::S256,
+                257..=288 => Self::S288,
+                289..=320 => Self::S320,
+                321..=352 => Self::S352,
+                353..=384 => Self::S384,
+                385..=416 => Self::S416,
+                417..=448 => Self::S448,
+                449..=480 => Self::S480,
+                481..=512 => Self::S512,
+                513..=576 => Self::S576,
+                577..=640 => Self::S640,
+                641..=704 => Self::S704,
+                705..=768 => Self::S768,
+                769..=832 => Self::S832,
+                833..=896 => Self::S896,
+                897..=960 => Self::S960,
+                _ => Self::S1024,
             };
 
-            table[size] = Self(class);
             size += 1;
         }
 
@@ -195,7 +159,7 @@ pub struct Page {
     page_size: u32,
     block_size: u32,
     size_class: SizeClass,
-    _padding: [u8; 3],
+    padding: [u8; 3],
 
     // Allocation state
     block_free_list: Option<NonNull<GCHeader>>,
@@ -212,7 +176,7 @@ impl Page {
     const LARGE_PAGE_SIZE: usize = 32 * 1024;
     const SIZE_THRESHOLD: usize = 512;
 
-    fn page_layout(page_size: usize) -> Layout {
+    fn layout(page_size: usize) -> Layout {
         Layout::from_size_align(page_size, PAGE_ALIGN).unwrap()
     }
 
@@ -240,7 +204,7 @@ impl Page {
         block_size: usize,
         size_class: SizeClass,
     ) -> Option<PagePtr> {
-        let ptr = allocator.alloc_page(Self::page_layout(page_size))?;
+        let ptr = allocator.alloc_page(Self::layout(page_size))?;
         let data_size = page_size - Self::HEADER_SIZE;
         let block_count = data_size / block_size;
         let last_block_offset = (block_count - 1) * block_size;
@@ -255,7 +219,7 @@ impl Page {
                 page_size: page_size as u32,
                 block_size: block_size as u32,
                 size_class,
-                _padding: [0; 3],
+                padding: [0; 3],
                 block_free_list: None,
                 block_free_next: last_block_offset as i32,
                 busy_blocks: 0,
@@ -274,8 +238,7 @@ impl Page {
             debug_assert!(page_ref.freelist_prev.is_none());
             debug_assert!(page_ref.freelist_next.is_none());
 
-            let layout = Self::page_layout(page_ref.page_size as usize);
-            allocator.dealloc_page(page.cast(), layout);
+            allocator.dealloc_page(page.cast(), Self::layout(page_ref.page_size as usize));
         }
     }
 
@@ -443,7 +406,7 @@ pub struct PageManager<A: PageAllocator> {
     freelist: [Option<PagePtr>; SizeClass::COUNT],
 
     /// All gcobject pages
-    gco_pagelist: Option<PagePtr>,
+    pagelist: Option<PagePtr>,
 
     /// Total number of pages currently allocated
     total_pages: usize,
@@ -457,7 +420,7 @@ impl<A: PageAllocator> PageManager<A> {
         Self {
             allocator,
             freelist: [None; SizeClass::COUNT],
-            gco_pagelist: None,
+            pagelist: None,
             total_pages: 0,
             total_bytes: 0,
         }
@@ -472,7 +435,7 @@ impl<A: PageAllocator> PageManager<A> {
     }
 
     pub fn gco_pages(&self) -> Option<PagePtr> {
-        self.gco_pagelist
+        self.pagelist
     }
 
     pub fn alloc(&mut self, size: usize) -> Option<NonNull<GCHeader>> {
@@ -484,6 +447,7 @@ impl<A: PageAllocator> PageManager<A> {
         let index = size_class.as_index();
 
         unsafe {
+            // find a page with free blocks in the freelist for this size class
             if let Some(mut page_ptr) = self.freelist[index] {
                 let page = page_ptr.as_mut();
                 let block = page.alloc();
@@ -495,15 +459,17 @@ impl<A: PageAllocator> PageManager<A> {
                 return block;
             }
 
+            // allocate fresh page and allocate from it
             let mut page_ptr = Page::new(&mut self.allocator, size_class)?;
-            let page = page_ptr.as_mut();
+            self.pagelist_insert(page_ptr);
 
-            self.gco_pagelist_insert(page_ptr);
+            let page = page_ptr.as_mut();
             self.total_pages += 1;
             self.total_bytes += page.page_size();
 
             let block = page.alloc();
 
+            // should have free blocks, but just in case
             if page.has_free() {
                 self.freelist_insert(page_ptr, size_class);
             }
@@ -514,11 +480,10 @@ impl<A: PageAllocator> PageManager<A> {
 
     fn alloc_large(&mut self, size: usize) -> Option<NonNull<GCHeader>> {
         let mut page_ptr = Page::new_large(&mut self.allocator, size)?;
+        self.pagelist_insert(page_ptr);
 
         unsafe {
             let page = page_ptr.as_mut();
-
-            self.gco_pagelist_insert(page_ptr);
             self.total_pages += 1;
             self.total_bytes += page.page_size();
 
@@ -526,31 +491,31 @@ impl<A: PageAllocator> PageManager<A> {
         }
     }
 
-    fn gco_pagelist_insert(&mut self, mut page_ptr: PagePtr) {
+    fn pagelist_insert(&mut self, mut page_ptr: PagePtr) {
         unsafe {
             let page = page_ptr.as_mut();
 
             debug_assert!(page.pagelist_prev.is_none());
             debug_assert!(page.pagelist_next.is_none());
 
-            page.pagelist_next = self.gco_pagelist;
+            page.pagelist_next = self.pagelist;
 
-            if let Some(mut old_head) = self.gco_pagelist {
+            if let Some(mut old_head) = self.pagelist {
                 old_head.as_mut().pagelist_prev = Some(page_ptr);
             }
 
-            self.gco_pagelist = Some(page_ptr);
+            self.pagelist = Some(page_ptr);
         }
     }
 
-    fn gco_pagelist_remove(&mut self, mut page_ptr: PagePtr) {
+    fn pagelist_remove(&mut self, mut page_ptr: PagePtr) {
         unsafe {
             let page = page_ptr.as_mut();
 
             if let Some(mut prev) = page.pagelist_prev {
                 prev.as_mut().pagelist_next = page.pagelist_next;
             } else {
-                self.gco_pagelist = page.pagelist_next;
+                self.pagelist = page.pagelist_next;
             }
 
             if let Some(mut next) = page.pagelist_next {
@@ -626,13 +591,13 @@ impl<A: PageAllocator> PageManager<A> {
 
     fn release_page(&mut self, mut page_ptr: PagePtr, size_class: SizeClass) {
         unsafe {
-            let page = page_ptr.as_mut();
+            self.pagelist_remove(page_ptr);
 
             if !size_class.is_large() {
                 self.freelist_remove(page_ptr, size_class);
             }
 
-            self.gco_pagelist_remove(page_ptr);
+            let page = page_ptr.as_mut();
             self.total_pages -= 1;
             self.total_bytes -= page.page_size();
 
@@ -643,7 +608,7 @@ impl<A: PageAllocator> PageManager<A> {
     /// Reset the page manager, deallocating all pages.
     pub fn reset(&mut self) {
         // Free all GCO pages
-        let mut page_opt = self.gco_pagelist;
+        let mut page_opt = self.pagelist;
         while let Some(page_ptr) = page_opt {
             unsafe {
                 let next = page_ptr.as_ref().pagelist_next();
@@ -654,7 +619,7 @@ impl<A: PageAllocator> PageManager<A> {
 
         // Reset state
         self.freelist = [None; SizeClass::COUNT];
-        self.gco_pagelist = None;
+        self.pagelist = None;
         self.total_pages = 0;
         self.total_bytes = 0;
         self.allocator.reset();
@@ -663,7 +628,7 @@ impl<A: PageAllocator> PageManager<A> {
 
 impl<A: PageAllocator> Drop for PageManager<A> {
     fn drop(&mut self) {
-        let mut page_opt = self.gco_pagelist;
+        let mut page_opt = self.pagelist;
         while let Some(page_ptr) = page_opt {
             let next = unsafe { page_ptr.as_ref().pagelist_next() };
             unsafe { Page::destroy(page_ptr, &mut self.allocator) };

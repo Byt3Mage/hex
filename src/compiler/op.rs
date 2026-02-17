@@ -1,32 +1,31 @@
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum UnaryOp {
+pub enum UnOp {
     Neg,
     Not,
-    BitNot,
     Deref,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum BinaryOp {
+pub enum BinOp {
     Add,
     Sub,
     Mul,
     Div,
     Mod,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
     BitAnd,
     BitOr,
     BitXor,
     Shl,
     Shr,
-    Eq,
-    Ne,
-    Lt,
-    Gt,
-    Le,
-    Ge,
-    And,
-    Or,
-    UnwrapOr,
+    NullCoalesce,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

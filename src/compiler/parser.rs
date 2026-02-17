@@ -2,17 +2,20 @@ use simple_ternary::tnr;
 
 use super::{
     ast::{AstArena, Expr, ExprKind, Param, Stmt, StmtKind},
-    ast_op::{AssignOp, BinaryOp, UnaryOp},
     lexer::{LexError, Lexer},
+    op::{AssignOp, BinOp, UnOp},
     parse_rules::{InfixRule, ParseRule, Precedence, PrefixRule},
     tokens::{Span, Token, TokenType},
 };
 
 use crate::{
     arena::Interner,
-    compiler::ast::{
-        AstType, AstTypeKind, Decl, DeclId, DeclKind, Field, Path, PathSegment, Pattern,
-        PatternKind, Variant, Visibility,
+    compiler::{
+        ast::{
+            AstType, AstTypeKind, Decl, DeclId, DeclKind, FieldDef, FieldInit, Path, PathSegment,
+            Pattern, PatternKind, VariantDef, Visibility,
+        },
+        sema::sema_value::ComptimeInt,
     },
     tt,
 };
@@ -23,7 +26,7 @@ pub struct ParseError {
     span: Span,
 }
 
-type ParseResult<T> = Result<T, ParseError>;
+type Result<T> = std::result::Result<T, ParseError>;
 
 pub struct Parser<'a> {
     lexer: &'a mut Lexer<'a>,
@@ -37,7 +40,7 @@ impl<'a> Parser<'a> {
         lexer: &'a mut Lexer<'a>,
         interner: &'a mut Interner,
         ast: &'a mut AstArena,
-    ) -> Result<Parser<'a>, LexError> {
+    ) -> std::result::Result<Parser<'a>, LexError> {
         let current = lexer.next_token()?;
 
         Ok(Parser {
@@ -48,7 +51,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    pub fn advance(&mut self) -> Result<(), ParseError> {
+    pub fn advance(&mut self) -> Result<()> {
         match self.lexer.next_token() {
             Ok(token) => {
                 self.current = token;
@@ -61,7 +64,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn advance_if(&mut self, ty: TokenType) -> Result<bool, ParseError> {
+    fn advance_if(&mut self, ty: TokenType) -> Result<bool> {
         if self.current.ty == ty {
             self.advance()?;
             Ok(true)
@@ -70,7 +73,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn consume(&mut self) -> Result<Token<'a>, ParseError> {
+    fn consume(&mut self) -> Result<Token<'a>> {
         let token = self.current.clone();
         self.advance()?;
         Ok(token)
@@ -81,7 +84,7 @@ impl<'a> Parser<'a> {
         self.current.ty == ty
     }
 
-    fn expect(&mut self, ty: TokenType) -> Result<Token<'a>, ParseError> {
+    fn expect(&mut self, ty: TokenType) -> Result<Token<'a>> {
         if self.current.ty == ty {
             self.consume()
         } else {
@@ -92,7 +95,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub fn parse_source(&mut self) -> ParseResult<DeclId> {
+    pub fn parse_source(&mut self) -> Result<DeclId> {
         let mut items = vec![];
 
         while !self.check(tt![eof]) {
@@ -110,7 +113,7 @@ impl<'a> Parser<'a> {
         Ok(self.ast.decls.insert(module))
     }
 
-    fn parse_decl(&mut self) -> ParseResult<Decl> {
+    fn parse_decl(&mut self) -> Result<Decl> {
         let vis = tnr! { self.advance_if(tt![pub])? => Visibility::Public : Visibility::Private};
 
         match self.current.ty {
@@ -118,6 +121,8 @@ impl<'a> Parser<'a> {
             tt![fn] => self.parse_func_decl(vis),
             tt![const] => self.parse_const_decl(vis),
             tt![struct] => self.parse_struct_decl(vis),
+            tt![union] => self.parse_union_decl(vis),
+            tt![enum] => self.parse_enum_decl(vis),
             tt => Err(ParseError {
                 msg: format!("Expected declaration, found {tt:?}"),
                 span: self.current.span,
@@ -125,7 +130,30 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_func_decl(&mut self, visibility: Visibility) -> ParseResult<Decl> {
+    fn parse_mod_decl(&mut self, visibility: Visibility) -> Result<Decl> {
+        let mod_token = self.expect(tt![mod])?;
+        let mod_name = self.expect(tt![ident])?;
+
+        self.expect(tt!['{'])?;
+
+        let mut decls = vec![];
+
+        while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
+            let item = self.parse_decl()?;
+            decls.push(self.ast.decls.insert(item));
+        }
+
+        let r_brace = self.expect(tt!['}'])?;
+
+        Ok(Decl {
+            visibility,
+            name: self.interner.get_or_intern(mod_name.lexeme),
+            kind: DeclKind::Module(decls),
+            span: mod_token.span.merge(r_brace.span),
+        })
+    }
+
+    fn parse_func_decl(&mut self, visibility: Visibility) -> Result<Decl> {
         let fn_token = self.expect(tt![fn])?;
         let func_name = self.expect(tt![ident])?;
 
@@ -150,7 +178,7 @@ impl<'a> Parser<'a> {
 
         self.expect(tt![')'])?;
 
-        let ret = if self.advance_if(tt![->])? {
+        let ret = if self.advance_if(tt![:])? {
             let ret = self.parse_type()?;
             Some(self.ast.types.insert(ret))
         } else {
@@ -172,7 +200,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_const_decl(&mut self, visibility: Visibility) -> ParseResult<Decl> {
+    fn parse_const_decl(&mut self, visibility: Visibility) -> Result<Decl> {
         let const_token = self.expect(tt![const])?;
         let const_name = self.expect(tt![ident])?;
 
@@ -199,30 +227,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_mod_decl(&mut self, visibility: Visibility) -> ParseResult<Decl> {
-        let mod_token = self.expect(tt![mod])?;
-        let mod_name = self.expect(tt![ident])?;
-
-        self.expect(tt!['{'])?;
-
-        let mut decls = vec![];
-
-        while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
-            let item = self.parse_decl()?;
-            decls.push(self.ast.decls.insert(item));
-        }
-
-        let r_brace = self.expect(tt!['}'])?;
-
-        Ok(Decl {
-            visibility,
-            name: self.interner.get_or_intern(mod_name.lexeme),
-            kind: DeclKind::Module(decls),
-            span: mod_token.span.merge(r_brace.span),
-        })
-    }
-
-    fn parse_struct_decl(&mut self, visibility: Visibility) -> ParseResult<Decl> {
+    fn parse_struct_decl(&mut self, visibility: Visibility) -> Result<Decl> {
         let struct_token = self.expect(tt![struct])?;
         let struct_name = self.expect(tt![ident])?;
 
@@ -237,7 +242,7 @@ impl<'a> Parser<'a> {
             self.expect(tt![:])?;
             let field_ty = self.parse_type()?;
 
-            fields.push(Field {
+            fields.push(FieldDef {
                 visibility: vis,
                 span: field_name.span.merge(field_ty.span),
                 name: self.interner.get_or_intern(field_name.lexeme),
@@ -262,7 +267,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_union_type(&mut self, visibility: Visibility) -> ParseResult<Decl> {
+    fn parse_union_decl(&mut self, visibility: Visibility) -> Result<Decl> {
         let union_token = self.expect(tt![union])?;
         let union_name = self.expect(tt![ident])?;
 
@@ -275,7 +280,7 @@ impl<'a> Parser<'a> {
             self.expect(tt![:])?;
             let field_ty = self.parse_type()?;
 
-            fields.push(Field {
+            fields.push(FieldDef {
                 visibility: vis,
                 span: field_name.span.merge(field_ty.span),
                 name: self.interner.get_or_intern(field_name.lexeme),
@@ -300,7 +305,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_enum_type(&mut self, visibility: Visibility) -> ParseResult<Decl> {
+    fn parse_enum_decl(&mut self, visibility: Visibility) -> Result<Decl> {
         let enum_token = self.expect(tt![enum])?;
         let enum_name = self.expect(tt![ident])?;
         let mut base = None;
@@ -325,7 +330,7 @@ impl<'a> Parser<'a> {
                 None
             };
 
-            variants.push(Variant {
+            variants.push(VariantDef {
                 name: self.interner.get_or_intern(variant_name.lexeme),
                 value,
                 span,
@@ -346,7 +351,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_type(&mut self) -> ParseResult<AstType> {
+    fn parse_type(&mut self) -> Result<AstType> {
         let ty_token = self.consume()?;
         let mut span = ty_token.span;
 
@@ -439,7 +444,7 @@ impl<'a> Parser<'a> {
         Ok(AstType { kind, span })
     }
 
-    fn parse_path(&mut self) -> ParseResult<Path> {
+    fn parse_path(&mut self) -> Result<Path> {
         let first = self.parse_path_segment()?;
         let mut span = first.span;
 
@@ -453,7 +458,7 @@ impl<'a> Parser<'a> {
         Ok(Path { first, rest, span })
     }
 
-    fn parse_path_w_first(&mut self, first: Token) -> ParseResult<Path> {
+    fn parse_path_w_first(&mut self, first: Token) -> Result<Path> {
         let first = PathSegment {
             name: self.interner.get_or_intern(first.lexeme),
             generics: vec![], // TODO: generics
@@ -472,7 +477,7 @@ impl<'a> Parser<'a> {
         Ok(Path { first, rest, span })
     }
 
-    fn parse_path_segment(&mut self) -> ParseResult<PathSegment> {
+    fn parse_path_segment(&mut self) -> Result<PathSegment> {
         let name_token = self.expect(tt![ident])?;
         let span = name_token.span;
 
@@ -485,16 +490,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_semi(&mut self) -> ParseResult<Stmt> {
-        let semi_token = self.expect(tt![;])?;
-
-        Ok(Stmt {
-            kind: StmtKind::Empty,
-            span: semi_token.span,
-        })
-    }
-
-    fn parse_pattern(&mut self) -> ParseResult<Pattern> {
+    fn parse_pattern(&mut self) -> Result<Pattern> {
         let mutable = self.advance_if(tt![mut])?;
         let name_token = self.expect(tt![ident])?;
 
@@ -507,7 +503,8 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_let(&mut self) -> ParseResult<Stmt> {
+    fn parse_let(&mut self) -> Result<Stmt> {
+        let let_token = self.expect(tt![let])?;
         let pat = self.parse_pattern()?;
         let ty = tnr! {self.advance_if(tt![:])? => Some(self.parse_type()?) : None};
 
@@ -517,7 +514,7 @@ impl<'a> Parser<'a> {
         let semi_token = self.expect(tt![;])?;
 
         Ok(Stmt {
-            span: pat.span.merge(semi_token.span),
+            span: let_token.span.merge(semi_token.span),
             kind: StmtKind::Let {
                 pattern: self.ast.patterns.insert(pat),
                 ty: ty.map(|t| self.ast.types.insert(t)),
@@ -526,31 +523,23 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_expr_stmt(&mut self) -> ParseResult<Stmt> {
-        let expr = self.parse_expr()?;
-
-        Ok(Stmt {
-            span: expr.span,
-            kind: StmtKind::Expr {
-                expr: self.ast.exprs.insert(expr),
-                has_semi: self.advance_if(tt![;])?,
-            },
-        })
+    fn parse_expr(&mut self) -> Result<Expr> {
+        self.parse_precedence(Precedence::Assignment, true)
     }
 
-    fn parse_expr(&mut self) -> ParseResult<Expr> {
-        self.parse_precedence(Precedence::Assignment)
+    fn parse_expr_no_struct(&mut self) -> Result<Expr> {
+        self.parse_precedence(Precedence::Assignment, false)
     }
 
-    fn parse_precedence(&mut self, precedence: Precedence) -> ParseResult<Expr> {
+    fn parse_precedence(&mut self, precedence: Precedence, allow_struct: bool) -> Result<Expr> {
         let rule = ParseRule::get(self.current.ty);
-        let mut expr = self.parse_prefix(rule.prefix)?;
+        let mut expr = self.parse_prefix(rule.prefix, allow_struct)?;
 
         loop {
             let infix_rule = ParseRule::get(self.current.ty);
 
-            if precedence <= infix_rule.precedence && infix_rule.infix != InfixRule::None {
-                expr = self.parse_infix(infix_rule.infix, expr)?;
+            if precedence <= infix_rule.prec && infix_rule.infix != InfixRule::None {
+                expr = self.parse_infix(infix_rule.infix, expr, allow_struct)?;
             } else {
                 break;
             }
@@ -559,8 +548,10 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
-    fn parse_prefix(&mut self, rule: PrefixRule) -> ParseResult<Expr> {
+    fn parse_prefix(&mut self, rule: PrefixRule, allow_struct: bool) -> Result<Expr> {
         match rule {
+            PrefixRule::LiteralCint => self.parse_cint(),
+            PrefixRule::LiteralUint => self.parse_uint(),
             PrefixRule::LiteralInt => self.parse_int(),
             PrefixRule::LiteralFloat => self.parse_float(),
             PrefixRule::LiteralString => self.parse_string(),
@@ -569,9 +560,9 @@ impl<'a> Parser<'a> {
             PrefixRule::LiteralNull => self.parse_null(),
             PrefixRule::LiteralVoid => self.parse_void(),
             PrefixRule::LiteralArray => self.parse_array(),
-            PrefixRule::Identifier => self.parse_path_expr(),
+            PrefixRule::Identifier => self.parse_path_expr(allow_struct),
             PrefixRule::Grouping => self.parse_group(),
-            PrefixRule::Unary => self.parse_unary(),
+            PrefixRule::Unary => self.parse_unary(allow_struct),
             PrefixRule::If => self.parse_if(),
             PrefixRule::Block => self.parse_block(),
             PrefixRule::While => self.parse_while(),
@@ -589,10 +580,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_infix(&mut self, rule: InfixRule, left: Expr) -> ParseResult<Expr> {
+    fn parse_infix(&mut self, rule: InfixRule, left: Expr, allow_struct: bool) -> Result<Expr> {
         match rule {
-            InfixRule::Binary => self.parse_binary(left),
-            InfixRule::Assign => self.parse_assign(left),
+            InfixRule::Binary => self.parse_binary(left, allow_struct),
+            InfixRule::Assign => self.parse_assign(left, allow_struct),
             InfixRule::Call => self.parse_call(left),
             InfixRule::Dot => self.parse_dot(left),
             InfixRule::Index => self.parse_index(left),
@@ -603,19 +594,89 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_path_expr(&mut self) -> ParseResult<Expr> {
+    fn parse_path_expr(&mut self, allow_struct: bool) -> Result<Expr> {
         let path = self.parse_path()?;
+        let span = path.span;
+        let path = self.ast.paths.insert(path);
+
+        if allow_struct && self.check(tt!['{']) {
+            return self.parse_struct_lit(AstType {
+                kind: AstTypeKind::Path(path),
+                span,
+            });
+        }
 
         Ok(Expr {
-            span: path.span,
-            kind: ExprKind::Path(self.ast.paths.insert(path)),
+            kind: ExprKind::Path(path),
+            span,
         })
     }
 
-    fn parse_int(&mut self) -> ParseResult<Expr> {
-        let int_token = self.expect(tt![int_lit])?;
+    fn parse_struct_lit(&mut self, ty: AstType) -> Result<Expr> {
+        self.expect(tt!['{'])?;
+
+        let mut fields = vec![];
+        while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
+            let name = self.expect(tt![ident])?;
+            self.expect(tt![:])?;
+            let value = self.parse_expr()?;
+
+            fields.push(FieldInit {
+                span: name.span.merge(value.span),
+                name: self.interner.get_or_intern(name.lexeme),
+                value: self.ast.exprs.insert(value),
+            });
+
+            if !self.advance_if(tt![,])? {
+                break;
+            }
+        }
+
+        let r_brace = self.expect(tt!['}'])?;
+
+        Ok(Expr {
+            span: ty.span.merge(r_brace.span),
+            kind: ExprKind::StructLit {
+                ty: self.ast.types.insert(ty),
+                fields,
+            },
+        })
+    }
+
+    fn parse_cint(&mut self) -> Result<Expr> {
+        let int_token = self.expect(tt![cint_lit])?;
 
         match str::parse::<u64>(int_token.lexeme) {
+            Ok(u) => Ok(Expr {
+                kind: ExprKind::CintLit(ComptimeInt::from_lit(u)),
+                span: int_token.span,
+            }),
+            Err(err) => Err(ParseError {
+                msg: format!("Error parsing int literal: {err}"),
+                span: int_token.span,
+            }),
+        }
+    }
+
+    fn parse_uint(&mut self) -> Result<Expr> {
+        let int_token = self.expect(tt![uint_lit])?;
+
+        match str::parse::<u64>(int_token.lexeme) {
+            Ok(u) => Ok(Expr {
+                kind: ExprKind::UintLit(u),
+                span: int_token.span,
+            }),
+            Err(err) => Err(ParseError {
+                msg: format!("Error parsing int literal: {err}"),
+                span: int_token.span,
+            }),
+        }
+    }
+
+    fn parse_int(&mut self) -> Result<Expr> {
+        let int_token = self.expect(tt![int_lit])?;
+
+        match str::parse::<i64>(int_token.lexeme) {
             Ok(i) => Ok(Expr {
                 kind: ExprKind::IntLit(i),
                 span: int_token.span,
@@ -627,7 +688,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_float(&mut self) -> ParseResult<Expr> {
+    fn parse_float(&mut self) -> Result<Expr> {
         let float_token = self.expect(tt![float_lit])?;
 
         match str::parse::<f64>(float_token.lexeme) {
@@ -642,7 +703,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_string(&mut self) -> ParseResult<Expr> {
+    fn parse_string(&mut self) -> Result<Expr> {
         let str_token = self.expect(tt![str_lit])?;
 
         Ok(Expr {
@@ -651,7 +712,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_true(&mut self) -> ParseResult<Expr> {
+    fn parse_true(&mut self) -> Result<Expr> {
         let true_token = self.expect(tt![true])?;
 
         Ok(Expr {
@@ -660,7 +721,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_false(&mut self) -> ParseResult<Expr> {
+    fn parse_false(&mut self) -> Result<Expr> {
         let false_token = self.expect(tt![false])?;
 
         Ok(Expr {
@@ -669,7 +730,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_null(&mut self) -> ParseResult<Expr> {
+    fn parse_null(&mut self) -> Result<Expr> {
         let null_token = self.expect(tt![null])?;
 
         Ok(Expr {
@@ -678,7 +739,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_void(&mut self) -> ParseResult<Expr> {
+    fn parse_void(&mut self) -> Result<Expr> {
         let void_token = self.expect(tt![void])?;
 
         Ok(Expr {
@@ -687,7 +748,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_array(&mut self) -> ParseResult<Expr> {
+    fn parse_array(&mut self) -> Result<Expr> {
         let l_brkt = self.expect(tt!['['])?;
 
         // Parse empty array literal
@@ -737,7 +798,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_group(&mut self) -> ParseResult<Expr> {
+    fn parse_group(&mut self) -> Result<Expr> {
         let open = self.expect(tt!['('])?;
         let expr = self.parse_expr()?;
         let close = self.expect(tt![')'])?;
@@ -748,12 +809,12 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_unary(&mut self) -> ParseResult<Expr> {
+    fn parse_unary(&mut self, allow_struct: bool) -> Result<Expr> {
         let op_token = self.consume()?;
 
         let op = match op_token.ty {
-            tt![-] => UnaryOp::Neg,
-            tt![!] => UnaryOp::Not,
+            tt![-] => UnOp::Neg,
+            tt![!] => UnOp::Not,
             _ => {
                 return Err(ParseError {
                     msg: format!("Unsupported unary operator: {:?}", op_token.ty),
@@ -762,31 +823,37 @@ impl<'a> Parser<'a> {
             }
         };
 
-        let expr = self.parse_precedence(Precedence::Unary)?;
+        let expr = self.parse_precedence(Precedence::Unary, allow_struct)?;
 
         Ok(Expr {
             span: op_token.span.merge(expr.span),
             kind: ExprKind::Unary {
                 op,
-                expr: self.ast.exprs.insert(expr),
+                rhs: self.ast.exprs.insert(expr),
             },
         })
     }
 
-    fn parse_binary(&mut self, lhs: Expr) -> ParseResult<Expr> {
+    fn parse_binary(&mut self, lhs: Expr, allow_struct: bool) -> Result<Expr> {
         let op_token = self.consume()?;
         let op = match op_token.ty {
-            tt![+] => BinaryOp::Add,
-            tt![-] => BinaryOp::Sub,
-            tt![*] => BinaryOp::Mul,
-            tt![/] => BinaryOp::Div,
-            tt![%] => BinaryOp::Mod,
-            tt![==] => BinaryOp::Eq,
-            tt![!=] => BinaryOp::Ne,
-            tt![<] => BinaryOp::Lt,
-            tt![<=] => BinaryOp::Le,
-            tt![>] => BinaryOp::Gt,
-            tt![>=] => BinaryOp::Ge,
+            tt![+] => BinOp::Add,
+            tt![-] => BinOp::Sub,
+            tt![*] => BinOp::Mul,
+            tt![/] => BinOp::Div,
+            tt![%] => BinOp::Mod,
+            tt![&] => BinOp::BitAnd,
+            tt![|] => BinOp::BitOr,
+            tt![^] => BinOp::BitXor,
+            tt![<<] => BinOp::Shl,
+            tt![>>] => BinOp::Shr,
+            tt![==] => BinOp::Eq,
+            tt![!=] => BinOp::Ne,
+            tt![<] => BinOp::Lt,
+            tt![<=] => BinOp::Le,
+            tt![>] => BinOp::Gt,
+            tt![>=] => BinOp::Ge,
+            tt![?:] => BinOp::NullCoalesce,
             _ => {
                 return Err(ParseError {
                     msg: format!("Unsupported binary operator: {:?}", op_token.ty),
@@ -795,8 +862,8 @@ impl<'a> Parser<'a> {
             }
         };
 
-        let precedence = ParseRule::get(op_token.ty).precedence;
-        let rhs = self.parse_precedence(precedence.next())?;
+        let rule = ParseRule::get(op_token.ty);
+        let rhs = self.parse_precedence(rule.rhs_prec(), allow_struct)?;
 
         Ok(Expr {
             span: lhs.span.merge(rhs.span),
@@ -808,7 +875,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_assign(&mut self, tgt: Expr) -> ParseResult<Expr> {
+    fn parse_assign(&mut self, tgt: Expr, allow_struct: bool) -> Result<Expr> {
         let op_token = self.consume()?;
         let op = match op_token.ty {
             tt![=] => AssignOp::Assign,
@@ -825,7 +892,7 @@ impl<'a> Parser<'a> {
             }
         };
 
-        let val = self.parse_precedence(Precedence::Assignment)?;
+        let val = self.parse_precedence(Precedence::Assignment, allow_struct)?;
 
         Ok(Expr {
             span: tgt.span.merge(val.span),
@@ -837,18 +904,48 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_block(&mut self) -> ParseResult<Expr> {
+    fn parse_block(&mut self) -> Result<Expr> {
         let l_brace = self.expect(tt!['{'])?;
         let mut stmts = vec![];
 
         while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
-            let stmt = match self.current.ty {
-                tt![;] => self.parse_semi()?,
-                tt![let] => self.parse_let()?,
-                _ => self.parse_expr_stmt()?,
-            };
+            match self.current.ty {
+                tt![;] => {
+                    //consume leading/trailing semicolons
+                    self.consume()?;
+                }
 
-            stmts.push(self.ast.stmts.insert(stmt))
+                tt![let] => {
+                    let let_stmt = self.parse_let()?;
+                    stmts.push(self.ast.stmts.insert(let_stmt));
+                }
+
+                // Parse expression statements
+                tt => {
+                    // check if current token can start a block expression
+                    let is_blk = matches!(
+                        tt,
+                        tt!['{'] | tt![if] | tt![match] | tt![while] | tt![for] | tt![loop]
+                    );
+
+                    let expr = self.parse_expr()?;
+                    let span = expr.span;
+
+                    if self.advance_if(tt![;])? {
+                        let kind = StmtKind::Semi(self.ast.exprs.insert(expr));
+                        stmts.push(self.ast.stmts.insert(Stmt { span, kind }));
+                    } else {
+                        let kind = StmtKind::Expr(self.ast.exprs.insert(expr));
+                        stmts.push(self.ast.stmts.insert(Stmt { span, kind }));
+
+                        // Expressions without block and without trailing semicolon
+                        // should be the last statement in a block.
+                        if !is_blk {
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         let r_brace = self.expect(tt!['}'])?;
@@ -859,10 +956,10 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_if(&mut self) -> ParseResult<Expr> {
+    fn parse_if(&mut self) -> Result<Expr> {
         let if_token = self.expect(tt![if])?;
 
-        let cond = self.parse_expr()?;
+        let cond = self.parse_expr_no_struct()?;
         let then_branch = self.parse_block()?;
 
         let (else_branch, span) = if self.advance_if(tt![else])? {
@@ -889,9 +986,9 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_while(&mut self) -> ParseResult<Expr> {
+    fn parse_while(&mut self) -> Result<Expr> {
         let while_token = self.expect(tt![while])?;
-        let cond = self.parse_expr()?;
+        let cond = self.parse_expr_no_struct()?;
         let body = self.parse_block()?;
 
         Ok(Expr {
@@ -903,7 +1000,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_loop(&mut self) -> ParseResult<Expr> {
+    fn parse_loop(&mut self) -> Result<Expr> {
         let loop_token = self.expect(tt![loop])?;
         let body = self.parse_block()?;
 
@@ -917,7 +1014,7 @@ impl<'a> Parser<'a> {
         ParseRule::get(self.current.ty).prefix != PrefixRule::None
     }
 
-    fn parse_return(&mut self) -> ParseResult<Expr> {
+    fn parse_return(&mut self) -> Result<Expr> {
         let return_token = self.expect(tt![return])?;
         let mut span = return_token.span;
 
@@ -935,7 +1032,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_break(&mut self) -> ParseResult<Expr> {
+    fn parse_break(&mut self) -> Result<Expr> {
         let break_token = self.expect(tt![break])?;
         let mut span = break_token.span;
 
@@ -953,7 +1050,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_continue(&mut self) -> ParseResult<Expr> {
+    fn parse_continue(&mut self) -> Result<Expr> {
         let continue_token = self.expect(tt![continue])?;
 
         Ok(Expr {
@@ -962,7 +1059,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_call(&mut self, callee: Expr) -> ParseResult<Expr> {
+    fn parse_call(&mut self, callee: Expr) -> Result<Expr> {
         self.expect(tt!['('])?;
 
         let mut args = vec![];
@@ -986,7 +1083,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_dot(&mut self, object: Expr) -> ParseResult<Expr> {
+    fn parse_dot(&mut self, object: Expr) -> Result<Expr> {
         self.expect(tt![.])?;
         let field = self.expect(tt![ident])?;
 
@@ -999,7 +1096,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_index(&mut self, object: Expr) -> ParseResult<Expr> {
+    fn parse_index(&mut self, object: Expr) -> Result<Expr> {
         self.expect(tt!['['])?;
         let index = self.parse_expr()?;
         let r_brkt = self.expect(tt![']'])?;

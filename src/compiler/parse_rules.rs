@@ -1,9 +1,13 @@
+use simple_ternary::tnr;
+
 use super::tokens::TokenType;
 use crate::tt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefixRule {
     None,
+    LiteralCint,
+    LiteralUint,
     LiteralInt,
     LiteralFloat,
     LiteralString,
@@ -41,6 +45,7 @@ pub enum InfixRule {
 pub enum Precedence {
     None = 0,
     Assignment, // =, += , -=, *=, /=, %=
+    Coalesce,   // ??
     Or,         // or
     And,        // and
     Equality,   // ==, !=
@@ -53,10 +58,11 @@ pub enum Precedence {
 }
 
 impl Precedence {
-    pub(crate) fn next(&self) -> Self {
+    fn next(&self) -> Self {
         match self {
             Precedence::None => Precedence::Assignment,
-            Precedence::Assignment => Precedence::Or,
+            Precedence::Assignment => Precedence::Coalesce,
+            Precedence::Coalesce => Precedence::Or,
             Precedence::Or => Precedence::And,
             Precedence::And => Precedence::Equality,
             Precedence::Equality => Precedence::Comparison,
@@ -74,12 +80,17 @@ impl Precedence {
 pub(crate) struct ParseRule {
     pub(crate) prefix: PrefixRule,
     pub(crate) infix: InfixRule,
-    pub(crate) precedence: Precedence,
+    pub(crate) prec: Precedence,
+    pub(crate) right_assoc: bool,
 }
 
 impl ParseRule {
     pub(crate) fn get(ty: TokenType) -> &'static Self {
         &RULES[ty as usize]
+    }
+
+    pub(crate) fn rhs_prec(&self) -> Precedence {
+        tnr! {self.right_assoc => self.prec : self.prec.next()}
     }
 }
 
@@ -87,240 +98,337 @@ static RULES: [ParseRule; TokenType::COUNT] = {
     let mut rules = [ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::None,
-        precedence: Precedence::None,
+        prec: Precedence::None,
+        right_assoc: false,
     }; TokenType::COUNT];
 
     rules[tt![ident] as usize] = ParseRule {
         prefix: PrefixRule::Identifier,
         infix: InfixRule::None,
-        precedence: Precedence::Primary,
+        prec: Precedence::Primary,
+        right_assoc: false,
+    };
+
+    rules[tt![cint_lit] as usize] = ParseRule {
+        prefix: PrefixRule::LiteralCint,
+        infix: InfixRule::None,
+        prec: Precedence::Primary,
+        right_assoc: false,
+    };
+
+    rules[tt![uint_lit] as usize] = ParseRule {
+        prefix: PrefixRule::LiteralUint,
+        infix: InfixRule::None,
+        prec: Precedence::Primary,
+        right_assoc: false,
     };
 
     rules[tt![int_lit] as usize] = ParseRule {
         prefix: PrefixRule::LiteralInt,
         infix: InfixRule::None,
-        precedence: Precedence::Primary,
+        prec: Precedence::Primary,
+        right_assoc: false,
     };
 
     rules[tt![float_lit] as usize] = ParseRule {
         prefix: PrefixRule::LiteralFloat,
         infix: InfixRule::None,
-        precedence: Precedence::Primary,
+        prec: Precedence::Primary,
+        right_assoc: false,
     };
 
     rules[tt![str_lit] as usize] = ParseRule {
         prefix: PrefixRule::LiteralString,
         infix: InfixRule::None,
-        precedence: Precedence::Primary,
+        prec: Precedence::Primary,
+        right_assoc: false,
     };
 
     rules[tt![null] as usize] = ParseRule {
         prefix: PrefixRule::LiteralNull,
         infix: InfixRule::None,
-        precedence: Precedence::Primary,
+        prec: Precedence::Primary,
+        right_assoc: false,
     };
 
     rules[tt![void] as usize] = ParseRule {
         prefix: PrefixRule::LiteralVoid,
         infix: InfixRule::None,
-        precedence: Precedence::Primary,
+        prec: Precedence::Primary,
+        right_assoc: false,
     };
 
     rules[tt!['('] as usize] = ParseRule {
         prefix: PrefixRule::Grouping,
         infix: InfixRule::Call,
-        precedence: Precedence::Call,
+        prec: Precedence::Call,
+        right_assoc: false,
     };
 
     rules[tt!['['] as usize] = ParseRule {
         prefix: PrefixRule::LiteralArray,
         infix: InfixRule::Index,
-        precedence: Precedence::Call,
+        prec: Precedence::Call,
+        right_assoc: false,
     };
 
     rules[tt![.] as usize] = ParseRule {
         prefix: PrefixRule::LiteralStruct,
         infix: InfixRule::Dot,
-        precedence: Precedence::Call,
+        prec: Precedence::Call,
+        right_assoc: false,
     };
 
     rules[tt![%] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Binary,
-        precedence: Precedence::Factor,
+        prec: Precedence::Factor,
+        right_assoc: false,
     };
 
     rules[tt![+] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Binary,
-        precedence: Precedence::Term,
+        prec: Precedence::Term,
+        right_assoc: false,
     };
 
     rules[tt![*] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Binary,
-        precedence: Precedence::Factor,
+        prec: Precedence::Factor,
+        right_assoc: false,
     };
 
     rules[tt![/] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Binary,
-        precedence: Precedence::Factor,
+        prec: Precedence::Factor,
+        right_assoc: false,
+    };
+
+    rules[tt![&] as usize] = ParseRule {
+        prefix: PrefixRule::None,
+        infix: InfixRule::Binary,
+        prec: Precedence::Factor,
+        right_assoc: false,
+    };
+
+    rules[tt![|] as usize] = ParseRule {
+        prefix: PrefixRule::None,
+        infix: InfixRule::Binary,
+        prec: Precedence::Term,
+        right_assoc: false,
+    };
+
+    rules[tt![^] as usize] = ParseRule {
+        prefix: PrefixRule::None,
+        infix: InfixRule::Binary,
+        prec: Precedence::Term,
+        right_assoc: false,
+    };
+
+    rules[tt![<<] as usize] = ParseRule {
+        prefix: PrefixRule::None,
+        infix: InfixRule::Binary,
+        prec: Precedence::Factor,
+        right_assoc: false,
+    };
+
+    rules[tt![>>] as usize] = ParseRule {
+        prefix: PrefixRule::None,
+        infix: InfixRule::Binary,
+        prec: Precedence::Factor,
+        right_assoc: false,
     };
 
     rules[tt![!] as usize] = ParseRule {
         prefix: PrefixRule::Unary,
         infix: InfixRule::None,
-        precedence: Precedence::None,
+        prec: Precedence::None,
+        right_assoc: false,
     };
 
     rules[tt![!=] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Binary,
-        precedence: Precedence::Equality,
+        prec: Precedence::Equality,
+        right_assoc: false,
     };
 
     rules[tt![==] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Binary,
-        precedence: Precedence::Equality,
+        prec: Precedence::Equality,
+        right_assoc: false,
     };
 
     rules[tt![>] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Binary,
-        precedence: Precedence::Comparison,
+        prec: Precedence::Comparison,
+        right_assoc: false,
     };
 
     rules[tt![>=] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Binary,
-        precedence: Precedence::Comparison,
+        prec: Precedence::Comparison,
+        right_assoc: false,
     };
 
     rules[tt![<] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Binary,
-        precedence: Precedence::Comparison,
+        prec: Precedence::Comparison,
+        right_assoc: false,
     };
 
     rules[tt![<=] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Binary,
-        precedence: Precedence::Comparison,
+        prec: Precedence::Comparison,
+        right_assoc: false,
     };
 
     rules[tt![-] as usize] = ParseRule {
         prefix: PrefixRule::Unary,
         infix: InfixRule::Binary,
-        precedence: Precedence::Term,
+        prec: Precedence::Term,
+        right_assoc: false,
+    };
+
+    rules[tt![?:] as usize] = ParseRule {
+        prefix: PrefixRule::None,
+        infix: InfixRule::Binary,
+        prec: Precedence::Coalesce,
+        right_assoc: false,
     };
 
     rules[tt![=] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Assign,
-        precedence: Precedence::Assignment,
+        prec: Precedence::Assignment,
+        right_assoc: true,
     };
+
     rules[tt![+=] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Assign,
-        precedence: Precedence::Assignment,
+        prec: Precedence::Assignment,
+        right_assoc: true,
     };
 
     rules[tt![-=] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Assign,
-        precedence: Precedence::Assignment,
+        prec: Precedence::Assignment,
+        right_assoc: true,
     };
 
     rules[tt![*=] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Assign,
-        precedence: Precedence::Assignment,
+        prec: Precedence::Assignment,
+        right_assoc: true,
     };
 
     rules[tt![/=] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Assign,
-        precedence: Precedence::Assignment,
+        prec: Precedence::Assignment,
+        right_assoc: true,
     };
 
     rules[tt![%=] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Assign,
-        precedence: Precedence::Assignment,
+        prec: Precedence::Assignment,
+        right_assoc: true,
     };
 
     rules[tt![and] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Binary,
-        precedence: Precedence::And,
+        prec: Precedence::And,
+        right_assoc: false,
     };
 
     rules[tt![false] as usize] = ParseRule {
         prefix: PrefixRule::False,
         infix: InfixRule::None,
-        precedence: Precedence::Primary,
+        prec: Precedence::Primary,
+        right_assoc: false,
     };
 
     rules[tt![or] as usize] = ParseRule {
         prefix: PrefixRule::None,
         infix: InfixRule::Binary,
-        precedence: Precedence::Or,
+        prec: Precedence::Or,
+        right_assoc: false,
     };
 
     rules[tt![true] as usize] = ParseRule {
         prefix: PrefixRule::True,
         infix: InfixRule::None,
-        precedence: Precedence::Primary,
+        prec: Precedence::Primary,
+        right_assoc: false,
     };
 
     rules[tt![if] as usize] = ParseRule {
         prefix: PrefixRule::If,
         infix: InfixRule::None,
-        precedence: Precedence::None,
+        prec: Precedence::None,
+        right_assoc: false,
     };
 
     rules[tt!['{'] as usize] = ParseRule {
         prefix: PrefixRule::Block,
         infix: InfixRule::None,
-        precedence: Precedence::None,
+        prec: Precedence::None,
+        right_assoc: false,
     };
 
     rules[tt![while] as usize] = ParseRule {
         prefix: PrefixRule::While,
         infix: InfixRule::None,
-        precedence: Precedence::None,
+        prec: Precedence::None,
+        right_assoc: false,
     };
 
     rules[tt![loop] as usize] = ParseRule {
         prefix: PrefixRule::Loop,
         infix: InfixRule::None,
-        precedence: Precedence::None,
+        prec: Precedence::None,
+        right_assoc: false,
     };
 
     rules[tt![match] as usize] = ParseRule {
         prefix: PrefixRule::Match,
         infix: InfixRule::None,
-        precedence: Precedence::None,
+        prec: Precedence::None,
+        right_assoc: false,
     };
 
     rules[tt![return] as usize] = ParseRule {
         prefix: PrefixRule::Return,
         infix: InfixRule::None,
-        precedence: Precedence::None,
+        prec: Precedence::None,
+        right_assoc: false,
     };
 
     rules[tt![break] as usize] = ParseRule {
         prefix: PrefixRule::Break,
         infix: InfixRule::None,
-        precedence: Precedence::None,
+        prec: Precedence::None,
+        right_assoc: false,
     };
 
     rules[tt![continue] as usize] = ParseRule {
         prefix: PrefixRule::Continue,
         infix: InfixRule::None,
-        precedence: Precedence::None,
+        prec: Precedence::None,
+        right_assoc: false,
     };
 
     rules

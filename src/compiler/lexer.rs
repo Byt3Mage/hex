@@ -10,6 +10,7 @@ pub enum LexErrorKind {
     UnterminatedString,
     InvalidEscape(char),
     MalformedNumber,
+    InvalidSuffix(char, TokenType),
 }
 
 #[derive(Debug)]
@@ -94,7 +95,6 @@ impl<'a> Lexer<'a> {
 
             // Double symbols
             '.' => Ok(self.make_double('.', tt![.], tt![..], o)),
-            '?' => Ok(self.make_double('?', tt![?], tt![??], o)),
             ':' => Ok(self.make_double(':', tt![:], tt![::], o)),
             '!' => Ok(self.make_double('=', tt![!], tt![!=], o)),
             '+' => Ok(self.make_double('=', tt![+], tt![+=], o)),
@@ -106,6 +106,7 @@ impl<'a> Lexer<'a> {
             '^' => Ok(self.make_double('=', tt![^], tt![^=], o)),
 
             // Complex double or triple symbols
+            '?' => Ok(self.make_question(o)),
             '=' => Ok(self.make_equals(o)),
             '-' => Ok(self.make_minus(o)),
             '>' => Ok(self.make_greater(o)),
@@ -115,7 +116,7 @@ impl<'a> Lexer<'a> {
             '"' => self.make_string(o),
 
             // Ints and float literals
-            c if c.is_ascii_digit() => Ok(self.make_number(o)),
+            c if c.is_ascii_digit() => self.make_number(o),
 
             // Idents
             c if c.is_ascii_alphabetic() || c == '_' => Ok(self.make_ident_or_kw(o)),
@@ -206,8 +207,8 @@ impl<'a> Lexer<'a> {
 
         match self.current {
             Some((_, '.')) => self.make_single(tt![?.], start_byte),
-            Some((_, '?')) => self.make_single(tt![??], start_byte),
-            _ => self.make_token(tt![-], start_byte, &self.input[start_byte..start_byte + 1]),
+            Some((_, ':')) => self.make_single(tt![?:], start_byte),
+            _ => self.make_token(tt![?], start_byte, &self.input[start_byte..start_byte + 1]),
         }
     }
 
@@ -285,8 +286,8 @@ impl<'a> Lexer<'a> {
         })
     }
 
-    fn make_number(&mut self, start_byte: usize) -> Token<'a> {
-        let mut ty = tt![int_lit];
+    fn make_number(&mut self, start_byte: usize) -> LexResult<'a> {
+        let mut ty = tt![cint_lit];
         let mut end_byte = start_byte;
 
         while let Some((byte_pos, ch)) = self.current {
@@ -304,7 +305,34 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        self.make_token(ty, start_byte, &self.input[start_byte..end_byte])
+        // Check for suffix
+        if let Some((b, ch)) = self.current {
+            match (ch, ty) {
+                ('i' | 'u', tt![float_lit]) => {
+                    return Err(LexError {
+                        kind: LexErrorKind::InvalidSuffix(ch, ty),
+                        span: Span::new(start_byte, b + ch.len_utf8(), self.line, self.column),
+                        hint: format!("Float literals cannot have integer suffixes"),
+                    });
+                }
+
+                ('i', _) => {
+                    ty = tt![int_lit];
+                    self.advance();
+                }
+                ('u', _) => {
+                    ty = tt![uint_lit];
+                    self.advance();
+                }
+                ('f', _) => {
+                    ty = tt![float_lit];
+                    self.advance();
+                }
+                _ => {}
+            }
+        }
+
+        Ok(self.make_token(ty, start_byte, &self.input[start_byte..end_byte]))
     }
 
     fn make_ident_or_kw(&mut self, start_byte: usize) -> Token<'a> {
@@ -335,6 +363,7 @@ impl<'a> Lexer<'a> {
             "else" => tt![else],
             "enum" => tt![enum],
             "false" => tt![false],
+            "float" => tt![float],
             "fn" => tt![fn],
             "for" => tt![for],
             "if" => tt![if],

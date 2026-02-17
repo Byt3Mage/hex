@@ -6,7 +6,7 @@ use crate::vm::{
     instruction::*,
     memory::PageAllocator,
     object::{AsValue, GCBuffer, GCTask, Value, try_get_ptr},
-    program::{CallInfo, FunctionId, NativeFunctionInfo, Program},
+    program::{CallInfo, FunctionPtr, NativeFunctionInfo, Program},
 };
 
 mod async_runtime;
@@ -36,8 +36,6 @@ pub enum VMError {
     ValueConversionFailed,
     #[error("Heap allocation failed")]
     AllocFailed,
-    #[error("Buffer index out of bounds")]
-    IndexOutOfBounds,
 }
 
 pub type VMResult<T> = Result<T, VMError>;
@@ -50,7 +48,7 @@ struct CallerInfo {
     base_reg: usize,
 
     /// Start register in caller to put return value
-    ret_reg: u8,
+    ret_reg: Reg,
 }
 
 struct Frame {
@@ -87,27 +85,27 @@ impl<'a, A: PageAllocator> VM<'a, A> {
     }
 
     #[inline(always)]
-    fn reg(&self, reg: u8) -> Value {
-        self.regs[self.base_reg + reg as usize]
+    fn reg(&self, reg: Reg) -> Value {
+        self.regs[self.base_reg + reg.index()]
     }
 
     #[inline(always)]
-    fn reg_mut(&mut self, reg: u8) -> &mut Value {
-        &mut self.regs[self.base_reg + reg as usize]
+    fn reg_mut(&mut self, reg: Reg) -> &mut Value {
+        &mut self.regs[self.base_reg + reg.index()]
     }
 
     #[inline(always)]
-    fn set_reg(&mut self, reg: u8, value: impl AsValue) {
-        self.regs[self.base_reg + reg as usize] = value.into_value();
+    fn set_reg(&mut self, reg: Reg, value: impl AsValue) {
+        self.regs[self.base_reg + reg.index()] = value.into_value();
     }
 
     #[inline(always)]
-    fn set_reg_raw(&mut self, reg: u8, value: Value) {
-        self.regs[self.base_reg + reg as usize] = value;
+    fn set_reg_raw(&mut self, reg: Reg, value: Value) {
+        self.regs[self.base_reg + reg.index()] = value;
     }
 
     #[inline(always)]
-    fn two_reg<T: AsValue>(&self, reg_a: u8, reg_b: u8) -> (T, T) {
+    fn two_reg<T: AsValue>(&self, reg_a: Reg, reg_b: Reg) -> (T, T) {
         (self.reg(reg_a).get(), self.reg(reg_b).get())
     }
 
@@ -127,24 +125,33 @@ impl<'a, A: PageAllocator> VM<'a, A> {
     }
 
     #[inline(always)]
-    fn exec_not(&mut self, i: Instruction) {
-        let dst = self.reg_mut(i.a());
-        let val: bool = dst.get();
-        dst.set(!val);
+    fn exec_bnot(&mut self, i: Instruction) {
+        let val: bool = self.reg(i.b()).get();
+        self.set_reg(i.a(), !val)
+    }
+
+    #[inline(always)]
+    fn exec_inot(&mut self, i: Instruction) {
+        let val: i64 = self.reg(i.b()).get();
+        self.set_reg(i.a(), !val)
+    }
+
+    #[inline(always)]
+    fn exec_unot(&mut self, i: Instruction) {
+        let val: u64 = self.reg(i.b()).get();
+        self.set_reg(i.a(), !val)
     }
 
     #[inline(always)]
     fn exec_ineg(&mut self, i: Instruction) {
-        let dst = self.reg_mut(i.a());
-        let val: i64 = dst.get();
-        dst.set(-val);
+        let val: i64 = self.reg(i.b()).get();
+        self.set_reg(i.a(), -val)
     }
 
     #[inline(always)]
     fn exec_fneg(&mut self, i: Instruction) {
-        let dst = self.reg_mut(i.a());
-        let val: f64 = dst.get();
-        dst.set(-val);
+        let val: f64 = self.reg(i.b()).get();
+        self.set_reg(i.a(), -val)
     }
 
     #[inline(always)]
@@ -325,14 +332,14 @@ impl<'a, A: PageAllocator> VM<'a, A> {
     }
 
     #[inline(always)]
-    fn call(&mut self, ret_reg: u8, cinfo: CallInfo) {
+    fn call(&mut self, ret_reg: Reg, cinfo: CallInfo) {
         // Create register window
         let base = self.regs.len();
         self.regs.resize(base + cinfo.nreg as usize, Value::zero());
 
         // Copy args from caller into callee registers
         // Call convention: args are in caller registers[ret..ret + narg]
-        let start = self.base_reg + ret_reg as usize;
+        let start = self.base_reg + ret_reg.index();
         let end = start + cinfo.narg as usize;
         self.regs.copy_within(start..end, base);
 
@@ -361,7 +368,7 @@ impl<'a, A: PageAllocator> VM<'a, A> {
     #[inline(always)]
     fn exec_callr(&mut self, i: Instruction) {
         let ret_reg = i.a();
-        let func = self.reg(i.b()).get::<FunctionId>() as usize;
+        let func = self.reg(i.b()).get::<FunctionPtr>() as usize;
         let cinfo = self.program.functions[func as usize].call_info;
         self.call(ret_reg, cinfo);
     }
@@ -375,7 +382,7 @@ impl<'a, A: PageAllocator> VM<'a, A> {
         self.regs.resize(base + cinfo.nreg as usize, Value::zero());
 
         // copy args into the same window
-        let start = self.base_reg + ret_reg as usize;
+        let start = self.base_reg + ret_reg.index();
         let end = start + cinfo.narg as usize;
         self.regs.copy_within(start..end, base);
 
@@ -386,13 +393,13 @@ impl<'a, A: PageAllocator> VM<'a, A> {
     }
 
     #[inline(always)]
-    fn calln(&mut self, ret_reg: u8, func: &NativeFunctionInfo) -> VMResult<()> {
+    fn calln(&mut self, ret_reg: Reg, func: &NativeFunctionInfo) -> VMResult<()> {
         let narg = func.narg as usize;
         let nret = func.nret as usize;
 
         // Immutably borrow args from caller registers
         // Call convention: args are in caller registers[ret..ret + narg]
-        let ret = self.base_reg + ret_reg as usize;
+        let ret = self.base_reg + ret_reg.index();
         let args = &self.regs[ret..ret + narg];
         let results = &mut self.native_call_ret[..nret];
 
@@ -414,7 +421,7 @@ impl<'a, A: PageAllocator> VM<'a, A> {
     #[inline(always)]
     fn exec_callnr(&mut self, i: Instruction) -> VMResult<()> {
         let ret_reg = i.a();
-        let func_id = self.reg(i.b()).get::<FunctionId>() as usize;
+        let func_id = self.reg(i.b()).get::<FunctionPtr>() as usize;
         let func = &self.program.native_functions[func_id];
         self.calln(ret_reg, func)
     }
@@ -429,9 +436,10 @@ impl<'a, A: PageAllocator> VM<'a, A> {
             // Return to caller
             Some(caller_info) => {
                 // Copy return values to caller's registers
-                let start = self.base_reg + i.a() as usize;
+                let start = self.base_reg + i.a().index();
                 let range = start..(start + frame.callee_info.nret as usize);
-                self.regs.copy_within(range, caller_info.ret_reg as usize);
+                let ret_start = caller_info.base_reg + caller_info.ret_reg.index();
+                self.regs.copy_within(range, ret_start);
 
                 // Clear register window
                 self.regs.truncate(self.base_reg);
@@ -488,7 +496,7 @@ impl<'a, A: PageAllocator> VM<'a, A> {
     fn exec_spawn_task(&mut self, i: Instruction) -> VMResult<()> {
         let dst = i.a();
         let cinfo = self.program.functions[i.bx() as usize].call_info;
-        let start = self.base_reg + dst as usize;
+        let start = self.base_reg + dst.index();
         let args = &self.regs[start..start + cinfo.narg as usize];
         let task = Task::new(cinfo, args);
         let ptr = self.heap.alloc_task(task, 0).ok_or(VMError::AllocFailed)?;
@@ -554,7 +562,9 @@ impl<'a, A: PageAllocator> VM<'a, A> {
                 Opcode::CONST => self.exec_const(i),
 
                 // Unary operations
-                Opcode::NOT => self.exec_not(i),
+                Opcode::BNOT => self.exec_bnot(i),
+                Opcode::INOT => self.exec_inot(i),
+                Opcode::UNOT => self.exec_unot(i),
                 Opcode::INEG => self.exec_ineg(i),
                 Opcode::FNEG => self.exec_fneg(i),
 
@@ -635,7 +645,7 @@ impl<'a, A: PageAllocator> VM<'a, A> {
         Err(VMError::PCOutOfBounds)
     }
 
-    pub fn execute(&mut self, func_id: FunctionId, args: &[Value]) -> VMResult<&[Value]> {
+    pub fn execute(&mut self, func_id: FunctionPtr, args: &[Value]) -> VMResult<&[Value]> {
         // Reset VM state before running top level function.
         self.reset();
 

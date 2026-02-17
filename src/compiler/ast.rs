@@ -1,7 +1,8 @@
 use crate::{
     arena::{Arena, Ident, StrSymbol},
     compiler::{
-        ast_op::{AssignOp, BinaryOp, UnaryOp},
+        op::{AssignOp, BinOp, UnOp},
+        sema::sema_value::ComptimeInt,
         tokens::Span,
     },
 };
@@ -46,7 +47,9 @@ pub struct Expr {
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     // Primitive Literals
-    IntLit(u64),
+    CintLit(ComptimeInt),
+    UintLit(u64),
+    IntLit(i64),
     FloatLit(f64),
     True,
     False,
@@ -82,7 +85,7 @@ pub enum ExprKind {
     /// ```
     /// let anon = _{ x: 10, y: 20 };
     /// let point = Point{ x: 10, y: 30 };
-    /// let result = Result<int>{ok: 42};
+    /// let result = Result{ ok: 42 };
     /// ```
     StructLit {
         ty: AstTypeId,
@@ -98,12 +101,12 @@ pub enum ExprKind {
     Group(ExprId),
 
     Unary {
-        op: UnaryOp,
-        expr: ExprId,
+        op: UnOp,
+        rhs: ExprId,
     },
 
     Binary {
-        op: BinaryOp,
+        op: BinOp,
         lhs: ExprId,
         rhs: ExprId,
     },
@@ -256,11 +259,13 @@ pub enum StmtKind {
         value: ExprId,
     },
 
-    Expr {
-        expr: ExprId,
-        has_semi: bool,
-    },
+    // Expression with semicolon.
+    Expr(ExprId),
 
+    // Expression with semicolon.
+    Semi(ExprId),
+
+    // Empty statement (just a semicolon).
     Empty,
 }
 
@@ -364,22 +369,22 @@ pub enum DeclKind {
 
     Struct {
         generics: Vec<GenericParam>,
-        fields: Vec<Field>,
+        fields: Vec<FieldDef>,
     },
 
     Union {
         generics: Vec<GenericParam>,
-        fields: Vec<Field>,
+        fields: Vec<FieldDef>,
     },
 
     Enum {
         base: Option<AstTypeId>,
-        variants: Vec<Variant>,
+        variants: Vec<VariantDef>,
     },
 }
 
 #[derive(Debug, Clone)]
-pub struct Field {
+pub struct FieldDef {
     pub visibility: Visibility,
     pub name: Ident,
     pub ty: AstTypeId,
@@ -387,7 +392,7 @@ pub struct Field {
 }
 
 #[derive(Debug, Clone)]
-pub struct Variant {
+pub struct VariantDef {
     pub name: Ident,
     pub value: Option<ExprId>,
     pub span: Span,

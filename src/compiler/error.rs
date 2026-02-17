@@ -2,8 +2,8 @@ use crate::{
     arena::Ident,
     compiler::{
         ast::PatternId,
-        sema::sema_type::SemaTypeId,
-        sema_v2::{ScopeId, SymbolId},
+        op::{BinOp, UnOp},
+        sema::{ScopeId, SymbolId, sema_type::SemaTypeId},
         tokens::Span,
     },
 };
@@ -12,20 +12,24 @@ use crate::{
 pub enum ResolveError {
     DuplicateSymbol {
         name: Ident,
-        first_def: Span,
-        dupe_def: Span,
+        first: Span,
+        duplicate: Span,
     },
-    DuplicateField {
+    DuplicateFieldDef {
         name: Ident,
-        first_def: Span,
-        dupe_def: Span,
+        first: Span,
+        duplicate: Span,
     },
-    DuplicateVariant {
+    DuplicateVariantDef {
         name: Ident,
-        first_def: Span,
-        dupe_def: Span,
+        first: Span,
+        duplicate: Span,
     },
     UndefinedSymbol {
+        name: Ident,
+        span: Span,
+    },
+    UndefinedField {
         name: Ident,
         span: Span,
     },
@@ -64,6 +68,11 @@ pub enum ResolveError {
         got: SemaTypeId,
         span: Span,
     },
+    CoerceFailed {
+        tgt: SemaTypeId,
+        val: SemaTypeId,
+        span: Span,
+    },
     InvalidEnumBase {
         span: Span,
     },
@@ -74,4 +83,51 @@ pub enum ResolveError {
     NegativeArrayLength {
         span: Span,
     },
+    InvalidArrayLength {
+        span: Span,
+    },
+    ExpectedStructOrUnion {
+        ty: SemaTypeId,
+        span: Span,
+    },
+    UnionFieldInit {
+        num_fields: usize,
+        span: Span,
+    },
+    DuplicateFieldInit {
+        name: Ident,
+        span: Span,
+    },
+    MissingFieldInit {
+        ty: SemaTypeId,
+        name: Ident,
+        span: Span,
+    },
+    InvalidUnaryOp {
+        op: UnOp,
+        ty: SemaTypeId,
+        span: Span,
+    },
+    InvalidBinaryOp {
+        op: BinOp,
+        lhs: SemaTypeId,
+        rhs: SemaTypeId,
+        span: Span,
+    },
+    ExpectedIndexable {
+        found: SemaTypeId,
+        span: Span,
+    },
+    ExpectedCallable {
+        ty: SemaTypeId,
+        span: Span,
+    },
 }
+
+macro_rules! bug {
+    ($($arg:tt)*) => {
+        panic!("INTERNAL COMPILER ERROR: {}", format!($($arg)*))
+    };
+}
+
+pub(super) use bug;

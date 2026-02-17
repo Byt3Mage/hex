@@ -12,50 +12,38 @@ slotmap::new_key_type! {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Signedness {
-    Signed,
-    Unsigned,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComptimeInt {
-    sign: Signedness,
-    value: u64,
+    sign: bool, // false = positive, true = negative
+    abs: u64,
 }
 
 impl ComptimeInt {
     pub fn from_lit(value: u64) -> Self {
         Self {
-            sign: Signedness::Unsigned,
-            value,
+            sign: false,
+            abs: value,
         }
     }
 
     pub fn negate(&self) -> Self {
-        if self.value == 0 {
-            return *self;
-        }
-
         Self {
-            sign: match self.sign {
-                Signedness::Signed => Signedness::Unsigned,
-                Signedness::Unsigned => Signedness::Signed,
-            },
-            value: self.value,
+            sign: !self.sign,
+            abs: self.abs,
         }
     }
 
     pub fn get_unsigned(&self) -> Option<u64> {
-        (self.sign == Signedness::Unsigned).then_some(self.value)
+        (!self.sign).then_some(self.abs)
     }
 
     pub fn get_signed(&self) -> Option<i64> {
-        const MAX: u64 = i64::MAX as u64;
-        const MIN: u64 = i64::MAX as u64 + 1;
+        const ABS_MAX: u64 = i64::MAX as u64;
+        const ABS_MIN: u64 = i64::MAX as u64 + 1;
 
-        match self.sign {
-            Signedness::Signed if self.value > MAX => Some(self.value as i64),
-            Signedness::Unsigned if self.value > MIN => Some(-(self.value as i64)),
+        match (self.sign, self.abs) {
+            (false, v) if v <= ABS_MAX => Some(v as i64),
+            (true, v) if v < ABS_MIN => Some(-(v as i64)),
+            (true, v) if v == ABS_MIN => Some(i64::MIN),
             _ => None,
         }
     }
@@ -63,7 +51,7 @@ impl ComptimeInt {
 
 #[derive(Debug, Clone)]
 pub enum SemaValue {
-    ComptimeInt(ComptimeInt),
+    Cint(ComptimeInt),
     Int(i64),
     Uint(u64),
     Bool(bool),
@@ -83,7 +71,7 @@ pub enum SemaValue {
 
 impl SemaValue {
     pub fn from_int_lit(value: u64) -> Self {
-        Self::ComptimeInt(ComptimeInt::from_lit(value))
+        Self::Cint(ComptimeInt::from_lit(value))
     }
 }
 

@@ -1,4 +1,75 @@
-use crate::vm::program::FunctionId;
+// Fundamental types.
+// Change ONLY these two, everything else derives automatically.
+//
+// To widen registers to 16-bit and instructions to 64-bit:
+//   type RegType = u16;
+//   type InstWidth = u64;
+
+pub type RegType = u8;
+pub type InstType = u32;
+
+// Derived constants. NEVER EDIT DIRECTLY
+const REG_BITS: InstType = (std::mem::size_of::<RegType>() * 8) as _;
+const INST_BITS: InstType = (std::mem::size_of::<InstType>() * 8) as _;
+const OPCODE_BITS: InstType = (std::mem::size_of::<Opcode>() * 8) as _;
+
+const REG_MASK: InstType = (1 << REG_BITS) - 1;
+
+// Remaining bits after opcode and register fields are set (for ABC format)
+const FIELD_A: InstType = OPCODE_BITS;
+const FIELD_B: InstType = FIELD_A + REG_BITS;
+const FIELD_C: InstType = FIELD_B + REG_BITS;
+
+// Remaining bits after opcode + one register (for ABx format)
+const BX_BITS: InstType = INST_BITS - FIELD_B;
+const BX_MASK: InstType = (1 << BX_BITS) - 1;
+
+// Remaining bits after opcode (for Ax format)
+const AX_BITS: InstType = INST_BITS - OPCODE_BITS;
+const AX_MASK: InstType = (1 << AX_BITS) - 1;
+
+// Assert that instruction width can safely encode ABC format without overflow
+const _: () = assert!(
+    OPCODE_BITS + (REG_BITS * 3) <= INST_BITS,
+    "ABC format does not fit in instruction width"
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct Reg(RegType);
+
+impl Reg {
+    #[inline(always)]
+    pub const fn raw(self) -> RegType {
+        self.0
+    }
+
+    #[inline(always)]
+    pub const fn new(index: RegType) -> Self {
+        Self(index)
+    }
+
+    #[inline(always)]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    #[inline(always)]
+    const fn encode(self) -> InstType {
+        self.0 as InstType
+    }
+
+    #[inline(always)]
+    const fn decode(bits: InstType) -> Self {
+        Self(bits as RegType)
+    }
+}
+
+impl std::fmt::Display for Reg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "R{}", self.0)
+    }
+}
 
 macro_rules! define_opcodes {
     ($($name:ident = $value:expr),* $(,)?) => {
@@ -12,7 +83,10 @@ macro_rules! define_opcodes {
 
         impl std::fmt::Display for Opcode {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_fmt(format_args!("{}", self.0))
+                match *self {
+                    $(Self($value) => f.write_str(stringify!($name)),)*
+                    _ => write!(f, "UNKNOWN({})", self.0),
+                }
             }
         }
     };
@@ -25,19 +99,21 @@ define_opcodes! {
     // Get value from constants table
     CONST = 1,
 
-    //Unary operations
-    NOT  = 2,
-    INEG = 3,
-    FNEG = 5,
+    // Unary operations
+    BNOT = 2,
+    INOT = 3,
+    UNOT = 4,
+    INEG = 5,
+    FNEG = 6,
 
-    // Integer arithmetic
+    // Signed integer arithmetic
     IADD = 10,
     ISUB = 11,
     IMUL = 12,
     IDIV = 13,
     IREM = 14,
 
-    // Immediate integer arithmetic
+    // Unsigned integer arithmetic
     UADD = 15,
     USUB = 16,
     UMUL = 17,
@@ -68,24 +144,23 @@ define_opcodes! {
     UGE = 36,
 
     // Floating-point comparisons
-    FEQ = 35,
-    FNE = 36,
-    FLT = 37,
-    FGT = 38,
-    FLE = 39,
-    FGE = 40,
+    FEQ = 37,
+    FNE = 38,
+    FLT = 39,
+    FGT = 40,
+    FLE = 41,
+    FGE = 42,
 
     // Jumps
-    JMP   = 50,  // Unconditional jump
-    JMP_T = 51,  // Conditional: jump if rA is true
-    JMP_F = 52,  // Conditional: jump if rA is false
+    JMP   = 50,
+    JMP_T = 51,
+    JMP_F = 52,
 
     // Call and return
     RET    = 60,
     CALL   = 61,
     CALLT  = 62,
     CALLN  = 63,
-    // CALL/CALLN (register)
     CALLR  = 64,
     CALLNR = 65,
 
@@ -105,8 +180,15 @@ define_opcodes! {
     HALT = 82,
 }
 
+// Instruction encoding
+//
+// ABC: [opcode] [a: Reg] [b: Reg] [c: Reg]
+// ABx: [opcode] [a: Reg] [bx: remaining bits]
+// Ax:  [opcode] [ax: remaining bits]
+
 #[derive(Debug, Clone, Copy)]
-pub struct Instruction(u32);
+#[repr(transparent)]
+pub struct Instruction(InstType);
 
 impl Instruction {
     #[inline(always)]
@@ -114,31 +196,28 @@ impl Instruction {
         Opcode((self.0 & 0xFF) as u8)
     }
 
-    // --- ABC Format ---
+    // ABC format
+
     #[inline(always)]
-    pub const fn a(self) -> u8 {
-        ((self.0 >> 8) & 0xFF) as u8
+    pub const fn a(self) -> Reg {
+        Reg::decode((self.0 >> FIELD_A) & REG_MASK)
     }
 
     #[inline(always)]
-    pub const fn b(self) -> u8 {
-        ((self.0 >> 16) & 0xFF) as u8
+    pub const fn b(self) -> Reg {
+        Reg::decode((self.0 >> FIELD_B) & REG_MASK)
     }
 
     #[inline(always)]
-    pub const fn c(self) -> u8 {
-        ((self.0 >> 24) & 0xFF) as u8
+    pub const fn c(self) -> Reg {
+        Reg::decode((self.0 >> FIELD_C) & REG_MASK)
     }
 
-    #[inline(always)]
-    pub const fn encode_abc(Opcode(op): Opcode, a: u8, b: u8, c: u8) -> Self {
-        Instruction((op as u32) | ((a as u32) << 8) | ((b as u32) << 16) | ((c as u32) << 24))
-    }
+    // ABx Format
 
-    // --- ABx Format ---
     #[inline(always)]
-    pub const fn bx(self) -> u16 {
-        ((self.0 >> 16) & 0xFFFF) as u16
+    pub const fn bx(self) -> InstType {
+        (self.0 >> FIELD_B) & BX_MASK
     }
 
     #[inline(always)]
@@ -148,298 +227,328 @@ impl Instruction {
 
     #[inline(always)]
     pub const fn bx_i64(self) -> i64 {
-        self.bx() as i16 as i64
+        // Sign-extend from BX_BITS width
+        let raw = self.bx() as i64;
+        let sign_bit = 1i64 << (BX_BITS - 1);
+        (raw ^ sign_bit) - sign_bit
     }
 
-    #[inline(always)]
-    pub const fn encode_abx(Opcode(op): Opcode, a: u8, bx: u16) -> Self {
-        Instruction((op as u32) | ((a as u32) << 8) | ((bx as u32) << 16))
-    }
-
-    // --- Ax Format ---
-    #[inline(always)]
-    pub const fn ax(self) -> u32 {
-        self.0 >> 8
-    }
+    // Ax Format
 
     #[inline(always)]
-    pub const fn encode_ax(Opcode(op): Opcode, ax: u32) -> Self {
-        debug_assert!(ax <= 0xFFFFFF, "ax field must fit in 24 bits");
-        Instruction((op as u32) | (ax << 8))
+    pub const fn ax(self) -> InstType {
+        (self.0 >> FIELD_A) & AX_MASK
     }
 }
 
+pub const R0: Reg = Reg::new(0);
+
 #[inline(always)]
-pub const fn mov(r_dst: u8, r_src: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::MOV, r_dst, r_src, 0)
+pub const fn encode_abc(Opcode(op): Opcode, a: Reg, b: Reg, c: Reg) -> Instruction {
+    Instruction(
+        (op as InstType)
+            | (a.encode() << FIELD_A)
+            | (b.encode() << FIELD_B)
+            | (c.encode() << FIELD_C),
+    )
 }
 
 #[inline(always)]
-pub const fn konst(r_dst: u8, idx: u16) -> Instruction {
-    Instruction::encode_abx(Opcode::CONST, r_dst, idx)
+pub const fn encode_abx(Opcode(op): Opcode, a: Reg, bx: InstType) -> Instruction {
+    debug_assert!(bx <= BX_MASK, "bx field overflow");
+    Instruction((op as InstType) | (a.encode() << FIELD_A) | (bx << FIELD_B))
+}
+
+#[inline(always)]
+pub const fn encode_ax(Opcode(op): Opcode, ax: InstType) -> Instruction {
+    debug_assert!(ax <= AX_MASK, "ax field overflow");
+    Instruction((op as InstType) | (ax << FIELD_A))
+}
+
+// Move
+#[inline(always)]
+pub const fn mov(dst: Reg, src: Reg) -> Instruction {
+    encode_abc(Opcode::MOV, dst, src, R0)
+}
+
+#[inline(always)]
+pub const fn konst(dst: Reg, idx: InstType) -> Instruction {
+    encode_abx(Opcode::CONST, dst, idx)
 }
 
 // Unary ops
 #[inline(always)]
-pub const fn not(r_dst: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::NOT, r_dst, 0, 0)
+pub const fn bnot(dst: Reg) -> Instruction {
+    encode_abc(Opcode::BNOT, dst, R0, R0)
 }
 
 #[inline(always)]
-pub const fn ineg(r_dst: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::INEG, r_dst, 0, 0)
+pub const fn inot(dst: Reg) -> Instruction {
+    encode_abc(Opcode::INOT, dst, R0, R0)
 }
 
 #[inline(always)]
-pub const fn fneg(r_dst: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::FNEG, r_dst, 0, 0)
+pub const fn unot(dst: Reg) -> Instruction {
+    encode_abc(Opcode::UNOT, dst, R0, R0)
+}
+
+#[inline(always)]
+pub const fn ineg(dst: Reg) -> Instruction {
+    encode_abc(Opcode::INEG, dst, R0, R0)
+}
+
+#[inline(always)]
+pub const fn fneg(dst: Reg) -> Instruction {
+    encode_abc(Opcode::FNEG, dst, R0, R0)
 }
 
 // Signed integer arithmetic
 #[inline(always)]
-pub fn iadd(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::IADD, r_dst, r_a, r_b)
+pub const fn iadd(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::IADD, dst, a, b)
 }
 
 #[inline(always)]
-pub fn isub(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::ISUB, r_dst, r_a, r_b)
+pub const fn isub(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::ISUB, dst, a, b)
 }
 
 #[inline(always)]
-pub fn imul(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::IMUL, r_dst, r_a, r_b)
+pub const fn imul(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::IMUL, dst, a, b)
 }
 
 #[inline(always)]
-pub fn idiv(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::IDIV, r_dst, r_a, r_b)
+pub const fn idiv(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::IDIV, dst, a, b)
 }
 
 #[inline(always)]
-pub fn irem(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::IREM, r_dst, r_a, r_b)
+pub const fn irem(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::IREM, dst, a, b)
 }
 
 // Unsigned integer arithmetic
 #[inline(always)]
-pub fn uadd(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::UADD, r_dst, r_a, r_b)
+pub const fn uadd(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::UADD, dst, a, b)
 }
 
 #[inline(always)]
-pub fn usub(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::USUB, r_dst, r_a, r_b)
+pub const fn usub(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::USUB, dst, a, b)
 }
 
 #[inline(always)]
-pub fn umul(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::UMUL, r_dst, r_a, r_b)
+pub const fn umul(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::UMUL, dst, a, b)
 }
 
 #[inline(always)]
-pub fn udiv(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::UDIV, r_dst, r_a, r_b)
+pub const fn udiv(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::UDIV, dst, a, b)
 }
 
 #[inline(always)]
-pub fn urem(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::UREM, r_dst, r_a, r_b)
+pub const fn urem(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::UREM, dst, a, b)
 }
 
 // Signed integer comparisons
 #[inline(always)]
-pub fn ieq(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::IEQ, r_dst, r_a, r_b)
+pub const fn ieq(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::IEQ, dst, a, b)
 }
 
 #[inline(always)]
-pub fn ine(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::INE, r_dst, r_a, r_b)
+pub const fn ine(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::INE, dst, a, b)
 }
 
 #[inline(always)]
-pub fn ilt(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::ILT, r_dst, r_a, r_b)
+pub const fn ilt(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::ILT, dst, a, b)
 }
 
 #[inline(always)]
-pub fn igt(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::IGT, r_dst, r_a, r_b)
+pub const fn igt(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::IGT, dst, a, b)
 }
 
 #[inline(always)]
-pub fn ile(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::ILE, r_dst, r_a, r_b)
+pub const fn ile(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::ILE, dst, a, b)
 }
 
 #[inline(always)]
-pub fn ige(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::IGE, r_dst, r_a, r_b)
+pub const fn ige(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::IGE, dst, a, b)
 }
 
 // Unsigned integer comparisons
 #[inline(always)]
-pub fn ueq(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::UEQ, r_dst, r_a, r_b)
+pub const fn ueq(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::UEQ, dst, a, b)
 }
 
 #[inline(always)]
-pub fn une(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::UNE, r_dst, r_a, r_b)
+pub const fn une(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::UNE, dst, a, b)
 }
 
 #[inline(always)]
-pub fn ult(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::ULT, r_dst, r_a, r_b)
+pub const fn ult(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::ULT, dst, a, b)
 }
 
 #[inline(always)]
-pub fn ule(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::ULE, r_dst, r_a, r_b)
+pub const fn ugt(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::UGT, dst, a, b)
 }
 
 #[inline(always)]
-pub fn ugt(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::UGT, r_dst, r_a, r_b)
+pub const fn ule(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::ULE, dst, a, b)
 }
 
 #[inline(always)]
-pub fn uge(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::UGE, r_dst, r_a, r_b)
+pub const fn uge(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::UGE, dst, a, b)
 }
 
 // Floating-point arithmetic
 #[inline(always)]
-pub fn fadd(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::FADD, r_dst, r_a, r_b)
+pub const fn fadd(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::FADD, dst, a, b)
 }
 
 #[inline(always)]
-pub fn fsub(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::FSUB, r_dst, r_a, r_b)
+pub const fn fsub(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::FSUB, dst, a, b)
 }
 
 #[inline(always)]
-pub fn fmul(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::FMUL, r_dst, r_a, r_b)
+pub const fn fmul(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::FMUL, dst, a, b)
 }
 
 #[inline(always)]
-pub fn fdiv(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::FDIV, r_dst, r_a, r_b)
+pub const fn fdiv(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::FDIV, dst, a, b)
 }
 
 #[inline(always)]
-pub fn frem(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::FREM, r_dst, r_a, r_b)
+pub const fn frem(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::FREM, dst, a, b)
 }
 
 // Floating-point comparisons
 #[inline(always)]
-pub fn feq(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::FEQ, r_dst, r_a, r_b)
+pub const fn feq(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::FEQ, dst, a, b)
 }
 
 #[inline(always)]
-pub fn fne(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::FNE, r_dst, r_a, r_b)
+pub const fn fne(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::FNE, dst, a, b)
 }
 
 #[inline(always)]
-pub fn flt(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::FLT, r_dst, r_a, r_b)
+pub const fn flt(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::FLT, dst, a, b)
 }
 
 #[inline(always)]
-pub fn fgt(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::FGT, r_dst, r_a, r_b)
+pub const fn fgt(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::FGT, dst, a, b)
 }
 
 #[inline(always)]
-pub fn fle(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::FLE, r_dst, r_a, r_b)
+pub const fn fle(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::FLE, dst, a, b)
 }
 
 #[inline(always)]
-pub fn fge(r_dst: u8, r_a: u8, r_b: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::FGE, r_dst, r_a, r_b)
+pub const fn fge(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::FGE, dst, a, b)
 }
 
 // Jumps
 #[inline(always)]
-pub fn jmp(target: u32) -> Instruction {
-    Instruction::encode_ax(Opcode::JMP, target)
+pub const fn jmp(target: InstType) -> Instruction {
+    encode_ax(Opcode::JMP, target)
 }
 
 #[inline(always)]
-pub fn jmp_t(r_cond: u8, target: u16) -> Instruction {
-    Instruction::encode_abx(Opcode::JMP_T, r_cond, target)
+pub const fn jmp_t(cond: Reg, target: InstType) -> Instruction {
+    encode_abx(Opcode::JMP_T, cond, target)
 }
 
 #[inline(always)]
-pub fn jmp_f(r_cond: u8, target: u16) -> Instruction {
-    Instruction::encode_abx(Opcode::JMP_F, r_cond, target)
+pub const fn jmp_f(cond: Reg, target: InstType) -> Instruction {
+    encode_abx(Opcode::JMP_F, cond, target)
 }
 
 // Call and return
 #[inline(always)]
-pub fn call(r_ret: u8, func: FunctionId) -> Instruction {
-    Instruction::encode_abx(Opcode::CALL, r_ret, func)
+pub const fn call(ret: Reg, func: InstType) -> Instruction {
+    encode_abx(Opcode::CALL, ret, func)
 }
 
 #[inline(always)]
-pub fn callr(r_ret: u8, r_func: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::CALLR, r_ret, r_func, 0)
+pub const fn callr(ret: Reg, func: Reg) -> Instruction {
+    encode_abc(Opcode::CALLR, ret, func, R0)
 }
 
 #[inline(always)]
-pub fn calln(r_ret: u8, func: FunctionId) -> Instruction {
-    Instruction::encode_abx(Opcode::CALLN, r_ret, func)
+pub const fn calln(ret: Reg, func: InstType) -> Instruction {
+    encode_abx(Opcode::CALLN, ret, func)
 }
 
 #[inline(always)]
-pub fn callnr(r_ret: u8, func: FunctionId) -> Instruction {
-    Instruction::encode_abx(Opcode::CALLN, r_ret, func)
+pub const fn callnr(ret: Reg, func: Reg) -> Instruction {
+    encode_abc(Opcode::CALLNR, ret, func, R0)
 }
 
 #[inline(always)]
-pub fn callt(r_ret: u8, func: FunctionId) -> Instruction {
-    Instruction::encode_abx(Opcode::CALLT, r_ret, func)
+pub const fn callt(ret: Reg, func: InstType) -> Instruction {
+    encode_abx(Opcode::CALLT, ret, func)
 }
 
 #[inline(always)]
-pub fn ret(r_src: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::RET, r_src, 0, 0)
+pub const fn ret(src: Reg) -> Instruction {
+    encode_abc(Opcode::RET, src, R0, R0)
+}
+
+// Heap allocations
+#[inline(always)]
+pub const fn alloc_buf(dst: Reg, len: Reg) -> Instruction {
+    encode_abc(Opcode::ALLOC_BUF, dst, len, R0)
 }
 
 #[inline(always)]
-pub const fn alloc_buf(r_dst: u8, r_len: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::ALLOC_BUF, r_dst, r_len, 0)
+pub const fn alloc_dyn(dst: Reg) -> Instruction {
+    encode_abc(Opcode::ALLOC_DYN, dst, R0, R0)
 }
 
 #[inline(always)]
-pub const fn alloc_dyn(r_dst: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::ALLOC_DYN, r_dst, 0, 0)
+pub const fn alloc_str(dst: Reg) -> Instruction {
+    encode_abc(Opcode::ALLOC_STR, dst, R0, R0)
+}
+
+// Heap operations
+#[inline(always)]
+pub const fn load(dst: Reg, ptr: Reg, off: Reg) -> Instruction {
+    encode_abc(Opcode::LOAD, dst, ptr, off)
 }
 
 #[inline(always)]
-pub const fn alloc_str(r_dst: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::ALLOC_STR, r_dst, 0, 0)
-}
-
-#[inline(always)]
-pub const fn load(r_dst: u8, r_ptr: u8, r_off: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::LOAD, r_dst, r_ptr, r_off)
-}
-
-#[inline(always)]
-pub const fn store(r_ptr: u8, r_off: u8, r_src: u8) -> Instruction {
-    Instruction::encode_abc(Opcode::STORE, r_ptr, r_off, r_src)
+pub const fn store(ptr: Reg, off: Reg, src: Reg) -> Instruction {
+    encode_abc(Opcode::STORE, ptr, off, src)
 }
 
 // End program
 #[inline(always)]
-pub fn halt() -> Instruction {
-    Instruction::encode_ax(Opcode::HALT, 0)
+pub const fn halt() -> Instruction {
+    encode_ax(Opcode::HALT, 0)
 }

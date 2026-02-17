@@ -101,7 +101,7 @@ pub type LocalFunctionId = usize;
 pub type UnitId = Name;
 
 /// Global function ID in the linked program
-pub type FunctionId = u16;
+pub type FunctionPtr = u16;
 
 /// Global native function ID in the linked program
 pub type NativeFunctionId = usize;
@@ -124,7 +124,7 @@ pub struct Program {
 /// Mapping information used during linking
 pub struct LinkContext {
     /// Map from (module_id, local_function_id) -> global_function_id
-    pub function_map: HashMap<(UnitId, LocalFunctionId), FunctionId>,
+    pub function_map: HashMap<(UnitId, LocalFunctionId), FunctionPtr>,
 
     /// Map from (module_id, local_native_function_id) -> global_native_function_id
     pub native_function_map: HashMap<(UnitId, LocalFunctionId), NativeFunctionId>,

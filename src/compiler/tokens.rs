@@ -3,6 +3,8 @@
 pub(crate) enum TokenType {
     // Literals
     Ident = 0,
+    CintLit,
+    UintLit,
     IntLit,
     FloatLit,
     StringLit,
@@ -24,7 +26,7 @@ pub(crate) enum TokenType {
     // One or two character symbols
     Question,            // ?
     QuestionDot,         // ?.
-    QuestionQuestion,    // ??
+    QuestionColon,       // ?:
     Bang,                // !
     BangEqual,           // !=
     Equal,               // =
@@ -118,6 +120,12 @@ impl TokenType {
 macro_rules! tt {
     (ident) => {
         $crate::compiler::tokens::TokenType::Ident
+    };
+    (cint_lit) => {
+        $crate::compiler::tokens::TokenType::CintLit
+    };
+    (uint_lit) => {
+        $crate::compiler::tokens::TokenType::UintLit
     };
     (int_lit) => {
         $crate::compiler::tokens::TokenType::IntLit
@@ -270,8 +278,8 @@ macro_rules! tt {
     (?.) => {
         $crate::compiler::tokens::TokenType::QuestionDot
     };
-    (??) => {
-        $crate::compiler::tokens::TokenType::QuestionQuestion
+    (?:) => {
+        $crate::compiler::tokens::TokenType::QuestionColon
     };
     (=>) => {
         $crate::compiler::tokens::TokenType::FatArrow
