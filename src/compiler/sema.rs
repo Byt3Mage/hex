@@ -1,6 +1,7 @@
 use std::{collections::hash_map::Entry, rc::Rc};
 
 use ahash::{AHashMap, AHashSet};
+use simple_ternary::tnr;
 
 use crate::{
     arena::{Arena, Ident, Interner},
@@ -17,7 +18,7 @@ use crate::{
                 EnumInfo, FieldInfo, SemaType, SemaTypeId, StructInfo, TypeArena, UnionInfo,
                 VariantInfo,
             },
-            sema_value::{SemaValue, SemaValueId, ValueArena},
+            sema_value::{ComptimeInt, SemaValue, SemaValueId, ValueArena},
         },
         tokens::Span,
     },
@@ -139,11 +140,14 @@ impl SymbolTable {
 
         match scope.symbols.entry(symbol.name) {
             Entry::Vacant(entry) => Ok(*entry.insert(self.symbols.insert(symbol))),
-            Entry::Occupied(entry) => Err(DuplicateSymbol {
-                name: symbol.name,
-                first: self.symbols[*entry.get()].span,
-                duplicate: symbol.span,
-            }),
+            Entry::Occupied(entry) => {
+                let first_def = self.symbols[*entry.get()].span;
+                Err(DuplicateSymbol {
+                    name: symbol.name,
+                    first: first_def,
+                    duplicate: symbol.span,
+                })
+            }
         }
     }
 
@@ -164,6 +168,12 @@ impl SymbolTable {
     pub fn find_function_scope(&self, scope_id: ScopeId) -> Option<ScopeId> {
         self.find_enclosing(scope_id, ScopeKind::Function)
     }
+}
+
+pub struct FunctionEnv {
+    scope: ScopeId,
+    return_type: SemaTypeId,
+    generics: AHashMap<Ident, SemaTypeId>,
 }
 
 pub struct Sema<'a> {
@@ -303,9 +313,9 @@ impl<'a> Sema<'a> {
             (SemaType::Bool, SemaType::Bool) => Ok(self.types.bool),
             (SemaType::Cstr, SemaType::Cstr) => Ok(self.types.cstr),
             (SemaType::Char, SemaType::Char) => Ok(self.types.char),
-            (SemaType::Float, SemaType::Float) => Ok(self.types.float),
             (SemaType::Null, SemaType::Null) => Ok(self.types.null),
             (SemaType::Void, SemaType::Void) => Ok(self.types.void),
+            (SemaType::Float, SemaType::Float) => Ok(self.types.float),
 
             // Normalize comptime int to runtime ints
             (SemaType::Cint, SemaType::Int) | (SemaType::Int, SemaType::Cint) => Ok(self.types.int),
@@ -515,8 +525,14 @@ impl<'a> Sema<'a> {
         let signature = self.types.insert(SemaType::Function { params, ret });
         self.symbols.get_mut(symbol).ty_id = Some(signature);
 
+        let env = FunctionEnv {
+            scope,
+            return_type: ret,
+            generics: AHashMap::new(),
+        };
+
         // Evaluate body type
-        let body = self.check_expr(scope, body)?;
+        let body = self.check_expr(&env, body)?;
 
         // Ensure body type can be assigned to return type
         self.coerce(ret, body, span)
@@ -815,19 +831,72 @@ impl<'a> Sema<'a> {
         base: SemaTypeId,
         variant_defs: &[VariantDef],
     ) -> Result<Vec<VariantInfo>> {
-        let mut seen_variants = AHashMap::new();
+        let is_base_uint = base == self.types.uint;
+        let mut seen_names = AHashMap::new();
+        let mut seen_values = AHashMap::new();
         let mut variant_infos = Vec::with_capacity(variant_defs.len());
+        let mut curr_val = tnr! {is_base_uint => ComptimeInt::unsigned(0) : ComptimeInt::signed(0)};
 
         for variant_def in variant_defs {
-            match seen_variants.entry(variant_def.name) {
+            match seen_names.entry(variant_def.name) {
                 Entry::Vacant(entry) => {
-                    let name = variant_def.name;
-                    let value = match variant_def.value {
-                        Some(expr_id) => self.eval_expr(scope, expr_id)?,
-                        None => self.values.insert(SemaValue::Void),
+                    if let Some(expr_id) = variant_def.value {
+                        let val = self.eval_expr(scope, expr_id)?;
+
+                        curr_val = match self.values.get(val) {
+                            SemaValue::Cint(c) => {
+                                if is_base_uint && c.is_neg() {
+                                    return Err(TypeMismatch {
+                                        exp: self.types.uint,
+                                        got: self.types.int,
+                                        span: variant_def.span,
+                                    });
+                                }
+                                *c
+                            }
+
+                            SemaValue::Int(i) if !is_base_uint => ComptimeInt::signed(*i),
+                            SemaValue::Uint(u) if is_base_uint => ComptimeInt::unsigned(*u),
+
+                            v => {
+                                return Err(TypeMismatch {
+                                    exp: base,
+                                    got: self.get_value_ty(v)?,
+                                    span: variant_def.span,
+                                });
+                            }
+                        };
                     };
-                    // TODO: check variant values
-                    variant_infos.push(VariantInfo { name, value });
+
+                    match seen_values.entry(curr_val) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(variant_def.span);
+                        }
+
+                        Entry::Occupied(entry) => {
+                            return Err(DuplicateVariantVal {
+                                value: curr_val,
+                                first: *entry.get(),
+                                duplicate: variant_def.span,
+                            });
+                        }
+                    }
+
+                    variant_infos.push(VariantInfo {
+                        name: variant_def.name,
+                        value: curr_val,
+                    });
+
+                    // auto-increment variant value for the next variant
+                    // TODO: cleanly handle errors.
+                    curr_val = if is_base_uint {
+                        let curr = curr_val.get_unsigned().unwrap();
+                        ComptimeInt::unsigned(curr + 1)
+                    } else {
+                        let curr = curr_val.get_signed().unwrap();
+                        ComptimeInt::signed(curr + 1)
+                    };
+
                     entry.insert(variant_def.span);
                 }
 
@@ -844,7 +913,7 @@ impl<'a> Sema<'a> {
         Ok(variant_infos)
     }
 
-    fn check_expr(&mut self, scope: ScopeId, expr_id: ExprId) -> Result<SemaTypeId> {
+    fn check_expr(&mut self, env: &FunctionEnv, expr_id: ExprId) -> Result<SemaTypeId> {
         let expr = &self.ast.exprs[expr_id];
 
         let ty_id = match &expr.kind {
@@ -859,13 +928,13 @@ impl<'a> Sema<'a> {
             ExprKind::Null => self.types.null,
             ExprKind::Void => self.types.void,
 
-            ExprKind::Path(path) => self.check_path(scope, *path, expr.span)?,
+            ExprKind::Path(path) => self.check_path(env.scope, *path, expr.span)?,
 
             ExprKind::ArrayLit(expr_ids) => todo!(),
 
             ExprKind::ArrayRepeat { value, count } => {
-                let elem = self.check_expr(scope, *value)?;
-                let count = self.eval_expr(scope, *count)?;
+                let elem = self.check_expr(env, *value)?;
+                let count = self.eval_expr(env.scope, *count)?;
 
                 match self.values.get(count) {
                     SemaValue::Cint(n) => match n.get_unsigned() {
@@ -884,13 +953,13 @@ impl<'a> Sema<'a> {
             }
 
             ExprKind::StructLit { ty, fields } => {
-                self.check_struct_lit(scope, *ty, fields, expr.span)?
+                self.check_struct_lit(env, *ty, fields, expr.span)?
             }
 
-            ExprKind::Group(inner) => self.check_expr(scope, *inner)?,
-            ExprKind::Unary { op, rhs } => self.check_unary(scope, *op, *rhs, expr.span)?,
+            ExprKind::Group(inner) => self.check_expr(env, *inner)?,
+            ExprKind::Unary { op, rhs } => self.check_unary(env, *op, *rhs, expr.span)?,
             ExprKind::Binary { op, lhs, rhs } => {
-                self.check_binary(scope, *op, *lhs, *rhs, expr.span)?
+                self.check_binary(env, *op, *lhs, *rhs, expr.span)?
             }
 
             ExprKind::Assign { op, tgt, val } => todo!(),
@@ -900,14 +969,14 @@ impl<'a> Sema<'a> {
                 then_branch,
                 else_branch,
             } => {
-                let cond_ty = self.check_expr(scope, *cond)?;
+                let cond_ty = self.check_expr(env, *cond)?;
 
                 // if expressions can only accept booleans as conditions
                 self.coerce(self.types.bool, cond_ty, self.ast.exprs[*cond].span)?;
 
-                let then_ty = self.check_expr(scope, *then_branch)?;
+                let then_ty = self.check_expr(env, *then_branch)?;
                 let else_ty = match else_branch {
-                    Some(e) => self.check_expr(scope, *e)?,
+                    Some(e) => self.check_expr(env, *e)?,
                     None => self.types.void,
                 };
 
@@ -921,18 +990,21 @@ impl<'a> Sema<'a> {
                 iter,
                 body,
             } => todo!(),
-            ExprKind::Block(stmts) => self.check_block(scope, stmts)?,
+            ExprKind::Block(stmts) => self.check_block(env, stmts)?,
             ExprKind::Return(value) => {
-                let Some(fn_scope) = self.symbols.find_function_scope(scope) else {
+                let Some(fn_scope) = self.symbols.find_function_scope(env.scope) else {
                     return Err(ReturnOutsideFunction { span: expr.span });
                 };
 
                 let ret_value_type = match value {
-                    Some(v) => self.check_expr(scope, *v)?,
+                    Some(v) => self.check_expr(env, *v)?,
                     None => self.types.void,
                 };
 
-                // todo: verify return expr type matches function return type
+                // verify that return value type matches function return type
+                self.coerce(env.return_type, ret_value_type, expr.span)?;
+
+                // return expressions are always diverging
                 self.types.never
             }
             ExprKind::Break(expr_id) => todo!(),
@@ -941,19 +1013,18 @@ impl<'a> Sema<'a> {
             ExprKind::Field { object, field } => todo!(),
             ExprKind::OptionalField { object, field } => todo!(),
             ExprKind::Index { object, index } => {
-                let object_ty = self.check_expr(scope, *object)?;
+                let object_ty = self.check_expr(env, *object)?;
 
                 match self.types.get(object_ty) {
                     SemaType::Array { elem, .. } | SemaType::Slice(elem) => {
                         let ty = *elem;
-                        let index_ty = self.check_expr(scope, *index)?;
+                        let index_ty = self.check_expr(env, *index)?;
 
-                        // arrays can only be indexed by uint
+                        // array/slice can only be indexed by uint
                         self.coerce(self.types.uint, index_ty, self.ast.exprs[*index].span)?;
 
                         ty
                     }
-
                     _ => {
                         return Err(ExpectedIndexable {
                             found: object_ty,
@@ -967,7 +1038,20 @@ impl<'a> Sema<'a> {
                 end,
                 inclusive,
             } => todo!(),
-            ExprKind::Unwrap(expr_id) => todo!(),
+            ExprKind::Unwrap(opt_id) => {
+                let opt_ty = self.check_expr(env, *opt_id)?;
+
+                // only optionals can be unwrapped
+                match self.types.get(opt_ty) {
+                    SemaType::Opt(inner) => *inner,
+                    _ => {
+                        return Err(ExpectedOptional {
+                            found: opt_ty,
+                            span: self.ast.exprs[*opt_id].span,
+                        });
+                    }
+                }
+            }
             ExprKind::Const(expr_id) => todo!(),
         };
 
@@ -1015,12 +1099,12 @@ impl<'a> Sema<'a> {
 
     fn check_struct_lit(
         &mut self,
-        scope: ScopeId,
+        env: &FunctionEnv,
         ty: AstTypeId,
         fields: &[FieldInit],
         span: Span,
     ) -> Result<SemaTypeId> {
-        let ty = self.eval_type(scope, ty)?;
+        let ty = self.eval_type(env.scope, ty)?;
 
         match self.types.get(ty) {
             SemaType::Struct(info) => {
@@ -1047,7 +1131,7 @@ impl<'a> Sema<'a> {
 
                     // check that value can be assigned to field
                     let field_ty = field_info.ty;
-                    let value_ty = self.check_expr(scope, field_init.value)?;
+                    let value_ty = self.check_expr(env, field_init.value)?;
                     self.coerce(field_ty, value_ty, field_init.span)?;
                 }
 
@@ -1086,7 +1170,7 @@ impl<'a> Sema<'a> {
 
                 // check that value can be assigned to field
                 let field_ty = field_info.ty;
-                let value_ty = self.check_expr(scope, field_init.value)?;
+                let value_ty = self.check_expr(env, field_init.value)?;
                 self.coerce(field_ty, value_ty, field_init.span)?;
 
                 Ok(ty)
@@ -1097,12 +1181,12 @@ impl<'a> Sema<'a> {
 
     fn check_unary(
         &mut self,
-        scope: ScopeId,
+        env: &FunctionEnv,
         op: UnOp,
         value: ExprId,
         span: Span,
     ) -> Result<SemaTypeId> {
-        let ty = self.check_expr(scope, value)?;
+        let ty = self.check_expr(env, value)?;
 
         match (op, self.types.get(ty)) {
             (UnOp::Neg, SemaType::Int) => Ok(self.types.int),
@@ -1120,14 +1204,14 @@ impl<'a> Sema<'a> {
 
     fn check_binary(
         &mut self,
-        scope: ScopeId,
+        env: &FunctionEnv,
         op: BinOp,
         lhs: ExprId,
         rhs: ExprId,
         span: Span,
     ) -> Result<SemaTypeId> {
-        let lhs = self.check_expr(scope, lhs)?;
-        let rhs = self.check_expr(scope, rhs)?;
+        let lhs = self.check_expr(env, lhs)?;
+        let rhs = self.check_expr(env, rhs)?;
         let (lhs, rhs) = self.coerce_numeric_operands(lhs, rhs);
 
         let lhs_ty = self.types.get(lhs);
@@ -1202,7 +1286,7 @@ impl<'a> Sema<'a> {
         }
     }
 
-    fn check_block(&mut self, scope: ScopeId, stmts: &[StmtId]) -> Result<SemaTypeId> {
+    fn check_block(&mut self, env: &FunctionEnv, stmts: &[StmtId]) -> Result<SemaTypeId> {
         let mut block_type = self.types.void;
 
         if stmts.is_empty() {
@@ -1217,19 +1301,19 @@ impl<'a> Sema<'a> {
             match &stmt.kind {
                 StmtKind::Empty => {}
                 StmtKind::Let { pattern, ty, value } => {
-                    let mut val_ty = self.check_expr(scope, *value)?;
+                    let mut val_ty = self.check_expr(env, *value)?;
 
                     if let Some(ty) = ty {
-                        let tgt_ty = self.eval_type(scope, *ty)?;
+                        let tgt_ty = self.eval_type(env.scope, *ty)?;
                         self.coerce(tgt_ty, val_ty, stmt.span)?;
                         val_ty = tgt_ty;
                     }
 
-                    self.bind_variable_pattern(scope, *pattern, val_ty)?;
+                    self.bind_variable_pattern(env.scope, *pattern, val_ty)?;
                 }
                 StmtKind::Semi(expr) => {
-                    // Evaluate expression type, but result is suppressed by semicolon
-                    let expr_ty = self.check_expr(scope, *expr)?;
+                    // Evaluate expression type, but result is surpressed by semicolon
+                    let expr_ty = self.check_expr(env, *expr)?;
 
                     // Diverging expressions are always assigned to the block type.
                     if matches!(self.types.get(expr_ty), SemaType::Never) {
@@ -1237,10 +1321,10 @@ impl<'a> Sema<'a> {
                     }
                 }
                 StmtKind::Expr(expr) => {
-                    let expr_type = self.check_expr(scope, *expr)?;
+                    let expr_type = self.check_expr(env, *expr)?;
 
                     // Expression without semicolon must be the last or coerce to void type.
-                    // We use coerce instead of direct check to support diverging expressions.
+                    // We use coerce instead of direct comparison to support diverging expressions.
                     if i == last {
                         block_type = expr_type;
                     } else {

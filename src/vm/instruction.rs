@@ -5,11 +5,11 @@
 //   type RegType = u16;
 //   type InstWidth = u64;
 
-pub type RegType = u8;
+pub type Reg = u8;
 pub type InstType = u32;
 
 // Derived constants. NEVER EDIT DIRECTLY
-const REG_BITS: InstType = (std::mem::size_of::<RegType>() * 8) as _;
+const REG_BITS: InstType = (std::mem::size_of::<Reg>() * 8) as _;
 const INST_BITS: InstType = (std::mem::size_of::<InstType>() * 8) as _;
 const OPCODE_BITS: InstType = (std::mem::size_of::<Opcode>() * 8) as _;
 
@@ -34,41 +34,14 @@ const _: () = assert!(
     "ABC format does not fit in instruction width"
 );
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct Reg(RegType);
-
-impl Reg {
-    #[inline(always)]
-    pub const fn raw(self) -> RegType {
-        self.0
-    }
-
-    #[inline(always)]
-    pub const fn new(index: RegType) -> Self {
-        Self(index)
-    }
-
-    #[inline(always)]
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-
-    #[inline(always)]
-    const fn encode(self) -> InstType {
-        self.0 as InstType
-    }
-
-    #[inline(always)]
-    const fn decode(bits: InstType) -> Self {
-        Self(bits as RegType)
-    }
+#[inline(always)]
+const fn encode_reg(reg: Reg) -> InstType {
+    reg as InstType
 }
 
-impl std::fmt::Display for Reg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "R{}", self.0)
-    }
+#[inline(always)]
+const fn decode_reg(bits: InstType) -> Reg {
+    bits as Reg
 }
 
 macro_rules! define_opcodes {
@@ -200,17 +173,17 @@ impl Instruction {
 
     #[inline(always)]
     pub const fn a(self) -> Reg {
-        Reg::decode((self.0 >> FIELD_A) & REG_MASK)
+        decode_reg((self.0 >> FIELD_A) & REG_MASK)
     }
 
     #[inline(always)]
     pub const fn b(self) -> Reg {
-        Reg::decode((self.0 >> FIELD_B) & REG_MASK)
+        decode_reg((self.0 >> FIELD_B) & REG_MASK)
     }
 
     #[inline(always)]
     pub const fn c(self) -> Reg {
-        Reg::decode((self.0 >> FIELD_C) & REG_MASK)
+        decode_reg((self.0 >> FIELD_C) & REG_MASK)
     }
 
     // ABx Format
@@ -241,22 +214,22 @@ impl Instruction {
     }
 }
 
-pub const R0: Reg = Reg::new(0);
+pub const R0: Reg = 0;
 
 #[inline(always)]
 pub const fn encode_abc(Opcode(op): Opcode, a: Reg, b: Reg, c: Reg) -> Instruction {
     Instruction(
         (op as InstType)
-            | (a.encode() << FIELD_A)
-            | (b.encode() << FIELD_B)
-            | (c.encode() << FIELD_C),
+            | (encode_reg(a) << FIELD_A)
+            | (encode_reg(b) << FIELD_B)
+            | (encode_reg(b) << FIELD_C),
     )
 }
 
 #[inline(always)]
 pub const fn encode_abx(Opcode(op): Opcode, a: Reg, bx: InstType) -> Instruction {
     debug_assert!(bx <= BX_MASK, "bx field overflow");
-    Instruction((op as InstType) | (a.encode() << FIELD_A) | (bx << FIELD_B))
+    Instruction((op as InstType) | (encode_reg(a) << FIELD_A) | (bx << FIELD_B))
 }
 
 #[inline(always)]

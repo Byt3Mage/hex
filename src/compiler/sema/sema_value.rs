@@ -11,18 +11,29 @@ slotmap::new_key_type! {
     pub struct SemaValueId;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ComptimeInt {
     sign: bool, // false = positive, true = negative
     abs: u64,
 }
 
 impl ComptimeInt {
-    pub fn from_lit(value: u64) -> Self {
+    pub fn unsigned(value: u64) -> Self {
         Self {
             sign: false,
             abs: value,
         }
+    }
+
+    pub fn signed(value: i64) -> Self {
+        Self {
+            sign: true,
+            abs: value.unsigned_abs(),
+        }
+    }
+
+    pub fn is_neg(&self) -> bool {
+        self.sign
     }
 
     pub fn negate(&self) -> Self {
@@ -71,7 +82,7 @@ pub enum SemaValue {
 
 impl SemaValue {
     pub fn from_int_lit(value: u64) -> Self {
-        Self::Cint(ComptimeInt::from_lit(value))
+        Self::Cint(ComptimeInt::unsigned(value))
     }
 }
 

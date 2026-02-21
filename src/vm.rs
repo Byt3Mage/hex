@@ -1,3 +1,5 @@
+use std::usize;
+
 use thiserror::Error;
 
 use crate::vm::{
@@ -38,26 +40,23 @@ pub enum VMError {
     AllocFailed,
 }
 
+enum ReturnType {
+    Internal,
+    TopLevel(Reg),
+}
+
+use VMError::*;
+
 pub type VMResult<T> = Result<T, VMError>;
 
 struct CallerInfo {
-    /// PC in caller instructions to return to
     ret_pc: usize,
-
-    /// Caller registers base offset
     base_reg: usize,
-
-    /// Start register in caller to put return value
-    ret_reg: Reg,
 }
 
 struct Frame {
-    /// Caller function metadata.
-    /// `None` means top-level function with no caller
-    caller_info: Option<CallerInfo>,
-
-    /// Current function metadata,
     callee_info: CallInfo,
+    caller_info: CallerInfo,
 }
 
 pub struct VM<'a, A: PageAllocator> {
@@ -68,14 +67,14 @@ pub struct VM<'a, A: PageAllocator> {
     scheduler: Scheduler,
 
     pc: usize,
-    base_reg: usize,
+    base: usize,
 
     program: &'a Program,
 }
 
 impl<'a, A: PageAllocator> VM<'a, A> {
     pub fn reset(&mut self) {
-        self.base_reg = 0;
+        self.base = 0;
         self.pc = 0;
 
         self.regs.clear();
@@ -86,22 +85,22 @@ impl<'a, A: PageAllocator> VM<'a, A> {
 
     #[inline(always)]
     fn reg(&self, reg: Reg) -> Value {
-        self.regs[self.base_reg + reg.index()]
+        self.regs[self.base + reg as usize]
     }
 
     #[inline(always)]
     fn reg_mut(&mut self, reg: Reg) -> &mut Value {
-        &mut self.regs[self.base_reg + reg.index()]
+        &mut self.regs[self.base + reg as usize]
     }
 
     #[inline(always)]
     fn set_reg(&mut self, reg: Reg, value: impl AsValue) {
-        self.regs[self.base_reg + reg.index()] = value.into_value();
+        self.regs[self.base + reg as usize] = value.into_value();
     }
 
     #[inline(always)]
     fn set_reg_raw(&mut self, reg: Reg, value: Value) {
-        self.regs[self.base_reg + reg.index()] = value;
+        self.regs[self.base + reg as usize] = value;
     }
 
     #[inline(always)]
@@ -111,7 +110,7 @@ impl<'a, A: PageAllocator> VM<'a, A> {
 
     #[inline(always)]
     fn last_frame_mut(&mut self) -> VMResult<&mut Frame> {
-        self.call_stack.last_mut().ok_or(VMError::EmptyCallStack)
+        self.call_stack.last_mut().ok_or(EmptyCallStack)
     }
 
     #[inline(always)]
@@ -333,58 +332,59 @@ impl<'a, A: PageAllocator> VM<'a, A> {
 
     #[inline(always)]
     fn call(&mut self, ret_reg: Reg, cinfo: CallInfo) {
-        // Create register window
-        let base = self.regs.len();
-        self.regs.resize(base + cinfo.nreg as usize, Value::zero());
+        // Call convention: args are in caller registers[RRet..RN]
+        //
+        // We use overlapping register windows for caller and callee
+        // to avoid copying arguments. This is safe because argument registers
+        // are not clobbered by the caller until the callee returns.
 
-        // Copy args from caller into callee registers
-        // Call convention: args are in caller registers[ret..ret + narg]
-        let start = self.base_reg + ret_reg.index();
-        let end = start + cinfo.narg as usize;
-        self.regs.copy_within(start..end, base);
+        // Callee window starts at caller's return register.
+        let base = self.base + ret_reg as usize;
+        let last = base + cinfo.nreg as usize;
+
+        // Grow regs to fit callee's full register count beyond the arg base.
+        if last > self.regs.len() {
+            self.regs.resize(last, Value::zero());
+        }
 
         // Create new call frame and save caller info
         self.call_stack.push(Frame {
-            caller_info: Some(CallerInfo {
-                ret_pc: self.pc,
-                base_reg: self.base_reg,
-                ret_reg,
-            }),
             callee_info: cinfo,
+            caller_info: CallerInfo {
+                ret_pc: self.pc,
+                base_reg: self.base,
+            },
         });
 
-        // Jump to function code
-        self.base_reg = base;
+        // Jump to callee code
+        self.base = base;
         self.pc = cinfo.entry_pc;
     }
 
     #[inline(always)]
     fn exec_call(&mut self, i: Instruction) {
-        let ret_reg = i.a();
-        let cinfo = self.program.functions[i.bx() as usize].call_info;
-        self.call(ret_reg, cinfo);
+        let cinfo = self.program.funcs[i.bx() as usize].call_info;
+        self.call(i.a(), cinfo);
     }
 
     #[inline(always)]
     fn exec_callr(&mut self, i: Instruction) {
-        let ret_reg = i.a();
         let func = self.reg(i.b()).get::<FunctionPtr>() as usize;
-        let cinfo = self.program.functions[func as usize].call_info;
-        self.call(ret_reg, cinfo);
+        let cinfo = self.program.funcs[func as usize].call_info;
+        self.call(i.a(), cinfo);
     }
 
     fn exec_callt(&mut self, i: Instruction) -> VMResult<()> {
-        let ret_reg = i.a();
-        let cinfo = self.program.functions[i.bx() as usize].call_info;
+        let cinfo = self.program.funcs[i.bx() as usize].call_info;
 
         // Reuse register window: shrink or grow in-place
-        let base = self.base_reg;
-        self.regs.resize(base + cinfo.nreg as usize, Value::zero());
+        self.regs
+            .resize(self.base + cinfo.nreg as usize, Value::zero());
 
         // copy args into the same window
-        let start = self.base_reg + ret_reg.index();
+        let start = self.base + i.a() as usize;
         let end = start + cinfo.narg as usize;
-        self.regs.copy_within(start..end, base);
+        self.regs.copy_within(start..end, self.base);
 
         // Reuse current frame and update the callee info.
         self.last_frame_mut()?.callee_info = cinfo;
@@ -399,73 +399,64 @@ impl<'a, A: PageAllocator> VM<'a, A> {
 
         // Immutably borrow args from caller registers
         // Call convention: args are in caller registers[ret..ret + narg]
-        let ret = self.base_reg + ret_reg.index();
-        let args = &self.regs[ret..ret + narg];
-        let results = &mut self.native_call_ret[..nret];
+        let ret = self.base + ret_reg as usize;
+        let arg = &self.regs[ret..ret + narg];
+        let res = &mut self.native_call_ret[..nret];
 
         // Call native function
-        (func.func)(args, results)?;
+        (func.func)(arg, res)?;
 
         // Copy results back into caller registers
-        self.regs[ret..ret + nret].copy_from_slice(results);
+        self.regs[ret..ret + nret].copy_from_slice(res);
         Ok(())
     }
 
     #[inline(always)]
     fn exec_calln(&mut self, i: Instruction) -> VMResult<()> {
-        let ret_reg = i.a();
-        let func = &self.program.native_functions[i.bx() as usize];
-        self.calln(ret_reg, func)
+        let func = &self.program.native_funcs[i.bx() as usize];
+        self.calln(i.a(), func)
     }
 
     #[inline(always)]
     fn exec_callnr(&mut self, i: Instruction) -> VMResult<()> {
-        let ret_reg = i.a();
         let func_id = self.reg(i.b()).get::<FunctionPtr>() as usize;
-        let func = &self.program.native_functions[func_id];
-        self.calln(ret_reg, func)
+        let func = &self.program.native_funcs[func_id];
+        self.calln(i.a(), func)
     }
 
-    fn exec_ret(&mut self, i: Instruction) -> VMResult<Option<Frame>> {
-        let frame = self.call_stack.pop().ok_or(VMError::EmptyCallStack)?;
+    fn exec_ret(&mut self, i: Instruction) -> ReturnType {
+        let Some(frame) = self.call_stack.pop() else {
+            // No frame, return from top level function
+            return ReturnType::TopLevel(i.a());
+        };
 
-        match &frame.caller_info {
-            // No caller means top level function, exit run loop
-            None => Ok(Some(frame)),
+        // Copy return values to caller's registers
+        let start = self.base + i.a() as usize;
+        let end = start + frame.callee_info.nret as usize;
+        self.regs.copy_within(start..end, self.base);
 
-            // Return to caller
-            Some(caller_info) => {
-                // Copy return values to caller's registers
-                let start = self.base_reg + i.a().index();
-                let range = start..(start + frame.callee_info.nret as usize);
-                let ret_start = caller_info.base_reg + caller_info.ret_reg.index();
-                self.regs.copy_within(range, ret_start);
-
-                // Clear register window
-                self.regs.truncate(self.base_reg);
-                self.base_reg = caller_info.base_reg;
-                self.pc = caller_info.ret_pc;
-                Ok(None)
-            }
-        }
+        // Return back to caller
+        self.base = frame.caller_info.base_reg;
+        self.pc = frame.caller_info.ret_pc;
+        ReturnType::Internal
     }
 
     #[inline(always)]
     fn exec_alloc_buf(&mut self, i: Instruction) -> VMResult<()> {
         let len = self.reg(i.b()).get::<u64>() as usize;
-        let ptr = self.heap.alloc_buff(len, 0).ok_or(VMError::AllocFailed)?;
+        let ptr = self.heap.alloc_buff(len, 0).ok_or(AllocFailed)?;
         self.set_reg(i.a(), ptr);
         Ok(())
     }
 
     fn exec_alloc_dyn(&mut self, i: Instruction) -> VMResult<()> {
-        let ptr = self.heap.alloc_dyn_buff(0).ok_or(VMError::AllocFailed)?;
+        let ptr = self.heap.alloc_dyn_buff(0).ok_or(AllocFailed)?;
         self.set_reg(i.a(), ptr);
         Ok(())
     }
 
     fn exec_alloc_str(&mut self, i: Instruction) -> VMResult<()> {
-        let ptr = self.heap.alloc_str(0).ok_or(VMError::AllocFailed)?;
+        let ptr = self.heap.alloc_str(0).ok_or(AllocFailed)?;
         self.set_reg(i.a(), ptr);
         Ok(())
     }
@@ -495,21 +486,21 @@ impl<'a, A: PageAllocator> VM<'a, A> {
 
     fn exec_spawn_task(&mut self, i: Instruction) -> VMResult<()> {
         let dst = i.a();
-        let cinfo = self.program.functions[i.bx() as usize].call_info;
-        let start = self.base_reg + dst.index();
+        let cinfo = self.program.funcs[i.bx() as usize].call_info;
+        let start = self.base + dst as usize;
         let args = &self.regs[start..start + cinfo.narg as usize];
         let task = Task::new(cinfo, args);
-        let ptr = self.heap.alloc_task(task, 0).ok_or(VMError::AllocFailed)?;
+        let ptr = self.heap.alloc_task(task, 0).ok_or(AllocFailed)?;
 
         self.set_reg(dst, ptr);
         Ok(())
     }
 
     pub fn exec_await(&mut self, i: Instruction) -> VMResult<bool> {
-        let mut current = self.scheduler.current().ok_or(VMError::IllegalAwait)?;
+        let mut current = self.scheduler.current().ok_or(IllegalAwait)?;
 
         if current.as_ref::<GCTask>().get().is_cancelled() {
-            return Err(VMError::TaskCancelled);
+            return Err(TaskCancelled);
         }
 
         let task: GCPtr = self.reg(i.a()).get();
@@ -524,7 +515,7 @@ impl<'a, A: PageAllocator> VM<'a, A> {
         let waiter = current.as_mut::<GCTask>().get_mut();
         std::mem::swap(&mut self.regs, &mut waiter.registers);
         std::mem::swap(&mut self.call_stack, &mut waiter.call_stack);
-        waiter.base_reg = self.base_reg;
+        waiter.base_reg = self.base;
         waiter.pc = self.pc - 1; // pc pushed back so await is retried on resume
 
         Ok(false)
@@ -551,7 +542,7 @@ impl<'a, A: PageAllocator> VM<'a, A> {
         Ok(())
     }
 
-    fn run<const SYNC: bool>(&mut self) -> VMResult<Option<Frame>> {
+    fn run<const SYNC: bool>(&mut self) -> VMResult<Reg> {
         while self.pc < self.program.bytecode.len() {
             let i = self.program.bytecode[self.pc];
             self.pc += 1;
@@ -610,15 +601,15 @@ impl<'a, A: PageAllocator> VM<'a, A> {
                 Opcode::JMP_F => self.exec_jump_false(i),
 
                 Opcode::CALL => self.exec_call(i),
+                Opcode::CALLR => self.exec_callr(i),
                 Opcode::CALLT => self.exec_callt(i)?,
                 Opcode::CALLN => self.exec_calln(i)?,
-                Opcode::CALLR => self.exec_callr(i),
                 Opcode::CALLNR => self.exec_callnr(i)?,
-                Opcode::RET => {
-                    if let Some(frame) = self.exec_ret(i)? {
-                        return Ok(Some(frame));
-                    }
-                }
+
+                Opcode::RET => match self.exec_ret(i) {
+                    ReturnType::Internal => {}
+                    ReturnType::TopLevel(ret_reg) => return Ok(ret_reg),
+                },
 
                 Opcode::ALLOC_BUF => self.exec_alloc_buf(i)?,
                 Opcode::ALLOC_DYN => self.exec_alloc_dyn(i)?,
@@ -634,26 +625,26 @@ impl<'a, A: PageAllocator> VM<'a, A> {
                     }
 
                     if !self.exec_await(i)? {
-                        return Ok(None);
+                        return Ok(0);
                     }
                 }
 
-                Opcode::HALT => return Ok(None),
-                op => return Err(VMError::IllegalOp(op)),
+                Opcode::HALT => return Ok(0),
+                op => return Err(IllegalOp(op)),
             }
         }
-        Err(VMError::PCOutOfBounds)
+        Err(PCOutOfBounds)
     }
 
     pub fn execute(&mut self, func_id: FunctionPtr, args: &[Value]) -> VMResult<&[Value]> {
         // Reset VM state before running top level function.
         self.reset();
 
-        let call_info = self.program.functions[func_id as usize].call_info;
+        let call_info = self.program.funcs[func_id as usize].call_info;
         let argc = args.len() as u8;
 
         if call_info.narg != argc {
-            return Err(VMError::InvalidArgCount {
+            return Err(InvalidArgCount {
                 exp: call_info.narg,
                 got: argc,
             });
@@ -661,23 +652,14 @@ impl<'a, A: PageAllocator> VM<'a, A> {
 
         self.regs.resize(call_info.nreg as usize, Value::zero());
         self.regs[..args.len()].copy_from_slice(args);
-        self.base_reg = 0;
+        self.base = 0;
         self.pc = call_info.entry_pc;
 
-        // Push synthetic frame
-        self.call_stack.push(Frame {
-            caller_info: None,
-            callee_info: call_info,
-        });
+        let ret_reg = self.run::<true>()?;
+        let start = self.base + ret_reg as usize;
+        let end = start + call_info.nret as usize;
 
-        match self.run::<true>()? {
-            None => Err(VMError::EmptyCallStack),
-            Some(frame) => {
-                let start = self.base_reg;
-                let range = start..(start + frame.callee_info.nret as usize);
-                Ok(&self.regs[range])
-            }
-        }
+        Ok(&self.regs[start..end])
     }
 
     fn collect_roots(&self) -> Vec<GCPtr> {

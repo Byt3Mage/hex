@@ -104,6 +104,10 @@ value! {
     // Niche values that can live in a single register
     OptPtr: Option<GCPtr>,
     OptBool: Option<bool>,
+
+    // OS-specific size types
+    Isize: isize,
+    Usize: usize,
 }
 
 pub fn try_get_ptr(value: &Value) -> Option<GCPtr> {

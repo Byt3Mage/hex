@@ -39,6 +39,12 @@ impl AstArena {
 }
 
 #[derive(Debug, Clone)]
+pub struct Package {
+    pub decl_id: DeclId,
+    pub decls: Vec<DeclId>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,

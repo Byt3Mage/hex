@@ -2,7 +2,10 @@ use std::rc::Rc;
 
 use crate::{
     arena::{Arena, Ident},
-    compiler::{ast::DeclId, sema::sema_value::SemaValueId},
+    compiler::{
+        ast::DeclId,
+        sema::sema_value::{ComptimeInt, SemaValueId},
+    },
 };
 
 slotmap::new_key_type! {
@@ -87,7 +90,7 @@ pub struct FieldInfo {
 #[derive(Debug, Clone)]
 pub struct VariantInfo {
     pub name: Name,
-    pub value: SemaValueId, // resolved discriminant value
+    pub value: ComptimeInt, // resolved discriminant value
 }
 
 pub struct TypeArena {

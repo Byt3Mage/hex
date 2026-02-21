@@ -3,7 +3,7 @@ use crate::{
     compiler::{
         ast::PatternId,
         op::{BinOp, UnOp},
-        sema::{ScopeId, SymbolId, sema_type::SemaTypeId},
+        sema::{ScopeId, SymbolId, sema_type::SemaTypeId, sema_value::ComptimeInt},
         tokens::Span,
     },
 };
@@ -22,6 +22,11 @@ pub enum ResolveError {
     },
     DuplicateVariantDef {
         name: Ident,
+        first: Span,
+        duplicate: Span,
+    },
+    DuplicateVariantVal {
+        value: ComptimeInt,
         first: Span,
         duplicate: Span,
     },
@@ -118,6 +123,10 @@ pub enum ResolveError {
         found: SemaTypeId,
         span: Span,
     },
+    ExpectedOptional {
+        found: SemaTypeId,
+        span: Span,
+    },
     ExpectedCallable {
         ty: SemaTypeId,
         span: Span,
@@ -130,4 +139,4 @@ macro_rules! bug {
     };
 }
 
-pub(super) use bug;
+pub(crate) use bug;

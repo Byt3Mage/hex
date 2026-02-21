@@ -1,4 +1,7 @@
-use crate::{arena::StrSymbol, compiler::op::UnOp};
+use crate::{
+    arena::StrSymbol,
+    compiler::op::{BinOp, UnOp},
+};
 
 /// A value in the register file. Can span one or more register slots
 /// depending on its type. Scalars are size 1, aggregates are size N.
@@ -10,6 +13,9 @@ pub struct Value(pub u32);
 /// Basic block identifier.
 pub type BlockId = usize;
 
+/// Field index within a struct/union.
+pub type FieldIdx = usize;
+
 /// Function identifier (indexes into module-level function table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FuncId(pub u32);
@@ -17,14 +23,6 @@ pub struct FuncId(pub u32);
 /// Type identifier (indexes into module-level type table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TypeId(pub u32);
-
-/// Field index within a struct.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FieldIdx(pub usize);
-
-/// Variant index within a tagged union.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct VariantIdx(pub usize);
 
 /// Scalar types. Used to select the correct
 /// VM instruction (e.g. int_add vs float_add)
@@ -35,28 +33,6 @@ pub enum ScalarType {
     Float,
     Bool,
     Pointer,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    And,
-    Or,
-    BitAnd,
-    BitOr,
-    BitXor,
-    Shl,
-    Shr,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,14 +46,14 @@ pub enum Literal {
 
 #[derive(Clone, Debug)]
 pub enum Inst {
-    /// Copy N register slots from src to dst.
+    /// Copy N (= size(ty)) register slots from src to dst.
     /// Both must have the same type.
     Copy { dst: Value, src: Value, ty: TypeId },
 
     /// dst = literal
     Const { dst: Value, val: Literal },
 
-    /// dst = lhs op rhs
+    /// dst = lhs (op) rhs
     BinOp {
         dst: Value,
         lhs: Value,
@@ -86,7 +62,7 @@ pub enum Inst {
         ty: ScalarType,
     },
 
-    /// dst = op src
+    /// dst = (op) src
     UnOp {
         dst: Value,
         src: Value,
@@ -102,7 +78,7 @@ pub enum Inst {
         to: ScalarType,
     },
 
-    // ── Memory / addressing ─────────────────
+    // ── Memory ─────────────────
     /// Allocate register slots for a value of the given type.
     /// For scalars this is 1 slot, for aggregates it's N slots.
     RegAlloc { dst: Value, ty: TypeId },
@@ -112,24 +88,19 @@ pub enum Inst {
     FieldAddr {
         dst: Value,
         base: Value,
-        field: usize,
+        field: FieldIdx,
         base_ty: TypeId,
     },
 
     // ── Tagged union operations ─────────────
-    /// Write the variant tag into a union value.
-    SetTag { dst: Value, variant: VariantIdx },
+    /// Write the field tag into a union value.
+    SetTag { dst: Value, field: FieldIdx },
 
-    /// Read the variant tag from a union value.
+    /// Read the field tag from a union value.
     GetTag { dst: Value, src: Value },
 
-    /// Get a value pointing to the payload of a specific variant.
-    VariantPayload {
-        dst: Value,
-        base: Value,
-        variant_idx: VariantIdx,
-        variant_ty: TypeId,
-    },
+    /// Get the field payload of a union value.
+    UnionFieldAddr { dst: Value, base: Value },
 
     // ── Calls ───────────────────────────────
     /// Direct function call.
@@ -178,7 +149,7 @@ pub enum Terminator {
     /// Multi-way branch (for match on tagged unions or integer switch).
     Switch {
         scrutinee: Value,
-        cases: Vec<(VariantIdx, BlockId, Vec<Value>)>,
+        cases: Vec<(FieldIdx, BlockId, Vec<Value>)>,
         default: Option<(BlockId, Vec<Value>)>,
     },
 

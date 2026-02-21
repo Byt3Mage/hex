@@ -1,6 +1,11 @@
 use std::{collections::HashMap, rc::Rc};
 
-use crate::vm::{VMResult, instruction::Instruction, name::Name, object::Value};
+use crate::vm::{
+    VMResult,
+    instruction::{Instruction, Reg},
+    name::Name,
+    object::Value,
+};
 
 /// A single compilation unit (before linking)
 pub struct Unit {
@@ -29,16 +34,16 @@ pub struct CallInfo {
     pub entry_pc: usize,
 
     /// Number of registers allocated for this function
-    pub nreg: u8,
+    pub nreg: Reg,
 
     /// Number of argument registers this function expects
-    pub narg: u8,
+    pub narg: Reg,
 
     /// Number of registers used for return value
-    pub nret: u8,
+    pub nret: Reg,
 
     /// Number of captured values (0 for regular functions)
-    pub ncap: u8,
+    pub ncap: Reg,
 }
 
 #[derive(Debug, Clone)]
@@ -112,13 +117,13 @@ pub struct Program {
     pub bytecode: Vec<Instruction>,
 
     /// All functions from all units, in global order
-    pub functions: Vec<FunctionInfo>,
+    pub funcs: Vec<FunctionInfo>,
 
     /// All constants from all units
     pub constants: Vec<Value>,
 
     /// All native functions from all units, in global order
-    pub native_functions: Vec<NativeFunctionInfo>,
+    pub native_funcs: Vec<NativeFunctionInfo>,
 }
 
 /// Mapping information used during linking

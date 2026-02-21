@@ -648,7 +648,7 @@ impl<'a> Parser<'a> {
 
         match str::parse::<u64>(int_token.lexeme) {
             Ok(u) => Ok(Expr {
-                kind: ExprKind::CintLit(ComptimeInt::from_lit(u)),
+                kind: ExprKind::CintLit(ComptimeInt::unsigned(u)),
                 span: int_token.span,
             }),
             Err(err) => Err(ParseError {

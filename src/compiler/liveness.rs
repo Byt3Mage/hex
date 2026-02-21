@@ -78,7 +78,7 @@ fn inst_defs(inst: &Inst) -> SmallVec<[Value; 2]> {
         | Inst::Copy { dst, .. }
         | Inst::SetTag { dst, .. }
         | Inst::GetTag { dst, .. }
-        | Inst::VariantPayload { dst, .. }
+        | Inst::UnionFieldAddr { dst, .. }
         | Inst::Call { dst, .. }
         | Inst::CallIndirect { dst, .. } => {
             defs.push(*dst);
@@ -122,7 +122,7 @@ fn inst_uses(inst: &Inst) -> SmallVec<[Value; 4]> {
         Inst::GetTag { src, .. } => {
             uses.push(*src);
         }
-        Inst::VariantPayload { base, .. } => {
+        Inst::UnionFieldAddr { base, .. } => {
             uses.push(*base);
         }
 
