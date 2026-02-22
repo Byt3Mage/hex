@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::vm::{VMResult, name::Name, object::Value, program::NativeFunctionInfo};
+use crate::vm::{VMResult, name::Name, object::Value, program::NativeFunc};
 
 /// A type that can be constructed from a slice of Values
 pub trait FromValues: Sized + 'static {
@@ -22,12 +22,12 @@ pub trait IntoValues: 'static {
 
 /// A trait for types that can be used as native functions in the VM
 pub trait IntoNativeFunc {
-    fn into_native_func(self, name: Name) -> NativeFunctionInfo;
+    fn into_native_func(self, name: Name) -> NativeFunc;
 }
 
 impl<Ret: IntoValues> IntoNativeFunc for fn() -> VMResult<Ret> {
-    fn into_native_func(self, name: Name) -> NativeFunctionInfo {
-        NativeFunctionInfo {
+    fn into_native_func(self, name: Name) -> NativeFunc {
+        NativeFunc {
             name,
             func: Rc::new(move |_: &[Value], result: &mut [Value]| {
                 self()?.into_values(result)?;
@@ -47,8 +47,8 @@ macro_rules! impl_into_native_func {
             Ret: IntoValues,
         {
             #[allow(unused_assignments)]
-            fn into_native_func(self, name: Name) -> NativeFunctionInfo {
-                NativeFunctionInfo {
+            fn into_native_func(self, name: Name) -> NativeFunc {
+                NativeFunc {
                     name,
                     func: Rc::new(move |args: &[Value], result: &mut [Value]| {
                         let mut offset = 0usize;

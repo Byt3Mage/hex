@@ -19,7 +19,7 @@ enum Status {
 }
 
 fn sum(arr: [int; 5]): int {
-    return 5;
+    return @as(int, 5);
 }
 
 fn test(): int {

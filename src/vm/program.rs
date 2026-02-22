@@ -25,7 +25,7 @@ pub struct Unit {
     pub functions: Vec<FunctionInfo>,
 
     /// All native functions defined in this unit (local indices)
-    pub native_functions: Vec<NativeFunctionInfo>,
+    pub native_functions: Vec<NativeFunc>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -55,7 +55,7 @@ pub struct FunctionInfo {
     pub call_info: CallInfo,
 }
 
-pub struct NativeFunctionInfo {
+pub struct NativeFunc {
     /// Function name with full path for debugging
     pub name: Name,
 
@@ -123,7 +123,7 @@ pub struct Program {
     pub constants: Vec<Value>,
 
     /// All native functions from all units, in global order
-    pub native_funcs: Vec<NativeFunctionInfo>,
+    pub native_funcs: Vec<NativeFunc>,
 }
 
 /// Mapping information used during linking

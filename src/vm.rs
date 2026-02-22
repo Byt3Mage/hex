@@ -8,7 +8,7 @@ use crate::vm::{
     instruction::*,
     memory::PageAllocator,
     object::{AsValue, GCBuffer, GCTask, Value, try_get_ptr},
-    program::{CallInfo, FunctionPtr, NativeFunctionInfo, Program},
+    program::{CallInfo, FunctionPtr, NativeFunc, Program},
 };
 
 mod async_runtime;
@@ -23,19 +23,15 @@ pub mod program;
 #[derive(Debug, Copy, Clone, Error)]
 pub enum VMError {
     #[error("Illegal opcode received: {0:?}")]
-    IllegalOp(Opcode),
-    #[error("Operation stack expected, but the call stack is empty")]
-    EmptyCallStack,
+    UnknownOp(Opcode),
     #[error("Invalid argument count: expected {exp}, got {got}")]
     InvalidArgCount { exp: u8, got: u8 },
     #[error("Attempted to await in a cancelled async task")]
     TaskCancelled,
     #[error("Await instruction received outside of an async task")]
-    IllegalAwait,
+    AwaitOutsideAsync,
     #[error("Program counter out of bounds")]
     PCOutOfBounds,
-    #[error("Invalid conversion")]
-    ValueConversionFailed,
     #[error("Heap allocation failed")]
     AllocFailed,
 }
@@ -106,11 +102,6 @@ impl<'a, A: PageAllocator> VM<'a, A> {
     #[inline(always)]
     fn two_reg<T: AsValue>(&self, reg_a: Reg, reg_b: Reg) -> (T, T) {
         (self.reg(reg_a).get(), self.reg(reg_b).get())
-    }
-
-    #[inline(always)]
-    fn last_frame_mut(&mut self) -> VMResult<&mut Frame> {
-        self.call_stack.last_mut().ok_or(EmptyCallStack)
     }
 
     #[inline(always)]
@@ -374,12 +365,14 @@ impl<'a, A: PageAllocator> VM<'a, A> {
         self.call(i.a(), cinfo);
     }
 
-    fn exec_callt(&mut self, i: Instruction) -> VMResult<()> {
+    fn exec_callt(&mut self, i: Instruction) {
         let cinfo = self.program.funcs[i.bx() as usize].call_info;
+        let last = self.base + cinfo.nreg as usize;
 
-        // Reuse register window: shrink or grow in-place
-        self.regs
-            .resize(self.base + cinfo.nreg as usize, Value::zero());
+        // Grow regs to fit callee's full register count beyond the arg base.
+        if last > self.regs.len() {
+            self.regs.resize(last, Value::zero());
+        }
 
         // copy args into the same window
         let start = self.base + i.a() as usize;
@@ -387,18 +380,23 @@ impl<'a, A: PageAllocator> VM<'a, A> {
         self.regs.copy_within(start..end, self.base);
 
         // Reuse current frame and update the callee info.
-        self.last_frame_mut()?.callee_info = cinfo;
+        // If we are top level function, nret must be the same
+        // for caller and tail callee, so we don't need to update
+        // callee info.
+        if let Some(frame) = self.call_stack.last_mut() {
+            frame.callee_info = cinfo
+        }
+
         self.pc = cinfo.entry_pc;
-        Ok(())
     }
 
     #[inline(always)]
-    fn calln(&mut self, ret_reg: Reg, func: &NativeFunctionInfo) -> VMResult<()> {
+    fn calln(&mut self, ret_reg: Reg, func: &NativeFunc) -> VMResult<()> {
         let narg = func.narg as usize;
         let nret = func.nret as usize;
 
         // Immutably borrow args from caller registers
-        // Call convention: args are in caller registers[ret..ret + narg]
+        // Call convention: args are in caller registers[RRet..RN]
         let ret = self.base + ret_reg as usize;
         let arg = &self.regs[ret..ret + narg];
         let res = &mut self.native_call_ret[..nret];
@@ -497,7 +495,7 @@ impl<'a, A: PageAllocator> VM<'a, A> {
     }
 
     pub fn exec_await(&mut self, i: Instruction) -> VMResult<bool> {
-        let mut current = self.scheduler.current().ok_or(IllegalAwait)?;
+        let mut current = self.scheduler.current().ok_or(AwaitOutsideAsync)?;
 
         if current.as_ref::<GCTask>().get().is_cancelled() {
             return Err(TaskCancelled);
@@ -600,9 +598,10 @@ impl<'a, A: PageAllocator> VM<'a, A> {
                 Opcode::JMP_T => self.exec_jump_true(i),
                 Opcode::JMP_F => self.exec_jump_false(i),
 
+                // Call operations
                 Opcode::CALL => self.exec_call(i),
                 Opcode::CALLR => self.exec_callr(i),
-                Opcode::CALLT => self.exec_callt(i)?,
+                Opcode::CALLT => self.exec_callt(i),
                 Opcode::CALLN => self.exec_calln(i)?,
                 Opcode::CALLNR => self.exec_callnr(i)?,
 
@@ -621,16 +620,17 @@ impl<'a, A: PageAllocator> VM<'a, A> {
                 Opcode::SPAWN => self.exec_spawn_task(i)?,
                 Opcode::AWAIT => {
                     if SYNC {
-                        return Err(VMError::IllegalAwait);
-                    }
-
-                    if !self.exec_await(i)? {
-                        return Ok(0);
+                        return Err(VMError::AwaitOutsideAsync);
+                    } else {
+                        if !self.exec_await(i)? {
+                            return Ok(0);
+                        }
                     }
                 }
 
                 Opcode::HALT => return Ok(0),
-                op => return Err(IllegalOp(op)),
+
+                op => return Err(UnknownOp(op)),
             }
         }
         Err(PCOutOfBounds)

@@ -371,7 +371,7 @@ impl<'a> Parser<'a> {
                 span = path.span;
                 AstTypeKind::Path(self.ast.paths.insert(path))
             }
-            tt![@] => {
+            tt![&] => {
                 let mutable = self.advance_if(tt![mut])?;
                 let pointee = self.parse_type()?;
                 span = span.merge(pointee.span);

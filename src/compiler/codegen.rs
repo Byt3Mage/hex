@@ -22,7 +22,7 @@ enum CodegenError {
 
 #[derive(Clone, Copy, Debug)]
 struct Allocation {
-    reg: Reg,
+    start: Reg,
     size: Reg,
 }
 
@@ -37,7 +37,7 @@ struct RegAllocator {
     /// Next register to allocate from (bump pointer).
     next_reg: Reg,
     /// Freed register ranges available for reuse: (start, size).
-    free_list: Vec<(Reg, Reg)>,
+    free_list: Vec<Allocation>,
     /// Peak register usage (for frame metadata).
     max_reg: Reg,
 }
@@ -46,16 +46,21 @@ impl RegAllocator {
     fn alloc(&mut self, size: usize) -> Result<Allocation, CodegenError> {
         // Try to reuse from free list.
         for i in 0..self.free_list.len() {
-            let (start, free_size) = self.free_list[i];
+            let alloc = self.free_list[i];
 
-            if (free_size as usize) == size {
+            if (alloc.size as usize) == size {
                 let size = size as Reg;
                 self.free_list.swap_remove(i);
-                return Ok(Allocation { reg: start, size });
-            } else if (free_size as usize) > size {
+                return Ok(Allocation { size, ..alloc });
+            }
+
+            if (alloc.size as usize) > size {
                 let size = size as Reg;
-                self.free_list[i] = (Reg::new(start.raw() + size), free_size - size);
-                return Ok(Allocation { reg: start, size });
+                self.free_list[i] = Allocation {
+                    start: alloc.start + size,
+                    size: alloc.size - size,
+                };
+                return Ok(Allocation { size, ..alloc });
             }
         }
 
@@ -68,16 +73,15 @@ impl RegAllocator {
 
         // safe to cast wihout truncating since we checked for overflow
         let size = size as Reg;
-        let reg = Reg::new(self.next_reg);
+        let start = self.next_reg;
 
         self.next_reg += size;
         self.max_reg = self.max_reg.max(self.next_reg);
-
-        Ok(Allocation { reg, size })
+        Ok(Allocation { start, size })
     }
 
-    fn free(&mut self, reg: Reg, size: Reg) {
-        self.free_list.push((reg, size));
+    fn free(&mut self, alloc: Allocation) {
+        self.free_list.push(alloc);
     }
 }
 
@@ -155,8 +159,8 @@ impl<'a> Codegen<'a> {
                 // both dst and src have valid register ranges
                 // so we can safely cast without checking for overflow.
                 for i in 0..self.type_size(*ty) {
-                    let d = Reg::new(r_dst.raw() + i as Reg);
-                    let s = Reg::new(r_src.raw() + i as Reg);
+                    let d = r_dst + i as Reg;
+                    let s = r_src + i as Reg;
                     self.code.push(mov(d, s));
                 }
 
@@ -218,7 +222,7 @@ impl<'a> Codegen<'a> {
                 // Compile-time offset calculation.
                 let r_base = self.reg_of(*base);
                 let offset = self.field_offset(*base_ty, *field);
-                let r_dest = Reg::new(r_base.raw() + offset as Reg);
+                let r_dest = r_base + offset as Reg;
 
                 // Don't allocate, just record the mapping.
                 // We don't check offset overflow because fields
@@ -227,7 +231,7 @@ impl<'a> Codegen<'a> {
                 self.reg_map.insert(
                     *dst,
                     Allocation {
-                        reg: r_dest,
+                        start: r_dest,
                         size: 1, // FieldAddr result points to a single field's start
                     },
                 );
@@ -245,21 +249,6 @@ impl<'a> Codegen<'a> {
                 let r_src = self.reg_of(*src);
                 let r_dst = self.reg_alloc(*dst, 1)?;
                 self.code.push(mov(r_dst, r_src));
-            }
-
-            Inst::UnionFieldAddr { dst, base } => {
-                // Field payload starts at base + 1 (after the tag).
-                let r_base = self.reg_of(*base);
-                let r_dst = Reg::new(r_base.raw() + 1);
-
-                // Don't allocate, just record the mapping.
-                self.reg_map.insert(
-                    *dst,
-                    Allocation {
-                        reg: r_dst,
-                        size: 1, // UnionFieldAddr result points to a single field's start
-                    },
-                );
             }
 
             Inst::Call { dst, func, args } => {
@@ -301,17 +290,17 @@ impl<'a> Codegen<'a> {
     fn reg_alloc(&mut self, val: Value, size: usize) -> Result<Reg, CodegenError> {
         let alloc = self.reg_alloc.alloc(size)?;
         self.reg_map.insert(val, alloc);
-        Ok(alloc.reg)
+        Ok(alloc.start)
     }
 
     /// Allocate a temporary register (not tied to an IR Value).
     fn reg_alloc_temp(&mut self, size: usize) -> Result<Reg, CodegenError> {
-        self.reg_alloc.alloc(size).map(|a| a.reg)
+        self.reg_alloc.alloc(size).map(|a| a.start)
     }
 
     /// Look up the register assigned to a Value.
     fn reg_of(&self, val: Value) -> Reg {
-        self.reg_map[&val].reg
+        self.reg_map[&val].start
     }
 
     /// Look up the register size of a type.
@@ -328,7 +317,8 @@ impl<'a> Codegen<'a> {
     fn field_offset(&self, ty: TypeId, field: usize) -> usize {
         match &self.types.types[ty.0 as usize] {
             TypeInfo::Struct(s) => s.fields[field].offset,
-            _ => bug!("field_offset on non-struct type"),
+            TypeInfo::Union(_) => 1, // Union fields start at offset 1 (after the tag)
+            _ => bug!("field_offset on non struct or union type"),
         }
     }
 }

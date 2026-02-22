@@ -11,7 +11,7 @@ use crate::{
             FieldDef, FieldInit, Param, PathId, PatternId, PatternKind, StmtId, StmtKind,
             VariantDef,
         },
-        error::ResolveError,
+        error::{ResolveError, bug},
         op::{BinOp, UnOp},
         sema::{
             sema_type::{
@@ -140,14 +140,11 @@ impl SymbolTable {
 
         match scope.symbols.entry(symbol.name) {
             Entry::Vacant(entry) => Ok(*entry.insert(self.symbols.insert(symbol))),
-            Entry::Occupied(entry) => {
-                let first_def = self.symbols[*entry.get()].span;
-                Err(DuplicateSymbol {
-                    name: symbol.name,
-                    first: first_def,
-                    duplicate: symbol.span,
-                })
-            }
+            Entry::Occupied(entry) => Err(DuplicateSymbol {
+                name: symbol.name,
+                first: self.symbols[*entry.get()].span,
+                duplicate: symbol.span,
+            }),
         }
     }
 
@@ -708,7 +705,7 @@ impl<'a> Sema<'a> {
     ) -> Result<SemaTypeId> {
         let decl = &self.ast.decls[decl_id];
         match &decl.kind {
-            DeclKind::Module(_) => unreachable!("module can't resolve to a type"),
+            DeclKind::Module(_) => bug!("module can't resolve to a type"),
 
             DeclKind::Function {
                 generics,
@@ -1220,7 +1217,7 @@ impl<'a> Sema<'a> {
         if op == BinOp::NullCoalesce
             && let SemaType::Opt(inner) = lhs_ty
         {
-            self.coerce(lhs, rhs, span)?;
+            self.coerce(*inner, rhs, span)?;
             return Ok(*inner);
         }
 

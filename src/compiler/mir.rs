@@ -99,9 +99,6 @@ pub enum Inst {
     /// Read the field tag from a union value.
     GetTag { dst: Value, src: Value },
 
-    /// Get the field payload of a union value.
-    UnionFieldAddr { dst: Value, base: Value },
-
     // ── Calls ───────────────────────────────
     /// Direct function call.
     Call {
