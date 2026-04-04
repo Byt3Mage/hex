@@ -1,0 +1,16 @@
+[package]
+name = "talkscript"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+hex-vm = { path = "../hex-vm" }
+ahash = "0.8.12"
+simple-ternary = "0.3.0"
+thiserror = "2.0.18"
+const-assert = { git = "https://github.com/aquarius2019/const-assert.git" }
+string-interner = "0.19.0"
+smallvec = "1.15.1"
