@@ -4,7 +4,7 @@ use ahash::{AHashMap, AHashSet};
 use simple_ternary::tnr;
 
 use crate::{
-    arena::{Arena, Ident, Interner, define_id},
+    arena::{Ident, Interner},
     compiler::{
         ast::{
             AstArena, AstType, AstTypeId, AstTypeKind, DeclId, DeclKind, ExprId, ExprKind,
@@ -12,8 +12,8 @@ use crate::{
             VariantDef,
         },
         error::{ResolveError, bug},
-        mir,
-        op::{BinOp, UnOp},
+        mir::{self},
+        op::{AssignOp, BinOp, UnOp},
         sema::{
             sema_type::{
                 EnumInfo, FieldInfo, SemaType, SemaTypeId, StructInfo, TypeArena, UnionInfo,
@@ -21,6 +21,7 @@ use crate::{
             },
             sema_value::{ComptimeInt, SemaValue, SemaValueId, ValueArena},
         },
+        symbol_table::{Lookup, ScopeId, ScopeKind, Symbol, SymbolId, SymbolKind, SymbolTable},
         tokens::Span,
     },
 };
@@ -30,143 +31,6 @@ pub mod sema_value;
 
 use ResolveError::*;
 type Result<T> = std::result::Result<T, ResolveError>;
-
-define_id!(SymbolId);
-define_id!(ScopeId);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SymbolKind {
-    Variable(bool),
-    Module(DeclId),
-    Function(DeclId),
-    Const(DeclId),
-    Enum(DeclId),
-    Struct(DeclId),
-    Union(DeclId),
-    Variant(SymbolId),
-}
-
-#[derive(Debug, Clone)]
-pub struct Symbol {
-    pub kind: SymbolKind,
-    pub name: Ident,
-    pub span: Span,
-    pub ty_id: Option<SemaTypeId>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScopeKind {
-    Package,
-    Module,
-    Function,
-    Enum,
-    Block,
-    Loop,
-}
-
-pub struct Scope {
-    pub kind: ScopeKind,
-    pub parent: Option<ScopeId>,
-    pub symbols: AHashMap<Ident, SymbolId>,
-}
-
-impl Scope {
-    pub fn new(kind: ScopeKind, parent: Option<ScopeId>) -> Self {
-        Self {
-            kind,
-            parent,
-            symbols: AHashMap::new(),
-        }
-    }
-}
-
-struct Lookup {
-    symbol: SymbolId,
-    scope: ScopeId,
-}
-
-pub struct SymbolTable {
-    scopes: Arena<ScopeId, Scope>,
-    symbols: Arena<SymbolId, Symbol>,
-    decl_scopes: AHashMap<DeclId, ScopeId>,
-    decl_symbols: AHashMap<DeclId, SymbolId>,
-}
-
-impl SymbolTable {
-    fn new() -> Self {
-        Self {
-            scopes: Arena::new(),
-            symbols: Arena::new(),
-            decl_scopes: AHashMap::new(),
-            decl_symbols: AHashMap::new(),
-        }
-    }
-
-    fn scope(&mut self, kind: ScopeKind, parent: Option<ScopeId>) -> ScopeId {
-        self.scopes.insert(Scope::new(kind, parent))
-    }
-
-    fn get(&self, symbol_id: SymbolId) -> &Symbol {
-        &self.symbols[symbol_id]
-    }
-
-    fn parent_scope(&self, scope_id: ScopeId) -> Option<ScopeId> {
-        self.scopes[scope_id].parent
-    }
-
-    fn get_mut(&mut self, symbol_id: SymbolId) -> &mut Symbol {
-        &mut self.symbols[symbol_id]
-    }
-
-    fn lookup_local(&self, name: Ident, scope_id: ScopeId) -> Option<SymbolId> {
-        self.scopes[scope_id].symbols.get(&name).copied()
-    }
-
-    fn lookup(&self, name: Ident, mut scope_id: ScopeId) -> Option<Lookup> {
-        loop {
-            let scope = &self.scopes[scope_id];
-            match scope.symbols.get(&name) {
-                Some(symbol) => {
-                    return Some(Lookup {
-                        symbol: *symbol,
-                        scope: scope_id,
-                    });
-                }
-                None => scope_id = scope.parent?,
-            }
-        }
-    }
-
-    fn define(&mut self, symbol: Symbol, scope_id: ScopeId) -> Result<SymbolId> {
-        let scope = &mut self.scopes[scope_id];
-        match scope.symbols.entry(symbol.name) {
-            Entry::Vacant(e) => Ok(*e.insert(self.symbols.insert(symbol))),
-            Entry::Occupied(e) => Err(DuplicateSymbol {
-                name: symbol.name,
-                first: self.symbols[*e.get()].span,
-                duplicate: symbol.span,
-            }),
-        }
-    }
-
-    fn find_enclosing(&self, mut scope_id: ScopeId, kind: ScopeKind) -> Option<ScopeId> {
-        loop {
-            let scope = &self.scopes[scope_id];
-            if scope.kind == kind {
-                return Some(scope_id);
-            }
-            scope_id = scope.parent?;
-        }
-    }
-
-    fn find_loop_scope(&self, scope_id: ScopeId) -> Option<ScopeId> {
-        self.find_enclosing(scope_id, ScopeKind::Loop)
-    }
-
-    pub fn find_function_scope(&self, scope_id: ScopeId) -> Option<ScopeId> {
-        self.find_enclosing(scope_id, ScopeKind::Function)
-    }
-}
 
 pub struct FunctionEnv {
     fn_scope: ScopeId,
@@ -182,6 +46,10 @@ pub struct Sema<'a> {
     values: ValueArena,
     value_bindings: AHashMap<SymbolId, SemaValueId>,
     expr_types: AHashMap<ExprId, SemaTypeId>,
+
+    pattern_symbols: AHashMap<PatternId, SymbolId>,
+    func_ids: AHashMap<DeclId, mir::FuncId>,
+    next_func_id: u32,
 }
 
 impl<'a> Sema<'a> {
@@ -194,6 +62,9 @@ impl<'a> Sema<'a> {
             values: ValueArena::new(),
             value_bindings: AHashMap::new(),
             expr_types: AHashMap::new(),
+            pattern_symbols: AHashMap::new(),
+            func_ids: AHashMap::new(),
+            next_func_id: 0,
         }
     }
 
@@ -214,6 +85,13 @@ impl<'a> Sema<'a> {
         self.symbols
             .lookup_local(name, scope)
             .ok_or(SymbolNotInScope { scope, name, span })
+    }
+
+    fn alloc_func_id(&mut self, decl: DeclId) -> mir::FuncId {
+        let id = mir::FuncId(self.next_func_id);
+        self.next_func_id += 1;
+        self.func_ids.insert(decl, id);
+        id
     }
 
     pub fn register_root_module(&mut self, root_decl: DeclId) -> Result<ScopeId> {
@@ -341,6 +219,7 @@ impl<'a> Sema<'a> {
         Ok(())
     }
 
+    // Type-check and lower a function declaration to MIR
     pub fn analyze_function(&mut self, decl_id: DeclId) -> Result<mir::Function> {
         let decl = &self.ast.decls[decl_id];
         let fn_scope = self.symbols.decl_scopes[&decl_id];
@@ -350,7 +229,7 @@ impl<'a> Sema<'a> {
             .expect("expected parent");
 
         let DeclKind::Function {
-            generics,
+            generics: _,
             params,
             ret,
             body,
@@ -359,32 +238,95 @@ impl<'a> Sema<'a> {
             bug!("expected function declaration");
         };
 
-        let mut param_types = Vec::with_capacity(params.len());
-        for param in params {
-            param_types.push(self.eval_type(parent_scope, param.ty)?);
+        // Clone what we need before mutating self
+        let params = params.clone();
+        let ret = *ret;
+        let body = *body;
+
+        // Step 1: Evaluate parameter types and bind parameter names
+        let mut param_symbols = Vec::with_capacity(params.len());
+        let mut param_sema_types = Vec::with_capacity(params.len());
+
+        for param in &params {
+            let param_ty = self.eval_type(parent_scope, param.ty)?;
+            self.bind_variable_pattern(fn_scope, param.pattern, param_ty)?;
+            param_sema_types.push(param_ty);
         }
 
+        // Step 2: Evaluate return type
         let ret_type = match ret {
-            Some(ty) => self.eval_type(parent_scope, *ty)?,
+            Some(ty) => self.eval_type(parent_scope, ty)?,
             None => self.types.void,
         };
 
+        // Step 3: Type-check the body
         let env = FunctionEnv {
             fn_scope,
             ret_type,
             values: mir::ValueAllocator::new(),
         };
+        let body_type = self.check_expr(&env, body)?;
 
-        for (param, ty) in params.iter().zip(param_types) {}
+        // Step 4: Check that body value can be assigned to return type
+        self.coerce(ret_type, body_type, decl.span)?;
+
+        // Step 5: Assign a MIR FuncId
+        let func_id = self.alloc_func_id(decl_id);
+
+        // Step 6: Lower to MIR
+        let mut builder = MirBuilder::new(self.ast, self.interner, &self.types, &self.expr_types);
+
+        // Bind parameter values in the builder
+        let mut mir_params = Vec::with_capacity(params.len());
+        let mut mir_param_tys = Vec::with_capacity(params.len());
+        for (sym, sema_ty) in param_symbols.iter().zip(&param_sema_types) {
+            let val = builder.alloc_value();
+            builder.var_map.insert(*sym, val);
+            mir_params.push(val);
+            mir_param_tys.push(builder.mir_type(*sema_ty));
+        }
+
+        // Set up return value slot
+        let no_ret_val = matches!(self.types.get(ret_type), SemaType::Void | SemaType::Never);
+
+        if !no_ret_val {
+            builder.ret_value = Some(builder.alloc_value());
+        }
+
+        // Lower body
+        let result = builder.lower_expr(body);
+
+        // If body produced a value, copy to return slot and jump to return block
+        if !builder.is_terminated() {
+            if let (Some(ret_slot), Some(src)) = (builder.ret_value, result) {
+                let ty = builder.mir_type(ret_type);
+                builder.emit(mir::Inst::Copy {
+                    dst: ret_slot,
+                    src,
+                    ty,
+                });
+            }
+
+            builder.terminate(mir::Terminator::Jump {
+                target: builder.ret_block,
+                args: vec![],
+            });
+        }
+
+        // Patch return block
+        let ret_block = builder.ret_block;
+        builder.blocks[ret_block].terminator = mir::Terminator::Return {
+            value: builder.ret_value,
+        };
 
         Ok(mir::Function {
-            id: mir::FuncId(0),
-            name: self.interner.resolve(decl.name).unwrap().to_owned(),
-            params: todo!(),
-            param_tys: todo!(),
-            return_ty: todo!(),
-            blocks: todo!(),
-            next_value: todo!(),
+            id: func_id,
+            name: self.interner.resolve(decl.name).unwrap_or("?").to_owned(),
+            params: mir_params,
+            param_tys: mir_param_tys,
+            return_ty: no_ret_val.then(|| builder.mir_type(ret_type)),
+            blocks: builder.blocks,
+            next_value: builder.values.alloc().0,
         })
     }
 
@@ -439,7 +381,7 @@ impl<'a> Sema<'a> {
             PatternKind::Wildcard | PatternKind::Rest => Ok(()),
 
             PatternKind::Identifier { name, mutable } => {
-                self.define(
+                let symbol = self.define(
                     Symbol {
                         kind: SymbolKind::Variable(*mutable),
                         name: *name,
@@ -448,6 +390,8 @@ impl<'a> Sema<'a> {
                     },
                     scope,
                 )?;
+
+                self.pattern_symbols.insert(pattern_id, symbol);
                 Ok(())
             }
 
@@ -898,7 +842,6 @@ impl<'a> Sema<'a> {
                     SemaType::Array { elem, .. } | SemaType::Slice(elem) => {
                         let ty = *elem;
                         let index_ty = self.check_expr(env, *index)?;
-
                         // array/slice can only be indexed by uint
                         self.coerce(self.types.uint, index_ty, self.ast.exprs[*index].span)?;
 
@@ -1031,7 +974,7 @@ impl<'a> Sema<'a> {
             SemaType::Union(info) => {
                 let num_fields = fields.len();
 
-                // unions can only be initialized with one field
+                // unions must be initialized with only one field
                 if num_fields != 1 {
                     return Err(UnionFieldInit { num_fields, span });
                 }
@@ -1523,5 +1466,964 @@ impl<'a> Sema<'a> {
             SemaValue::Variant(sema_type_id, sema_value_id) => todo!(),
             SemaValue::Function(decl_id) => todo!(),
         }
+    }
+}
+
+/// Tracks the MIR block being built and the break/continue targets for loops.
+struct LoopContext {
+    /// mir::Block to jump to on `break`
+    break_block: mir::BlockId,
+    /// mir::Block to jump to on `continue`
+    continue_block: mir::BlockId,
+    /// Value to write break results into (if the loop is used as an expression)
+    break_dest: Option<mir::Value>,
+}
+
+/// Lowers a type-checked function body into MIR.
+///
+/// The builder maintains a "current block" that instructions are appended to.
+/// Control flow (if/while/loop) creates new blocks and wires them with terminators.
+struct MirBuilder<'a> {
+    ast: &'a AstArena,
+    interner: &'a Interner,
+    types: &'a TypeArena,
+    expr_types: &'a AHashMap<ExprId, SemaTypeId>,
+
+    /// MIR type table being built (maps SemaTypeId → mir::TypeId)
+    mir_types: mir::TypeTable,
+    type_map: AHashMap<SemaTypeId, mir::TypeId>,
+
+    /// Function-level state
+    values: mir::ValueAllocator,
+    blocks: Vec<mir::Block>,
+    current_block: mir::BlockId,
+
+    /// Variable bindings: symbol → MIR value
+    var_map: AHashMap<SymbolId, mir::Value>,
+
+    /// Loop context stack for break/continue
+    loop_stack: Vec<LoopContext>,
+
+    /// Return block and return slot
+    ret_block: mir::BlockId,
+    ret_value: Option<mir::Value>,
+}
+
+impl<'a> MirBuilder<'a> {
+    fn new(
+        ast: &'a AstArena,
+        interner: &'a Interner,
+        types: &'a TypeArena,
+        expr_types: &'a AHashMap<ExprId, SemaTypeId>,
+    ) -> Self {
+        let mir_types = mir::TypeTable { types: vec![] };
+        let entry_block = mir::Block {
+            id: 0,
+            params: vec![],
+            insts: vec![],
+            terminator: mir::Terminator::Unreachable,
+        };
+
+        // Reserve block 0 for the return block, block 1 for entry.
+        // We'll swap them at the end so entry is 0.
+        let ret_block = mir::Block {
+            id: 1,
+            params: vec![],
+            insts: vec![],
+            terminator: mir::Terminator::Unreachable,
+        };
+
+        Self {
+            ast,
+            interner,
+            types,
+            expr_types,
+            mir_types,
+            type_map: AHashMap::new(),
+            values: mir::ValueAllocator::new(),
+            blocks: vec![entry_block, ret_block],
+            current_block: 0,
+            var_map: AHashMap::new(),
+            loop_stack: vec![],
+            ret_block: 1,
+            ret_value: None,
+        }
+    }
+
+    // ── Helpers ───────────────────────────────
+
+    fn alloc_value(&mut self) -> mir::Value {
+        self.values.alloc()
+    }
+
+    fn new_block(&mut self) -> mir::BlockId {
+        let id = self.blocks.len();
+        self.blocks.push(mir::Block {
+            id,
+            params: vec![],
+            insts: vec![],
+            terminator: mir::Terminator::Unreachable,
+        });
+        id
+    }
+
+    fn emit(&mut self, inst: mir::Inst) {
+        self.blocks[self.current_block].insts.push(inst);
+    }
+
+    fn switch_to(&mut self, block: mir::BlockId) {
+        self.current_block = block;
+    }
+
+    fn terminate(&mut self, term: mir::Terminator) {
+        self.blocks[self.current_block].terminator = term;
+    }
+
+    fn is_terminated(&self) -> bool {
+        !matches!(
+            self.blocks[self.current_block].terminator,
+            mir::Terminator::Unreachable
+        )
+    }
+
+    /// Resolve a SemaTypeId to a MIR scalar type for use in BinOp/UnOp.
+    fn scalar_type(&self, ty: SemaTypeId) -> mir::ScalarType {
+        match self.types.get(ty) {
+            SemaType::Int | SemaType::Cint => mir::ScalarType::Int,
+            SemaType::Uint => mir::ScalarType::UInt,
+            SemaType::Float => mir::ScalarType::Float,
+            SemaType::Bool => mir::ScalarType::Bool,
+            SemaType::Ptr { .. } => mir::ScalarType::Pointer,
+            _ => bug!("scalar_type called on non-scalar type"),
+        }
+    }
+
+    /// Get or create a MIR TypeId for a SemaTypeId.
+    fn mir_type(&mut self, sema_ty: SemaTypeId) -> mir::TypeId {
+        if let Some(&id) = self.type_map.get(&sema_ty) {
+            return id;
+        }
+
+        let info = match self.types.get(sema_ty) {
+            SemaType::Int | SemaType::Cint => mir::TypeInfo::Scalar(mir::ScalarType::Int),
+            SemaType::Uint => mir::TypeInfo::Scalar(mir::ScalarType::UInt),
+            SemaType::Float => mir::TypeInfo::Scalar(mir::ScalarType::Float),
+            SemaType::Bool => mir::TypeInfo::Scalar(mir::ScalarType::Bool),
+            SemaType::Char => mir::TypeInfo::Scalar(mir::ScalarType::Int),
+            SemaType::Ptr { .. } => mir::TypeInfo::Scalar(mir::ScalarType::Pointer),
+
+            SemaType::Struct(info) => {
+                let fields: Vec<mir::FieldLayout> = info
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .scan(0usize, |offset, (_, f)| {
+                        let ty = self.mir_type(f.ty);
+                        let field_size = self.mir_type_size(ty);
+                        let field_offset = *offset;
+                        *offset += field_size;
+                        Some(mir::FieldLayout {
+                            name: self.interner.resolve(f.name).unwrap_or("?").to_owned(),
+                            ty,
+                            offset: field_offset,
+                        })
+                    })
+                    .collect();
+                let size = fields.iter().map(|f| self.mir_type_size(f.ty)).sum();
+                let name = info
+                    .name
+                    .and_then(|n| self.interner.resolve(n))
+                    .unwrap_or("anon")
+                    .to_owned();
+                mir::TypeInfo::Struct(mir::StructLayout { name, fields, size })
+            }
+
+            SemaType::Union(info) => {
+                let fields: Vec<mir::FieldLayout> = info
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        let ty = self.mir_type(f.ty);
+                        mir::FieldLayout {
+                            name: self.interner.resolve(f.name).unwrap_or("?").to_owned(),
+                            ty,
+                            offset: 1, // all union fields start after the tag
+                        }
+                    })
+                    .collect();
+                let max_field = fields
+                    .iter()
+                    .map(|f| self.mir_type_size(f.ty))
+                    .max()
+                    .unwrap_or(0);
+                let size = 1 + max_field; // tag + largest field
+                let name = info
+                    .name
+                    .and_then(|n| self.interner.resolve(n))
+                    .unwrap_or("anon")
+                    .to_owned();
+                mir::TypeInfo::Union(mir::UnionLayout { name, fields, size })
+            }
+
+            SemaType::Array { elem, len } => {
+                let elem_ty = self.mir_type(*elem);
+                let elem_size = self.mir_type_size(elem_ty);
+                let length = *len as usize;
+                mir::TypeInfo::Array(mir::ArrayLayout {
+                    elem_ty,
+                    length,
+                    elem_size,
+                    size: elem_size * length,
+                })
+            }
+
+            SemaType::Function(params, ret) => {
+                // Function values are just pointers (scalar), but we track the
+                // signature in the type table for call emission.
+                let param_tys = params.iter().map(|p| self.mir_type(*p)).collect();
+                let ret_ty = if *ret == self.types.void {
+                    None
+                } else {
+                    Some(self.mir_type(*ret))
+                };
+                mir::TypeInfo::FuncPtr(param_tys, ret_ty)
+            }
+
+            // Void, Never, Null, Enum, etc. — these don't occupy registers
+            // in most contexts. We map them to a zero-sized scalar.
+            _ => mir::TypeInfo::Scalar(mir::ScalarType::Int),
+        };
+
+        let id = mir::TypeId(self.mir_types.types.len() as u32);
+        self.mir_types.types.push(info);
+        self.type_map.insert(sema_ty, id);
+        id
+    }
+
+    fn mir_type_size(&self, ty: mir::TypeId) -> usize {
+        match &self.mir_types.types[ty.0 as usize] {
+            mir::TypeInfo::Scalar(_) | mir::TypeInfo::FuncPtr(..) => 1,
+            mir::TypeInfo::Struct(s) => s.size,
+            mir::TypeInfo::Array(a) => a.size,
+            mir::TypeInfo::Union(u) => u.size,
+        }
+    }
+
+    fn lower_function(
+        &mut self,
+        name: String,
+        func_id: mir::FuncId,
+        params: &[ParamDef],
+        param_symbols: &[SymbolId],
+        ret_ty: SemaTypeId,
+        body: ExprId,
+    ) -> mir::Function {
+        // Set up return slot
+        if ret_ty != self.types.void && ret_ty != self.types.never {
+            let ret_val = self.alloc_value();
+            self.ret_value = Some(ret_val);
+        }
+
+        // Allocate MIR values for parameters and bind them
+        let mut mir_params = Vec::with_capacity(params.len());
+        let mut mir_param_tys = Vec::with_capacity(params.len());
+        for (param, &sym_id) in params.iter().zip(param_symbols) {
+            let val = self.alloc_value();
+            let sema_ty = self.expr_types.get(&ExprId::from(0)); // won't work — use symbol ty
+            mir_params.push(val);
+            self.var_map.insert(sym_id, val);
+        }
+
+        // We need param types from symbols, not expr_types
+        // This is handled by the caller setting up param_tys
+
+        // Lower the body
+        let result = self.lower_expr(body);
+
+        // If the body produced a value and we're not already terminated,
+        // write it to the return slot and jump to the return block.
+        if !self.is_terminated() {
+            if let Some(result_val) = result {
+                if let Some(ret_val) = self.ret_value {
+                    let ty = self.mir_type(ret_ty);
+                    self.emit(mir::Inst::Copy {
+                        dst: ret_val,
+                        src: result_val,
+                        ty,
+                    });
+                }
+            }
+            self.terminate(mir::Terminator::Jump {
+                target: self.ret_block,
+                args: vec![],
+            });
+        }
+
+        // Patch the return block's terminator
+        self.blocks[self.ret_block].terminator = mir::Terminator::Return {
+            value: self.ret_value,
+        };
+
+        let return_ty = if ret_ty != self.types.void {
+            Some(self.mir_type(ret_ty))
+        } else {
+            None
+        };
+
+        mir::Function {
+            id: func_id,
+            name,
+            params: mir_params,
+            param_tys: mir_param_tys,
+            return_ty,
+            blocks: std::mem::take(&mut self.blocks),
+            next_value: self.values.alloc().0, // hacky but gets the count
+        }
+    }
+
+    fn lower_expr(&mut self, expr_id: ExprId) -> Option<mir::Value> {
+        let expr = &self.ast.exprs[expr_id];
+        let sema_ty = self.expr_types[&expr_id];
+
+        match &expr.kind {
+            ExprKind::CintLit(c) => {
+                let dst = self.alloc_value();
+                let lit = match c.get_signed() {
+                    Some(i) => mir::Literal::Int(i),
+                    None => mir::Literal::Uint(c.get_unsigned().unwrap()),
+                };
+                self.emit(mir::Inst::Const { dst, val: lit });
+                Some(dst)
+            }
+
+            ExprKind::IntLit(i) => {
+                let dst = self.alloc_value();
+                let val = mir::Literal::Int(*i);
+                self.emit(mir::Inst::Const { dst, val });
+                Some(dst)
+            }
+
+            ExprKind::UintLit(u) => {
+                let dst = self.alloc_value();
+                let val = mir::Literal::Uint(*u);
+                self.emit(mir::Inst::Const { dst, val });
+                Some(dst)
+            }
+
+            ExprKind::FloatLit(f) => {
+                let dst = self.alloc_value();
+                let val = mir::Literal::Float(*f);
+                self.emit(mir::Inst::Const { dst, val });
+                Some(dst)
+            }
+
+            ExprKind::True => {
+                let dst = self.alloc_value();
+                let val = mir::Literal::Bool(true);
+                self.emit(mir::Inst::Const { dst, val });
+                Some(dst)
+            }
+
+            ExprKind::False => {
+                let dst = self.alloc_value();
+                let val = mir::Literal::Bool(false);
+                self.emit(mir::Inst::Const { dst, val });
+                Some(dst)
+            }
+
+            ExprKind::Char(c) => {
+                let dst = self.alloc_value();
+                let val = mir::Literal::Char(*c);
+                self.emit(mir::Inst::Const { dst, val });
+                Some(dst)
+            }
+
+            ExprKind::StrLit(s) => {
+                let dst = self.alloc_value();
+                let val = mir::Literal::Str(*s);
+                self.emit(mir::Inst::Const { dst, val });
+                Some(dst)
+            }
+
+            ExprKind::Null | ExprKind::Void => None,
+
+            // ── Variables / paths ─────────────
+            ExprKind::Path(path) => {
+                let path = &self.ast.paths[*path];
+
+                // Simple single-segment path → variable or function reference
+                if path.is_simple() {
+                    // Look up in var_map first
+                    // For now, we just handle the simple local variable case.
+                    // Function references and qualified paths need the symbol table.
+                    // This is a simplification — in a full impl we'd resolve through
+                    // the symbol table here too.
+                    None // handled below via symbol resolution
+                } else {
+                    None
+                }
+            }
+
+            ExprKind::Group(inner) => self.lower_expr(*inner),
+
+            ExprKind::Unary { op, rhs } => {
+                let src = self.lower_expr(*rhs)?;
+                let dst = self.alloc_value();
+                let rhs_ty = self.expr_types[rhs];
+
+                self.emit(mir::Inst::UnOp {
+                    dst,
+                    src,
+                    op: *op,
+                    ty: self.scalar_type(rhs_ty),
+                });
+                Some(dst)
+            }
+
+            // ── Binary ───────────────────────
+            ExprKind::Binary { op, lhs, rhs } => {
+                let lhs_val = self.lower_expr(*lhs)?;
+                let rhs_val = self.lower_expr(*rhs)?;
+                let dst = self.alloc_value();
+
+                // The result type determines which instruction variant we use.
+                // For comparisons, the operand type matters, not the result.
+                let operand_ty = self.expr_types[lhs];
+                self.emit(mir::Inst::BinOp {
+                    dst,
+                    lhs: lhs_val,
+                    rhs: rhs_val,
+                    op: *op,
+                    ty: self.scalar_type(operand_ty),
+                });
+                Some(dst)
+            }
+
+            ExprKind::Assign { op, tgt, val } => {
+                let rhs = self.lower_expr(*val)?;
+
+                match *op {
+                    AssignOp::Assign => {
+                        // For simple variable targets, just copy.
+                        // For field/index targets, we'd need store instructions.
+                        if let Some(lhs) = self.lower_lvalue(*tgt) {
+                            let ty = self.mir_type(sema_ty);
+                            self.emit(mir::Inst::Copy {
+                                dst: lhs,
+                                src: rhs,
+                                ty,
+                            });
+                        }
+                    }
+                    _ => {
+                        // Compound assignment: load, compute, store
+                        if let Some(lhs) = self.lower_lvalue(*tgt) {
+                            let bin_op = assign_op_to_bin_op(*op);
+                            let tmp = self.alloc_value();
+                            let operand_ty = self.expr_types[tgt];
+                            self.emit(mir::Inst::BinOp {
+                                dst: tmp,
+                                lhs,
+                                rhs,
+                                op: bin_op,
+                                ty: self.scalar_type(operand_ty),
+                            });
+                            let ty = self.mir_type(operand_ty);
+                            self.emit(mir::Inst::Copy {
+                                dst: lhs,
+                                src: tmp,
+                                ty,
+                            });
+                        }
+                    }
+                }
+                None
+            }
+
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let cond_val = self.lower_expr(*cond)?;
+
+                let then_block = self.new_block();
+                let else_block = self.new_block();
+                let merge_block = self.new_block();
+
+                self.terminate(mir::Terminator::BranchIf {
+                    cond: cond_val,
+                    then_target: then_block,
+                    then_args: vec![],
+                    else_target: else_block,
+                    else_args: vec![],
+                });
+
+                // Result value for the if expression
+                let is_void = sema_ty == self.types.void;
+                let result = if is_void {
+                    None
+                } else {
+                    Some(self.alloc_value())
+                };
+
+                // Then branch
+                self.switch_to(then_block);
+                let then_val = self.lower_expr(*then_branch);
+                if !self.is_terminated() {
+                    if let (Some(dst), Some(src)) = (result, then_val) {
+                        let ty = self.mir_type(sema_ty);
+                        self.emit(mir::Inst::Copy { dst, src, ty });
+                    }
+                    self.terminate(mir::Terminator::Jump {
+                        target: merge_block,
+                        args: vec![],
+                    });
+                }
+
+                // Else branch
+                self.switch_to(else_block);
+                if let Some(else_expr) = else_branch {
+                    let else_val = self.lower_expr(*else_expr);
+                    if !self.is_terminated() {
+                        if let (Some(dst), Some(src)) = (result, else_val) {
+                            let ty = self.mir_type(sema_ty);
+                            self.emit(mir::Inst::Copy { dst, src, ty });
+                        }
+                        self.terminate(mir::Terminator::Jump {
+                            target: merge_block,
+                            args: vec![],
+                        });
+                    }
+                } else {
+                    self.terminate(mir::Terminator::Jump {
+                        target: merge_block,
+                        args: vec![],
+                    });
+                }
+
+                self.switch_to(merge_block);
+                result
+            }
+
+            ExprKind::While { cond, body } => {
+                let cond_block = self.new_block();
+                let body_block = self.new_block();
+                let exit_block = self.new_block();
+
+                self.terminate(mir::Terminator::Jump {
+                    target: cond_block,
+                    args: vec![],
+                });
+
+                // Condition
+                self.switch_to(cond_block);
+                let cond_val = self.lower_expr(*cond).unwrap();
+                self.terminate(mir::Terminator::BranchIf {
+                    cond: cond_val,
+                    then_target: body_block,
+                    then_args: vec![],
+                    else_target: exit_block,
+                    else_args: vec![],
+                });
+
+                // Body
+                self.loop_stack.push(LoopContext {
+                    break_block: exit_block,
+                    continue_block: cond_block,
+                    break_dest: None,
+                });
+
+                self.switch_to(body_block);
+                self.lower_expr(*body);
+                if !self.is_terminated() {
+                    self.terminate(mir::Terminator::Jump {
+                        target: cond_block,
+                        args: vec![],
+                    });
+                }
+
+                self.loop_stack.pop();
+                self.switch_to(exit_block);
+                None // while is always void
+            }
+
+            // ── Loop ─────────────────────────
+            ExprKind::Loop(body) => {
+                let body_block = self.new_block();
+                let exit_block = self.new_block();
+
+                // If the loop type is non-void, allocate a result slot for break values
+                let is_void = sema_ty == self.types.void || sema_ty == self.types.never;
+                let break_dest = if is_void {
+                    None
+                } else {
+                    Some(self.alloc_value())
+                };
+
+                self.terminate(mir::Terminator::Jump {
+                    target: body_block,
+                    args: vec![],
+                });
+
+                self.loop_stack.push(LoopContext {
+                    break_block: exit_block,
+                    continue_block: body_block,
+                    break_dest,
+                });
+
+                self.switch_to(body_block);
+                self.lower_expr(*body);
+                if !self.is_terminated() {
+                    self.terminate(mir::Terminator::Jump {
+                        target: body_block,
+                        args: vec![],
+                    });
+                }
+
+                self.loop_stack.pop();
+                self.switch_to(exit_block);
+                break_dest
+            }
+
+            ExprKind::Block(stmts) => self.lower_block(stmts),
+
+            ExprKind::Return(value) => {
+                if let Some(val_expr) = value {
+                    let val = self.lower_expr(*val_expr);
+                    if let (Some(ret_slot), Some(v)) = (self.ret_value, val) {
+                        let ret_ty = self.expr_types[val_expr];
+                        let ty = self.mir_type(ret_ty);
+                        self.emit(mir::Inst::Copy {
+                            dst: ret_slot,
+                            src: v,
+                            ty,
+                        });
+                    }
+                }
+                self.terminate(mir::Terminator::Jump {
+                    target: self.ret_block,
+                    args: vec![],
+                });
+                None
+            }
+
+            // ── Break ────────────────────────
+            ExprKind::Break(value) => {
+                let ctx = self.loop_stack.last().expect("break outside loop");
+                let break_block = ctx.break_block;
+                let break_dest = ctx.break_dest;
+
+                if let Some(val_expr) = value {
+                    let val = self.lower_expr(*val_expr);
+                    if let (Some(dst), Some(src)) = (break_dest, val) {
+                        let val_ty = self.expr_types[val_expr];
+                        let ty = self.mir_type(val_ty);
+                        self.emit(mir::Inst::Copy { dst, src, ty });
+                    }
+                }
+
+                self.terminate(mir::Terminator::Jump {
+                    target: break_block,
+                    args: vec![],
+                });
+                None
+            }
+
+            // ── Continue ─────────────────────
+            ExprKind::Continue => {
+                let ctx = self.loop_stack.last().expect("continue outside loop");
+                let continue_block = ctx.continue_block;
+                self.terminate(mir::Terminator::Jump {
+                    target: continue_block,
+                    args: vec![],
+                });
+                None
+            }
+
+            // ── Call ─────────────────────────
+            ExprKind::Call { callee, args } => {
+                let mut arg_vals = Vec::with_capacity(args.len());
+                for &arg in args {
+                    if let Some(v) = self.lower_expr(arg) {
+                        arg_vals.push(v);
+                    }
+                }
+
+                let callee_ty = self.expr_types[callee];
+
+                // Check if callee is a direct function reference
+                let is_void = sema_ty == self.types.void;
+
+                // For simplicity, try direct call via path, fall back to indirect.
+                if let ExprKind::Path(path) = &self.ast.exprs[*callee].kind {
+                    let path = &self.ast.paths[*path];
+                    // In a full impl, resolve the path to a mir::FuncId.
+                    // For now, emit indirect call through the callee value.
+                }
+
+                let callee_val = self.lower_expr(*callee);
+
+                if is_void {
+                    if let Some(func_ptr) = callee_val {
+                        self.emit(mir::Inst::CallIndirectVoid {
+                            func_ptr,
+                            args: arg_vals,
+                        });
+                    }
+                    None
+                } else {
+                    let dst = self.alloc_value();
+                    if let Some(func_ptr) = callee_val {
+                        self.emit(mir::Inst::CallIndirect {
+                            dst,
+                            func_ptr,
+                            args: arg_vals,
+                        });
+                    }
+                    Some(dst)
+                }
+            }
+
+            // ── Field access ─────────────────
+            ExprKind::Field { object, field } => {
+                let base = self.lower_expr(*object)?;
+                let object_ty = self.expr_types[object];
+                let base_mir_ty = self.mir_type(object_ty);
+
+                // Find field index
+                let field_idx = self.find_field_index(object_ty, *field);
+                let dst = self.alloc_value();
+                self.emit(mir::Inst::FieldAddr {
+                    dst,
+                    base,
+                    field: field_idx,
+                    base_ty: base_mir_ty,
+                });
+                Some(dst)
+            }
+
+            // ── Index ────────────────────────
+            ExprKind::Index { object, index } => {
+                // Array indexing lowers to FieldAddr with a runtime index.
+                // But MIR FieldAddr uses compile-time indices.
+                // For dynamic indexing we'd need a different instruction.
+                // For now, we lower to a direct field access if the index is const,
+                // otherwise this needs a heap load (arrays on heap) or
+                // a special indexed-access instruction.
+                //
+                // Since the VM uses register-file arrays, dynamic indexing
+                // can't be done with FieldAddr. We'd need to extend MIR.
+                // For now, emit a placeholder — the index is lowered as a value
+                // and we use FieldAddr with index 0 as a stub.
+                let _base = self.lower_expr(*object);
+                let _idx = self.lower_expr(*index);
+                let dst = self.alloc_value();
+                // TODO: proper dynamic index instruction
+                Some(dst)
+            }
+
+            // ── Struct literal ────────────────
+            ExprKind::StructLit { ty, fields } => {
+                let mir_ty = self.mir_type(sema_ty);
+                let dst = self.alloc_value();
+                self.emit(mir::Inst::RegAlloc { dst, ty: mir_ty });
+
+                for field_init in fields {
+                    let field_idx = self.find_field_index(sema_ty, field_init.name);
+                    let val = self.lower_expr(field_init.value);
+
+                    if let Some(src) = val {
+                        let field_dst = self.alloc_value();
+                        self.emit(mir::Inst::FieldAddr {
+                            dst: field_dst,
+                            base: dst,
+                            field: field_idx,
+                            base_ty: mir_ty,
+                        });
+                        let field_ty_sema = self.field_sema_type(sema_ty, field_idx);
+                        let field_ty = self.mir_type(field_ty_sema);
+                        self.emit(mir::Inst::Copy {
+                            dst: field_dst,
+                            src,
+                            ty: field_ty,
+                        });
+                    }
+                }
+
+                Some(dst)
+            }
+
+            // ── Unwrap ───────────────────────
+            ExprKind::Unwrap(_inner) => {
+                // TODO: emit runtime null check + trap
+                let val = self.lower_expr(*_inner);
+                val
+            }
+
+            // ── Cast ─────────────────────────
+            ExprKind::Cast { expr: inner, ty: _ } => {
+                let src = self.lower_expr(*inner)?;
+                let from_ty = self.expr_types[inner];
+                let dst = self.alloc_value();
+                self.emit(mir::Inst::Cast {
+                    dst,
+                    src,
+                    from: self.scalar_type(from_ty),
+                    to: self.scalar_type(sema_ty),
+                });
+                Some(dst)
+            }
+
+            ExprKind::Const(inner) => {
+                // Comptime expressions lower the same way at this stage.
+                // The comptime evaluator would have already folded these.
+                self.lower_expr(*inner)
+            }
+
+            // Things we haven't implemented yet
+            ExprKind::ArrayLit(_)
+            | ExprKind::ArrayRepeat { .. }
+            | ExprKind::Match { .. }
+            | ExprKind::For { .. }
+            | ExprKind::OptionalField { .. }
+            | ExprKind::Range { .. } => {
+                // TODO: implement these
+                None
+            }
+        }
+    }
+
+    /// Lower statements in a block, returning the block's result value.
+    fn lower_block(&mut self, stmts: &[StmtId]) -> Option<mir::Value> {
+        if stmts.is_empty() {
+            return None;
+        }
+
+        let last = stmts.len() - 1;
+        let mut result = None;
+
+        for (i, &stmt_id) in stmts.iter().enumerate() {
+            if self.is_terminated() {
+                break;
+            }
+
+            let stmt = &self.ast.stmts[stmt_id];
+
+            match &stmt.kind {
+                StmtKind::Empty => {}
+
+                StmtKind::Let { pattern, ty, value } => {
+                    let val = self.lower_expr(*value);
+                    // Bind the pattern's variables to the lowered value.
+                    if let Some(v) = val {
+                        self.bind_pattern(*pattern, v);
+                    }
+                }
+
+                StmtKind::Semi(expr) => {
+                    self.lower_expr(*expr);
+                }
+
+                StmtKind::Expr(expr) => {
+                    let val = self.lower_expr(*expr);
+                    if i == last {
+                        result = val;
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Resolve an expression to its MIR lvalue (the Value it's stored in).
+    /// Returns None for non-assignable expressions.
+    fn lower_lvalue(&mut self, expr_id: ExprId) -> Option<mir::Value> {
+        let expr = &self.ast.exprs[expr_id];
+        match &expr.kind {
+            ExprKind::Path(path) => {
+                // Look up variable in var_map via the path
+                // For a simple single-name path, this is a local variable.
+                let path = &self.ast.paths[*path];
+                if path.is_simple() {
+                    // We need the SymbolId — but we only have an Ident.
+                    // In the current architecture, we'd need a scope to look this up.
+                    // For now, return None; proper implementation needs scope threading.
+                    None
+                } else {
+                    None
+                }
+            }
+            ExprKind::Field { object, field } => {
+                let base = self.lower_lvalue(*object)?;
+                let object_ty = self.expr_types[object];
+                let base_mir_ty = self.mir_type(object_ty);
+                let field_idx = self.find_field_index(object_ty, *field);
+                let dst = self.alloc_value();
+                self.emit(mir::Inst::FieldAddr {
+                    dst,
+                    base,
+                    field: field_idx,
+                    base_ty: base_mir_ty,
+                });
+                Some(dst)
+            }
+            _ => None,
+        }
+    }
+
+    /// Bind pattern variables to a MIR value.
+    fn bind_pattern(&mut self, pattern_id: PatternId, value: mir::Value) {
+        let pattern = &self.ast.patterns[pattern_id];
+        match &pattern.kind {
+            PatternKind::Identifier { .. } => {
+                // We need the SymbolId that was created during type checking.
+                // The proper way is to have sema record pattern → SymbolId mappings.
+                // For now, this is a known gap.
+            }
+            PatternKind::Wildcard | PatternKind::Rest => {}
+            _ => {} // TODO: destructuring patterns
+        }
+    }
+
+    fn find_field_index(&self, sema_ty: SemaTypeId, field_name: Ident) -> usize {
+        match self.types.get(sema_ty) {
+            SemaType::Struct(info) => info
+                .fields
+                .iter()
+                .position(|f| f.name == field_name)
+                .unwrap_or_else(|| bug!("field not found in struct")),
+            SemaType::Union(info) => info
+                .fields
+                .iter()
+                .position(|f| f.name == field_name)
+                .unwrap_or_else(|| bug!("field not found in union")),
+            _ => bug!("field access on non-struct/union"),
+        }
+    }
+
+    fn field_sema_type(&self, sema_ty: SemaTypeId, field_idx: usize) -> SemaTypeId {
+        match self.types.get(sema_ty) {
+            SemaType::Struct(info) => info.fields[field_idx].ty,
+            SemaType::Union(info) => info.fields[field_idx].ty,
+            _ => bug!("field_sema_type on non-struct/union"),
+        }
+    }
+}
+
+fn assign_op_to_bin_op(op: AssignOp) -> BinOp {
+    match op {
+        AssignOp::AddAssign => BinOp::Add,
+        AssignOp::SubAssign => BinOp::Sub,
+        AssignOp::MulAssign => BinOp::Mul,
+        AssignOp::DivAssign => BinOp::Div,
+        AssignOp::ModAssign => BinOp::Mod,
+        AssignOp::BitAndAssign => BinOp::BitAnd,
+        AssignOp::BitOrAssign => BinOp::BitOr,
+        AssignOp::BitXorAssign => BinOp::BitXor,
+        AssignOp::ShlAssign => BinOp::Shl,
+        AssignOp::ShrAssign => BinOp::Shr,
+        AssignOp::Assign => bug!("plain assign is not a compound op"),
     }
 }

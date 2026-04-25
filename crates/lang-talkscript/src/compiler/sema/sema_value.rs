@@ -4,7 +4,7 @@ use ahash::AHashMap;
 
 use crate::{
     arena::{Arena, Ident, StrSymbol, define_id},
-    compiler::{ast::DeclId, sema::sema_type::SemaTypeId},
+    compiler::{ast::DeclId, mir, sema::sema_type::SemaTypeId},
 };
 
 define_id!(SemaValueId);

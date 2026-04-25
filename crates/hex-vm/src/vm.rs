@@ -57,10 +57,8 @@ pub struct VM<'a, A: PageAllocator> {
     native_call_ret: Box<[Value; u8::MAX as usize]>,
     heap: Heap<A>,
     scheduler: Scheduler,
-
     pc: usize,
     base: usize,
-
     program: &'a Program,
 }
 

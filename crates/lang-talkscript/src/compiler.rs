@@ -10,6 +10,7 @@ mod op;
 mod parse_rules;
 mod parser;
 pub mod sema;
+mod symbol_table;
 mod tokens;
 
 #[derive(Debug, thiserror::Error)]

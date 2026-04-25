@@ -187,10 +187,10 @@ impl<'a> Codegen<'a> {
             } => {
                 // We only allow scalar types for raw binary operations,
                 // so r_dst should have a register allocation of 1.
+                let op = lower_binop(*op, *ty);
                 let r_lhs = self.reg_of(*lhs);
                 let r_rhs = self.reg_of(*rhs);
                 let r_dst = self.reg_alloc(*dst, 1)?;
-                let op = lower_binop(*op, *ty);
                 self.code.push(encode_abc(op, r_dst, r_lhs, r_rhs));
             }
 
@@ -325,14 +325,11 @@ fn lower_unop(op: UnOp, ty: ScalarType) -> Opcode {
     match (op, ty) {
         (UnOp::Neg, ScalarType::Int) => Opcode::INEG,
         (UnOp::Neg, ScalarType::Float) => Opcode::FNEG,
-
         (UnOp::Not, ScalarType::Bool) => Opcode::BNOT,
         (UnOp::Not, ScalarType::Int) => Opcode::INOT,
         (UnOp::Not, ScalarType::UInt) => Opcode::UNOT,
-
         (UnOp::Deref, _) => todo!("add pointer dereference"),
-
-        _ => bug!("unsupported unop {:?} for type {:?}", op, ty),
+        _ => bug!("unsupported unary op `{op:?}` for `{ty:?}`"),
     }
 }
 
@@ -378,7 +375,7 @@ fn lower_binop(op: BinOp, ty: ScalarType) -> Opcode {
         (BinOp::Ge, ScalarType::Float) => Opcode::FGE,
 
         // Bitwise and logical ops use int opcodes
-        (BinOp::BitAnd | BinOp::And, _) => todo!("proper bitwise ops"), // TODO: proper bitwise opcodes
-        _ => bug!("unsupported binop {:?} for type {:?}", op, ty),
+        (BinOp::BitAnd | BinOp::And, _) => todo!("proper bitwise ops"),
+        _ => bug!("unsupported binary op `{op:?}` for `{ty:?}`"),
     }
 }

@@ -6,7 +6,6 @@ use crate::{
 /// A value in the register file. Can span one or more register slots
 /// depending on its type. Scalars are size 1, aggregates are size N.
 /// Values are mutable, i.e. they can be stored to multiple times.
-/// SSA properties are recovered via analysis passes when needed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Value(pub u32);
 
@@ -23,6 +22,12 @@ pub struct FuncId(pub u32);
 /// Type identifier (indexes into module-level type table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TypeId(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TypedValue {
+    value: Value,
+    type_: TypeId,
+}
 
 pub struct ValueAllocator {
     next_value: u32,
@@ -173,14 +178,9 @@ pub enum Terminator {
     Unreachable,
 }
 
-// ──────────────────────────────────────────────
-// Blocks and Functions
-// ──────────────────────────────────────────────
-
 #[derive(Clone, Debug)]
 pub struct Block {
     pub id: BlockId,
-    /// Block parameters — values passed from incoming edges.
     pub params: Vec<Value>,
     pub insts: Vec<Inst>,
     pub terminator: Terminator,
@@ -194,13 +194,8 @@ pub struct Function {
     pub param_tys: Vec<TypeId>,
     pub return_ty: Option<TypeId>,
     pub blocks: Vec<Block>,
-    /// Counter for generating fresh Value IDs.
     pub next_value: u32,
 }
-
-// ──────────────────────────────────────────────
-// Type table
-// ──────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct FieldLayout {
@@ -244,10 +239,6 @@ pub enum TypeInfo {
 pub struct TypeTable {
     pub types: Vec<TypeInfo>,
 }
-
-// ──────────────────────────────────────────────
-// Module
-// ──────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct Module {

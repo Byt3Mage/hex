@@ -3,7 +3,8 @@ use crate::{
     compiler::{
         ast::PatternId,
         op::{BinOp, UnOp},
-        sema::{ScopeId, SymbolId, sema_type::SemaTypeId, sema_value::ComptimeInt},
+        sema::{sema_type::SemaTypeId, sema_value::ComptimeInt},
+        symbol_table::{ScopeId, SymbolId},
         tokens::Span,
     },
 };
