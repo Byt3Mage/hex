@@ -1,6 +1,10 @@
+use crate::{memory::*, object::*};
+use hex_vm::value::Value;
 use std::{ptr::NonNull, usize};
 
-use crate::{async_runtime::Task, memory::*, object::*};
+fn try_get_ptr(_: &Value) -> Option<GCPtr> {
+    todo!("implement runtime tagging")
+}
 
 const WHITE0_BIT: u8 = 1 << 0;
 const WHITE1_BIT: u8 = 1 << 1;
@@ -20,8 +24,6 @@ pub enum BlockType {
     DynBuffer,
     /// String data
     String,
-    /// Async task
-    Task,
 }
 
 #[derive(Clone, Copy)]
@@ -110,11 +112,6 @@ impl GCHeader {
         self.mark &= !mask
     }
 
-    #[inline(always)]
-    const fn reset_2_bits(&mut self, b1: u8, b2: u8) {
-        self.reset_bit(b1 | b2);
-    }
-
     const fn white_to_gray(&mut self) {
         self.reset_bit(WHITE_BITS);
     }
@@ -153,11 +150,11 @@ impl GCPtr {
     }
 
     #[inline(always)]
-    pub(super) fn ty(&self) -> BlockType {
+    pub fn ty(&self) -> BlockType {
         self.hdr().tt
     }
 
-    pub(super) fn as_ref<T>(&self) -> &T {
+    pub fn as_ref<T>(&self) -> &T {
         unsafe { &*self.obj_ptr() }
     }
 
@@ -188,7 +185,7 @@ pub struct MemCategoryStats {
     pub objects: usize,
 }
 
-pub struct Heap<A: PageAllocator> {
+pub struct Heap<A: HeapAllocator> {
     pages: PageManager<A>,
 
     // Gray lists for marking
@@ -204,7 +201,7 @@ pub struct Heap<A: PageAllocator> {
     memcat_stats: Box<[MemCategoryStats; MEM_CATEGORY_COUNT]>,
 }
 
-impl<A: PageAllocator> Heap<A> {
+impl<A: HeapAllocator> Heap<A> {
     pub fn new(allocator: A) -> Self {
         Self {
             pages: PageManager::new(allocator),
@@ -290,20 +287,6 @@ impl<A: PageAllocator> Heap<A> {
         Some(GCPtr(block))
     }
 
-    pub fn alloc_task(&mut self, task: Task, memcat: u8) -> Option<GCPtr> {
-        let size = GCTask::block_size();
-        let block = self.pages.alloc(size)?;
-
-        unsafe {
-            block.write(GCHeader::new(self.current_white, BlockType::Task, memcat));
-            let task_ptr = block.as_ref().object_ptr::<GCTask>();
-            task_ptr.write(GCTask::new(task));
-        }
-
-        self.track_alloc(memcat, size);
-        Some(GCPtr(block))
-    }
-
     /// Returns the "other" white (dead white from previous cycle)
     #[inline(always)]
     const fn other_white(&self) -> u8 {
@@ -345,7 +328,6 @@ impl<A: PageAllocator> Heap<A> {
             BlockType::String => hdr.mark |= BLACK_BIT,
             BlockType::Buffer => obj.as_mut::<GCBuffer>().gc_list = self.gray.replace(obj),
             BlockType::DynBuffer => obj.as_mut::<GCDynBuffer>().gc_list = self.gray.replace(obj),
-            BlockType::Task => obj.as_mut::<GCTask>().gc_list = self.gray.replace(obj),
             BlockType::Free => unreachable!("attempted to mark freed object"),
         }
     }
@@ -376,12 +358,6 @@ impl<A: PageAllocator> Heap<A> {
                 self.gray = buff.gc_list.take();
                 self.mark_children(buff.get());
                 GCDynBuffer::block_size() + buff.get().len() * size_of::<Value>()
-            }
-            BlockType::Task => {
-                let task = obj.as_mut::<GCTask>();
-                self.gray = task.gc_list.take();
-                self.mark_children(&task.get().registers);
-                GCTask::block_size() + task.get().registers.len() * size_of::<Value>()
             }
         }
     }
@@ -496,7 +472,7 @@ impl<A: PageAllocator> Heap<A> {
             let hdr = unsafe { block.as_mut() };
 
             // Skip freed blocks
-            if !hdr.is_free() {
+            if hdr.is_free() {
                 continue;
             }
 
@@ -532,11 +508,6 @@ impl<A: PageAllocator> Heap<A> {
                 let obj_ptr = hdr.payload_ptr().cast::<GCString>();
                 unsafe { std::ptr::drop_in_place(obj_ptr) };
                 GCString::block_size()
-            }
-            BlockType::Task => {
-                let obj_ptr = hdr.payload_ptr().cast::<GCTask>();
-                unsafe { std::ptr::drop_in_place(obj_ptr) };
-                GCTask::block_size()
             }
         };
 
@@ -587,7 +558,6 @@ impl<A: PageAllocator> Heap<A> {
         match hdr.tt {
             BlockType::Buffer => obj.as_mut::<GCBuffer>().gc_list = self.gray.replace(obj),
             BlockType::DynBuffer => obj.as_mut::<GCDynBuffer>().gc_list = self.gray.replace(obj),
-            BlockType::Task => obj.as_mut::<GCTask>().gc_list = self.gray.replace(obj),
             BlockType::Free | BlockType::String => unreachable!("back bariier on non-container"),
         }
     }
@@ -678,10 +648,6 @@ impl<A: PageAllocator> Heap<A> {
                         let obj_ptr = hdr.object_ptr::<GCString>();
                         unsafe { std::ptr::drop_in_place(obj_ptr) };
                     }
-                    BlockType::Task => {
-                        let obj_ptr = hdr.object_ptr::<GCTask>();
-                        unsafe { std::ptr::drop_in_place(obj_ptr) };
-                    }
                 }
             }
         }
@@ -703,7 +669,7 @@ impl<A: PageAllocator> Heap<A> {
 
 // In heap.rs
 
-impl<A: PageAllocator> Drop for Heap<A> {
+impl<A: HeapAllocator> Drop for Heap<A> {
     fn drop(&mut self) {
         let mut page_opt = self.pages.gco_pages();
         while let Some(page_ptr) = page_opt {
@@ -725,10 +691,6 @@ impl<A: PageAllocator> Drop for Heap<A> {
                     }
                     BlockType::String => {
                         let obj_ptr = hdr.payload_ptr().cast::<GCString>();
-                        unsafe { std::ptr::drop_in_place(obj_ptr) };
-                    }
-                    BlockType::Task => {
-                        let obj_ptr = hdr.payload_ptr().cast::<GCTask>();
                         unsafe { std::ptr::drop_in_place(obj_ptr) };
                     }
                 }

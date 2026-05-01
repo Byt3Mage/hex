@@ -1,8 +1,5 @@
-use std::{alloc::Layout, ptr::NonNull};
-
-use simple_ternary::tnr;
-
 use crate::heap::GCHeader;
+use std::{alloc::Layout, ptr::NonNull};
 
 const NUM_CLASSES: usize = 36;
 const MAX_SMALL_SIZE: usize = 1024;
@@ -64,7 +61,7 @@ impl SizeClass {
     }
 }
 
-pub trait PageAllocator {
+pub trait HeapAllocator {
     fn alloc(&mut self, layout: Layout) -> Option<NonNull<u8>>;
     fn dealloc(&mut self, ptr: NonNull<u8>, layout: Layout);
     fn reset(&mut self);
@@ -112,7 +109,7 @@ impl Page {
         Layout::from_size_align(page_size, PAGE_ALIGN).unwrap()
     }
 
-    fn new<A: PageAllocator>(allocator: &mut A, size_class: SizeClass) -> Option<PagePtr> {
+    fn new<A: HeapAllocator>(allocator: &mut A, size_class: SizeClass) -> Option<PagePtr> {
         debug_assert!(!size_class.is_large());
 
         let block_size = size_class.block_size();
@@ -125,12 +122,12 @@ impl Page {
         Self::new_with_size(allocator, page_size, block_size, size_class)
     }
 
-    fn new_large<A: PageAllocator>(allocator: &mut A, block_size: usize) -> Option<PagePtr> {
+    fn new_large<A: HeapAllocator>(allocator: &mut A, block_size: usize) -> Option<PagePtr> {
         let page_size = (Self::HEADER_SIZE + block_size + (PAGE_ALIGN - 1)) & !(PAGE_ALIGN - 1);
         Self::new_with_size(allocator, page_size, block_size, SizeClass::LARGE)
     }
 
-    fn new_with_size<A: PageAllocator>(
+    fn new_with_size<A: HeapAllocator>(
         allocator: &mut A,
         page_size: usize,
         block_size: usize,
@@ -163,7 +160,7 @@ impl Page {
         }
     }
 
-    pub unsafe fn destroy<A: PageAllocator>(page_ptr: PagePtr, allocator: &mut A) {
+    pub unsafe fn destroy<A: HeapAllocator>(page_ptr: PagePtr, allocator: &mut A) {
         unsafe {
             let page = page_ptr.as_ref();
 
@@ -196,7 +193,7 @@ impl Page {
     }
 
     #[inline]
-    pub fn size_class(&self) -> SizeClass {
+    fn size_class(&self) -> SizeClass {
         self.size_class
     }
 
@@ -302,7 +299,7 @@ impl Iterator for BlockIter {
 }
 
 /// Manages lists of pages for allocation
-pub struct PageManager<A: PageAllocator> {
+pub struct PageManager<A: HeapAllocator> {
     allocator: A,
 
     /// Freelist per size class (pages with free blocks)
@@ -318,7 +315,7 @@ pub struct PageManager<A: PageAllocator> {
     total_bytes: usize,
 }
 
-impl<A: PageAllocator> PageManager<A> {
+impl<A: HeapAllocator> PageManager<A> {
     pub const fn new(allocator: A) -> Self {
         Self {
             allocator,
@@ -343,7 +340,11 @@ impl<A: PageAllocator> PageManager<A> {
 
     pub fn alloc(&mut self, size: usize) -> Option<NonNull<GCHeader>> {
         let size_class = SizeClass::from_size(size)?;
-        tnr! {size_class.is_large() => self.alloc_large(size) : self.alloc_small(size_class)}
+        if size_class.is_large() {
+            self.alloc_large(size)
+        } else {
+            self.alloc_small(size_class)
+        }
     }
 
     fn alloc_small(&mut self, size_class: SizeClass) -> Option<NonNull<GCHeader>> {
@@ -526,7 +527,7 @@ impl<A: PageAllocator> PageManager<A> {
     }
 }
 
-impl<A: PageAllocator> Drop for PageManager<A> {
+impl<A: HeapAllocator> Drop for PageManager<A> {
     fn drop(&mut self) {
         let mut page_opt = self.pagelist;
         while let Some(page_ptr) = page_opt {
@@ -608,7 +609,7 @@ const fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
 
-impl PageAllocator for BumpAllocator {
+impl HeapAllocator for BumpAllocator {
     fn alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
         if let Some(base) = self.current_chunk {
             let aligned_offset = align_up(self.offset, layout.align());
@@ -631,7 +632,7 @@ impl PageAllocator for BumpAllocator {
 
 pub struct SystemAllocator;
 
-impl PageAllocator for SystemAllocator {
+impl HeapAllocator for SystemAllocator {
     #[inline]
     fn alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
         NonNull::new(unsafe { std::alloc::alloc(layout) })

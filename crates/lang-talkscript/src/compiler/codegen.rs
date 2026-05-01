@@ -5,7 +5,7 @@ use crate::compiler::{
     op::{BinOp, UnOp},
 };
 use ahash::AHashMap;
-use hex_vm::{self, instruction::*, object::AsValue, program::FunctionPtr};
+use hex_vm::{self, instruction::*, opcode::Opcode, program::FunctionPtr, value::IsValue};
 use thiserror::Error;
 
 /// Maximum register index.
@@ -91,7 +91,7 @@ struct Codegen<'a> {
     /// Bytecode output.
     code: Vec<Instruction>,
     /// Constants table output.
-    constants: Vec<hex_vm::object::Value>,
+    constants: Vec<hex_vm::value::Value>,
     /// Maps BlockId -> bytecode offset (for resolving jumps).
     block_offsets: AHashMap<BlockId, usize>,
     /// Jump instructions that need patching after all blocks are emitted.
@@ -171,11 +171,11 @@ impl<'a> Codegen<'a> {
                     Literal::Uint(u) => self.add_constant(*u),
                     Literal::Float(f) => self.add_constant(*f),
                     Literal::Bool(b) => self.add_constant(*b),
-                    Literal::Char(c) => self.add_constant(*c),
+                    Literal::Char(c) => todo!("handle char literal"),
                     Literal::Str(s) => todo!("add string literal to constants table"),
                 };
 
-                self.code.push(konst(reg, const_idx));
+                self.code.push(const_(reg, const_idx));
             }
 
             Inst::BinOp {
@@ -239,7 +239,7 @@ impl<'a> Codegen<'a> {
                 // Tag is stored in the first register of the union.
                 let r_dst = self.reg_of(*dst);
                 let tag = self.add_constant(*field);
-                self.code.push(konst(r_dst, tag));
+                self.code.push(const_(r_dst, tag));
             }
 
             Inst::GetTag { dst, src } => {
@@ -272,13 +272,13 @@ impl<'a> Codegen<'a> {
             Inst::FuncAddr { dst, func } => {
                 let r_dest = self.reg_alloc(*dst, 1)?;
                 let func_ptr = self.add_constant(func.0 as FunctionPtr);
-                self.code.push(konst(r_dest, func_ptr));
+                self.code.push(const_(r_dest, func_ptr));
             }
         }
         Ok(())
     }
 
-    fn add_constant<T: AsValue>(&mut self, val: T) -> InstType {
+    fn add_constant<T: IsValue>(&mut self, val: T) -> InstType {
         let idx = self.constants.len();
         self.constants.push(val.into_value());
         idx as InstType

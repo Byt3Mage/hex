@@ -1,9 +1,8 @@
-mod async_runtime;
+pub mod disassemble;
+pub mod extension;
 pub mod function;
-mod heap;
 pub mod instruction;
-mod memory;
-pub mod name;
-pub mod object;
+pub mod opcode;
 pub mod program;
+pub mod value;
 pub mod vm;

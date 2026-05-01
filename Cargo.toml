@@ -1,3 +1,9 @@
+
 [workspace]
-members = ["crates/hex-vm", "crates/lang-talkscript"]
+members = [
+    "crates/hex-gc",
+    "crates/hex-mir",
+    "crates/hex-vm",
+    "crates/lang-talkscript",
+]
 resolver = "2"

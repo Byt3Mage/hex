@@ -5,6 +5,8 @@
 //   type RegType = u16;
 //   type InstWidth = u64;
 
+use crate::opcode::Opcode;
+
 pub type Reg = u8;
 pub type InstType = u32;
 
@@ -42,115 +44,6 @@ const fn encode_reg(reg: Reg) -> InstType {
 #[inline(always)]
 const fn decode_reg(bits: InstType) -> Reg {
     bits as Reg
-}
-
-macro_rules! define_opcodes {
-    ($($name:ident = $value:expr),* $(,)?) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        #[repr(transparent)]
-        pub struct Opcode(pub u8);
-
-        impl Opcode {
-            $(pub const $name: Self = Self($value);)*
-        }
-
-        impl std::fmt::Display for Opcode {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                match *self {
-                    $(Self($value) => f.write_str(stringify!($name)),)*
-                    _ => write!(f, "UNKNOWN({})", self.0),
-                }
-            }
-        }
-    };
-}
-
-define_opcodes! {
-    // Move between registers
-    MOV = 0,
-
-    // Get value from constants table
-    CONST = 1,
-
-    // Unary operations
-    BNOT = 2,
-    INOT = 3,
-    UNOT = 4,
-    INEG = 5,
-    FNEG = 6,
-
-    // Signed integer arithmetic
-    IADD = 10,
-    ISUB = 11,
-    IMUL = 12,
-    IDIV = 13,
-    IREM = 14,
-
-    // Unsigned integer arithmetic
-    UADD = 15,
-    USUB = 16,
-    UMUL = 17,
-    UDIV = 18,
-    UREM = 19,
-
-    // Floating-point arithmetic
-    FADD = 20,
-    FSUB = 21,
-    FMUL = 22,
-    FDIV = 23,
-    FREM = 24,
-
-    // Signed integer comparisons
-    IEQ = 25,
-    INE = 26,
-    ILT = 27,
-    IGT = 28,
-    ILE = 29,
-    IGE = 30,
-
-    // Unsigned integer comparisons
-    UEQ = 31,
-    UNE = 32,
-    ULT = 33,
-    UGT = 34,
-    ULE = 35,
-    UGE = 36,
-
-    // Floating-point comparisons
-    FEQ = 37,
-    FNE = 38,
-    FLT = 39,
-    FGT = 40,
-    FLE = 41,
-    FGE = 42,
-
-    // Jumps
-    JMP   = 50,
-    JMP_T = 51,
-    JMP_F = 52,
-
-    // Call and return
-    RET    = 60,
-    CALL   = 61,
-    CALLT  = 62,
-    CALLN  = 63,
-    CALLR  = 64,
-    CALLNR = 65,
-
-    // Heap allocations
-    ALLOC_BUF = 70,
-    ALLOC_DYN = 71,
-    ALLOC_STR = 72,
-
-    // Heap operations
-    LOAD  = 73,
-    STORE = 74,
-
-    SPAWN = 80,
-    AWAIT = 81,
-
-    // End program
-    HALT = 82,
 }
 
 // Instruction encoding
@@ -245,34 +138,34 @@ pub const fn mov(dst: Reg, src: Reg) -> Instruction {
 }
 
 #[inline(always)]
-pub const fn konst(dst: Reg, idx: InstType) -> Instruction {
+pub const fn const_(dst: Reg, idx: InstType) -> Instruction {
     encode_abx(Opcode::CONST, dst, idx)
 }
 
 // Unary ops
 #[inline(always)]
-pub const fn bnot(dst: Reg) -> Instruction {
-    encode_abc(Opcode::BNOT, dst, R0, R0)
+pub const fn bnot(dst: Reg, src: Reg) -> Instruction {
+    encode_abc(Opcode::BNOT, dst, src, R0)
 }
 
 #[inline(always)]
-pub const fn inot(dst: Reg) -> Instruction {
-    encode_abc(Opcode::INOT, dst, R0, R0)
+pub const fn inot(dst: Reg, src: Reg) -> Instruction {
+    encode_abc(Opcode::INOT, dst, src, R0)
 }
 
 #[inline(always)]
-pub const fn unot(dst: Reg) -> Instruction {
-    encode_abc(Opcode::UNOT, dst, R0, R0)
+pub const fn unot(dst: Reg, src: Reg) -> Instruction {
+    encode_abc(Opcode::UNOT, dst, src, R0)
 }
 
 #[inline(always)]
-pub const fn ineg(dst: Reg) -> Instruction {
-    encode_abc(Opcode::INEG, dst, R0, R0)
+pub const fn ineg(dst: Reg, src: Reg) -> Instruction {
+    encode_abc(Opcode::INEG, dst, src, R0)
 }
 
 #[inline(always)]
-pub const fn fneg(dst: Reg) -> Instruction {
-    encode_abc(Opcode::FNEG, dst, R0, R0)
+pub const fn fneg(dst: Reg, src: Reg) -> Instruction {
+    encode_abc(Opcode::FNEG, dst, src, R0)
 }
 
 // Signed integer arithmetic
@@ -489,35 +382,8 @@ pub const fn callt(ret: Reg, func: InstType) -> Instruction {
 }
 
 #[inline(always)]
-pub const fn ret(src: Reg) -> Instruction {
-    encode_abc(Opcode::RET, src, R0, R0)
-}
-
-// Heap allocations
-#[inline(always)]
-pub const fn alloc_buf(dst: Reg, len: Reg) -> Instruction {
-    encode_abc(Opcode::ALLOC_BUF, dst, len, R0)
-}
-
-#[inline(always)]
-pub const fn alloc_dyn(dst: Reg) -> Instruction {
-    encode_abc(Opcode::ALLOC_DYN, dst, R0, R0)
-}
-
-#[inline(always)]
-pub const fn alloc_str(dst: Reg) -> Instruction {
-    encode_abc(Opcode::ALLOC_STR, dst, R0, R0)
-}
-
-// Heap operations
-#[inline(always)]
-pub const fn load(dst: Reg, ptr: Reg, off: Reg) -> Instruction {
-    encode_abc(Opcode::LOAD, dst, ptr, off)
-}
-
-#[inline(always)]
-pub const fn store(ptr: Reg, off: Reg, src: Reg) -> Instruction {
-    encode_abc(Opcode::STORE, ptr, off, src)
+pub const fn ret() -> Instruction {
+    encode_ax(Opcode::RET, 0)
 }
 
 // End program

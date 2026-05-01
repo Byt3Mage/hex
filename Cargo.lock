@@ -59,13 +59,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hex-gc"
+version = "0.1.0"
+dependencies = [
+ "hex-vm",
+]
+
+[[package]]
+name = "hex-mir"
+version = "0.1.0"
+dependencies = [
+ "hex-vm",
+]
+
+[[package]]
 name = "hex-vm"
 version = "0.1.0"
 dependencies = [
- "ahash",
- "const-assert",
- "simple-ternary",
- "string-interner",
  "thiserror",
 ]
 
