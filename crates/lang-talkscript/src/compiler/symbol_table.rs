@@ -4,7 +4,7 @@ use ahash::AHashMap;
 
 use crate::{
     arena::{Arena, Ident, define_id},
-    compiler::{ast::DeclId, error::ResolveError, sema::sema_type::SemaTypeId, tokens::Span},
+    compiler::{ast::DeclId, error::SemaError, sema::sema_type::SemaTypeId, tokens::Span},
 };
 
 define_id!(SymbolId);
@@ -113,11 +113,11 @@ impl SymbolTable {
         }
     }
 
-    pub fn define(&mut self, symbol: Symbol, scope_id: ScopeId) -> Result<SymbolId, ResolveError> {
+    pub fn define(&mut self, symbol: Symbol, scope_id: ScopeId) -> Result<SymbolId, SemaError> {
         let scope = &mut self.scopes[scope_id];
         match scope.symbols.entry(symbol.name) {
             Entry::Vacant(e) => Ok(*e.insert(self.symbols.insert(symbol))),
-            Entry::Occupied(e) => Err(ResolveError::DuplicateSymbol {
+            Entry::Occupied(e) => Err(SemaError::DuplicateSymbol {
                 name: symbol.name,
                 first: self.symbols[*e.get()].span,
                 duplicate: symbol.span,

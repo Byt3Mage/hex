@@ -1,32 +1,12 @@
-mod math {
-    struct Point { x: int, y: int, z: ?Point }
-
-    const LEN = 6;
-
-    fn square(n: int) : int {
-        n * n
-    }
-}
-
-union Result {
-    ok: uint,
-    err: Status,
-}
-
-enum Status {
-    Active = 1,
-    Inactive,
-}
-
-fn sum(arr: [int; 5]): int {
-    return @as(int, 5);
-}
-
-fn test(): int {
-    let x = if true {
-        return 42;
-    } else {
-        "hello"
-    };
+fn square(n: int): int {
+    let x = n * n;
     x
+}
+
+fn add(a: uint, b: uint): uint {
+    a + b
+}
+
+fn max(a: int, b: int): int {
+    if a > b { a } else { b }
 }

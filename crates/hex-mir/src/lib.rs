@@ -3,7 +3,7 @@ pub mod lowering;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct Val(u32);
+pub struct Val(pub u32);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -83,7 +83,9 @@ pub enum ConvOp {
 
 #[derive(Debug, Clone)]
 pub enum Inst {
-    Const(Ty, u64),
+    IntLit(i64),
+    UintLit(u64),
+    BoolLit(bool),
     BinOp(BinOp, Val, Val),
     UnOp(UnOp, Val),
     Conv(ConvOp, Val),
@@ -205,65 +207,31 @@ pub struct Import {
     pub ret_tys: Vec<Ty>,
 }
 
-#[test]
-fn test_mir() {
-    use crate::lowering::lower_function;
-    use hex_vm::disassemble::disassemble;
+impl std::fmt::Display for Val {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "%{}", self.0)
+    }
+}
 
-    // struct Enemy {
-    //     x: i64,
-    //     y: i64,
-    //     health: i64,
-    //     scores: [i64; 2],  // kills, deaths
-    // }
-    //
-    // Flattened: 5 registers [x, y, health, kills, deaths]
-    //
-    // fn spawn_enemy(x: i64, y: i64) -> Enemy {
-    //     return Enemy { x, y, health: 100, scores: [0, 0] };
-    // }
-    //
-    // fn total_score(e: Enemy) -> i64 {
-    //     return e.scores[0] + e.scores[1];
-    // }
+impl std::fmt::Display for Block {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bb{}", self.0)
+    }
+}
 
-    // --- spawn_enemy ---
-    let mut spawn = FuncDef::new(
-        "spawn_enemy",
-        vec![Ty::I64, Ty::I64, Ty::I64, Ty::I64, Ty::I64],
-    );
-    let (sb0, sp) = spawn.new_block(vec![Ty::I64, Ty::I64]); // x, y
-
-    let health = spawn.push_inst(sb0, Ty::I64, Inst::Const(Ty::I64, 100));
-    let zero1 = spawn.push_inst(sb0, Ty::I64, Inst::Const(Ty::I64, 0));
-    let zero2 = spawn.push_inst(sb0, Ty::I64, Inst::Const(Ty::I64, 0));
-
-    // Return [x, y, health, kills, deaths]
-    spawn.set_term(sb0, Term::Ret(vec![sp[0], sp[1], health, zero1, zero2]));
-
-    // --- total_score ---
-    // Calls spawn_enemy, then extracts scores and adds them.
-    let mut total = FuncDef::new("total_score", vec![Ty::I64]);
-    let (tb0, tp) = total.new_block(vec![Ty::I64, Ty::I64]); // x, y args to pass through
-
-    // Call spawn_enemy(x, y) -> returns 5 values
-    let call = total.push_inst(tb0, Ty::I64, Inst::Call(FuncRef(0), vec![tp[0], tp[1]]));
-
-    // Extract kills (index 3) and deaths (index 4)
-    let kills = total.push_inst(tb0, Ty::I64, Inst::Result(call, 3));
-    let deaths = total.push_inst(tb0, Ty::I64, Inst::Result(call, 4));
-
-    // Add them
-    let sum = total.push_inst(tb0, Ty::I64, Inst::BinOp(BinOp::IAdd, kills, deaths));
-
-    total.set_term(tb0, Term::Ret(vec![sum]));
-
-    // Lower and print function
-    println!("spawn:");
-    let lowered = lower_function(&spawn);
-    disassemble(&lowered.bytecode, &lowered.constants);
-
-    println!("total_score:");
-    let lowered = lower_function(&total);
-    disassemble(&lowered.bytecode, &lowered.constants);
+impl std::fmt::Display for Inst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Inst::IntLit(i) => write!(f, "int({i})"),
+            Inst::UintLit(u) => write!(f, "uint({u})"),
+            Inst::BoolLit(b) => write!(f, "bool({b})"),
+            Inst::BinOp(op, a, b) => write!(f, "{op:?} {a} {b}"),
+            Inst::UnOp(op, a) => write!(f, "{op:?} {a}"),
+            Inst::Conv(op, a) => write!(f, "{op:?} {a}"),
+            Inst::Call(func, vals) => write!(f, "call({func:?}) {vals:?}"),
+            Inst::CallNative(func, vals) => write!(f, "call({func:?}) {vals:?}"),
+            Inst::CallIndirect(func, vals) => write!(f, "call({func}) {vals:?}"),
+            Inst::Result(val, idx) => write!(f, "res({val})[{idx}]"),
+        }
+    }
 }

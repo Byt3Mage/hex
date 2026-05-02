@@ -82,7 +82,10 @@ impl RegAlloc {
     }
 
     fn get(&self, val: Val) -> Reg {
-        self.reg_map[val.0 as usize].expect("value has no register")
+        match self.reg_map[val.0 as usize] {
+            Some(reg) => reg,
+            None => panic!("value: {val} has no register"),
+        }
     }
 
     fn nreg(&self) -> Reg {
@@ -98,10 +101,12 @@ struct PendingJump {
 pub fn lower_function(func: &FuncDef) -> LoweredFunction {
     let liveness = Liveness::compute(func);
 
-    let protected: HashSet<u32> = func
+    let protected = func
         .blocks
         .iter()
-        .flat_map(|b| b.params.iter().map(|p| p.0))
+        .enumerate()
+        .filter(|(i, _)| *i != func.entry.0 as usize)
+        .flat_map(|(_, b)| b.params.iter().map(|p| p.0))
         .collect();
 
     let mut regs = RegAlloc::new(func.next_val, protected);
@@ -172,10 +177,24 @@ fn lower_inst(
     let InstDef { val, inst } = inst_def;
 
     match inst {
-        Inst::Const(_, bits) => {
+        Inst::IntLit(i) => {
             let dst = regs.alloc(*val);
             let const_idx = consts.len() as InstType;
-            consts.push(bits.into_value());
+            consts.push(i.into_value());
+            bc.push(const_(dst, const_idx));
+        }
+
+        Inst::UintLit(u) => {
+            let dst = regs.alloc(*val);
+            let const_idx = consts.len() as InstType;
+            consts.push(u.into_value());
+            bc.push(const_(dst, const_idx));
+        }
+
+        Inst::BoolLit(b) => {
+            let dst = regs.alloc(*val);
+            let const_idx = consts.len() as InstType;
+            consts.push(b.into_value());
             bc.push(const_(dst, const_idx));
         }
 
@@ -327,9 +346,10 @@ fn emit_block_args(
     target: Block,
     args: &[Val],
 ) {
-    let target_block = &func.blocks[target.0 as usize];
+    debug_assert!(target != func.entry, "cannot branch to entry block");
 
-    let moves: Vec<(Reg, Reg)> = target_block
+    let tgt_blk = &func.blocks[target.0 as usize];
+    let moves: Vec<(Reg, Reg)> = tgt_blk
         .params
         .iter()
         .zip(args.iter())

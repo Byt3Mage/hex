@@ -28,6 +28,12 @@ pub enum PrefixRule {
     Return,
     Break,
     Continue,
+
+    // Types
+    Int,
+    Uint,
+    Bool,
+    Void,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +51,7 @@ pub enum InfixRule {
 pub enum Precedence {
     None = 0,
     Assignment, // =, += , -=, *=, /=, %=
-    Coalesce,   // ??
+    Coalesce,   // ?:
     Or,         // or
     And,        // and
     Equality,   // ==, !=
@@ -428,6 +434,27 @@ static RULES: [ParseRule; TokenType::COUNT] = {
         prefix: PrefixRule::Continue,
         infix: InfixRule::None,
         prec: Precedence::None,
+        right_assoc: false,
+    };
+
+    rules[tt![int] as usize] = ParseRule {
+        prefix: PrefixRule::Int,
+        infix: InfixRule::None,
+        prec: Precedence::Primary,
+        right_assoc: false,
+    };
+
+    rules[tt![uint] as usize] = ParseRule {
+        prefix: PrefixRule::Uint,
+        infix: InfixRule::None,
+        prec: Precedence::Primary,
+        right_assoc: false,
+    };
+
+    rules[tt![bool] as usize] = ParseRule {
+        prefix: PrefixRule::Bool,
+        infix: InfixRule::None,
+        prec: Precedence::Primary,
         right_assoc: false,
     };
 

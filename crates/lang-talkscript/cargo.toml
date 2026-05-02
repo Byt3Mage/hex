@@ -7,7 +7,8 @@ edition = "2024"
 doctest = false
 
 [dependencies]
-hex-vm = { path = "../hex-vm" }
+hex-mir = { path = "../hex-mir" }
+hex-vm = { path="../hex-vm"}
 ahash = "0.8.12"
 simple-ternary = "0.3.0"
 thiserror = "2.0.18"

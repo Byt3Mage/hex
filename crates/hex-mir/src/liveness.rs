@@ -182,7 +182,7 @@ impl Liveness {
 
     pub fn for_each_operand(inst: &Inst, mut f: impl FnMut(Val)) {
         match inst {
-            Inst::Const(_, _) => {}
+            Inst::IntLit(_) | Inst::UintLit(_) | Inst::BoolLit(_) => {}
             Inst::BinOp(_, a, b) => {
                 f(*a);
                 f(*b);
@@ -201,7 +201,7 @@ impl Liveness {
 
     pub fn any_inst_operand<R>(inst: &Inst, mut f: impl FnMut(Val) -> Option<R>) -> Option<R> {
         match inst {
-            Inst::Const(_, _) => None,
+            Inst::IntLit(_) | Inst::UintLit(_) | Inst::BoolLit(_) => None,
             Inst::BinOp(_, a, b) => f(*a).or_else(|| f(*b)),
             Inst::UnOp(_, a) | Inst::Conv(_, a) => f(*a),
             Inst::Call(_, args) | Inst::CallNative(_, args) => {

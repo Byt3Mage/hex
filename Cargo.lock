@@ -179,6 +179,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "const-assert",
+ "hex-mir",
  "hex-vm",
  "simple-ternary",
  "smallvec",
