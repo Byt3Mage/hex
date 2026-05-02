@@ -4,8 +4,8 @@ use crate::{
     arena::Interner,
     compiler::{
         ast::{
-            Ast, BinOp, Decl, DeclId, DeclKind, Expr, ExprKind, Param, Stmt, StmtKind, UnOp,
-            Visibility,
+            AssignOp, Ast, BinOp, Decl, DeclId, DeclKind, Expr, ExprKind, Param, Stmt, StmtKind,
+            UnOp, Visibility,
         },
         lexer::{LexError, Lexer},
         parse_rules::{InfixRule, ParseRule, Precedence, PrefixRule},
@@ -96,7 +96,7 @@ impl<'a> Parser<'a> {
 
         while !self.check(tt![eof]) {
             let decl = self.parse_decl()?;
-            items.push(self.ast.push_decl(decl));
+            items.push(self.ast.insert_decl(decl));
         }
 
         let module = Decl {
@@ -106,7 +106,7 @@ impl<'a> Parser<'a> {
             span: Span::default().merge(self.current.span),
         };
 
-        Ok(self.ast.push_decl(module))
+        Ok(self.ast.insert_decl(module))
     }
 
     fn parse_decl(&mut self) -> ParseResult<Decl> {
@@ -116,9 +116,9 @@ impl<'a> Parser<'a> {
             tt![mod] => self.parse_mod_decl(vis),
             tt![fn] => self.parse_func_decl(vis),
             tt![const] => self.parse_const_decl(vis),
-            tt![struct] => self.parse_struct_decl(vis),
-            tt![union] => self.parse_union_decl(vis),
-            tt![enum] => self.parse_enum_decl(vis),
+            //tt![struct] => self.parse_struct_decl(vis),
+            //tt![union] => self.parse_union_decl(vis),
+            //tt![enum] => self.parse_enum_decl(vis),
             tt => Err(ParseError {
                 msg: format!("Expected declaration, found {tt:?}"),
                 span: self.current.span,
@@ -140,7 +140,7 @@ impl<'a> Parser<'a> {
 
         while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
             let item = self.parse_decl()?;
-            decls.push(self.ast.push_decl(item));
+            decls.push(self.ast.insert_decl(item));
         }
 
         let r_brace = self.expect(tt!['}'])?;
@@ -167,8 +167,9 @@ impl<'a> Parser<'a> {
 
             params.push(Param {
                 span: name.span.merge(ty.span),
+                is_comptime: false,
                 name: self.intern.get_or_intern(name.lexeme),
-                ty: self.ast.push_expr(ty),
+                ty: self.ast.insert_expr(ty),
             });
 
             if !self.advance_if(tt![,])? {
@@ -180,7 +181,7 @@ impl<'a> Parser<'a> {
 
         let ret = if self.advance_if(tt![:])? {
             let ret = self.parse_expr()?;
-            Some(self.ast.push_expr(ret))
+            Some(self.ast.insert_expr(ret))
         } else {
             None
         };
@@ -191,21 +192,21 @@ impl<'a> Parser<'a> {
             vis,
             name: self.intern.get_or_intern(func_name.lexeme),
             span: fn_token.span.merge(body.span),
-            kind: DeclKind::Fn {
+            kind: DeclKind::Func {
                 params,
                 ret,
-                body: self.ast.push_expr(body),
+                body: self.ast.insert_expr(body),
             },
         })
     }
 
     fn parse_const_decl(&mut self, vis: Visibility) -> ParseResult<Decl> {
-        /*  let const_token = self.expect(tt![const])?;
+        let const_token = self.expect(tt![const])?;
         let const_name = self.expect(tt![ident])?;
 
         let ty = if self.advance_if(tt![:])? {
-            let ty = self.parse_type()?;
-            Some(self.ast.types.insert(ty))
+            let ty = self.parse_expr()?;
+            Some(self.ast.insert_expr(ty))
         } else {
             None
         };
@@ -220,11 +221,10 @@ impl<'a> Parser<'a> {
             name: self.intern.get_or_intern(const_name.lexeme),
             kind: DeclKind::Const {
                 ty,
-                value: self.ast.exprs.insert(value),
+                val: self.ast.insert_expr(value),
             },
             span: const_token.span.merge(semi.span),
-        })*/
-        todo!()
+        })
     }
 
     fn parse_struct_decl(&mut self, visibility: Visibility) -> ParseResult<Decl> {
@@ -368,8 +368,8 @@ impl<'a> Parser<'a> {
         Ok(Stmt {
             kind: StmtKind::Let {
                 name: self.intern.get_or_intern(name.lexeme),
-                ty: ty.map(|t| self.ast.push_expr(t)),
-                value: self.ast.push_expr(value),
+                ty: ty.map(|t| self.ast.insert_expr(t)),
+                value: self.ast.insert_expr(value),
             },
             span: let_token.span.merge(semi_token.span),
         })
@@ -411,10 +411,9 @@ impl<'a> Parser<'a> {
             PrefixRule::LiteralInt => self.parse_int(),
             PrefixRule::LiteralFloat => self.parse_float(),
             PrefixRule::LiteralString => self.parse_string(),
-            PrefixRule::True => self.parse_true(),
-            PrefixRule::False => self.parse_false(),
+            PrefixRule::LiteralBool => self.parse_bool(),
             PrefixRule::LiteralNull => self.parse_null(),
-            PrefixRule::LiteralVoid => self.parse_void(),
+            PrefixRule::LiteralVoid => self.parse_void_type(),
             PrefixRule::LiteralArray => self.parse_array(),
             PrefixRule::Identifier => self.parse_ident(),
             PrefixRule::Grouping => self.parse_group(),
@@ -431,7 +430,7 @@ impl<'a> Parser<'a> {
             PrefixRule::Int => self.parse_int_type(),
             PrefixRule::Uint => self.parse_uint_type(),
             PrefixRule::Bool => self.parse_bool_type(),
-            PrefixRule::Void => self.parse_void(),
+            PrefixRule::Void => self.parse_void_type(),
             PrefixRule::None => Err(ParseError {
                 msg: format!("Expected expression, found {:?}", self.current.ty),
                 span: self.current.span,
@@ -493,7 +492,7 @@ impl<'a> Parser<'a> {
     fn parse_int_type(&mut self) -> ParseResult<Expr> {
         let int_ty = self.expect(tt![int])?;
         Ok(Expr {
-            kind: ExprKind::TyInt,
+            kind: ExprKind::IntType,
             span: int_ty.span,
         })
     }
@@ -501,7 +500,7 @@ impl<'a> Parser<'a> {
     fn parse_uint_type(&mut self) -> ParseResult<Expr> {
         let uint_ty = self.expect(tt![uint])?;
         Ok(Expr {
-            kind: ExprKind::TyUint,
+            kind: ExprKind::UintType,
             span: uint_ty.span,
         })
     }
@@ -509,7 +508,7 @@ impl<'a> Parser<'a> {
     fn parse_bool_type(&mut self) -> ParseResult<Expr> {
         let bool_ty = self.expect(tt![bool])?;
         Ok(Expr {
-            kind: ExprKind::TyBool,
+            kind: ExprKind::BoolType,
             span: bool_ty.span,
         })
     }
@@ -517,7 +516,7 @@ impl<'a> Parser<'a> {
     fn parse_void_type(&mut self) -> ParseResult<Expr> {
         let void_ty = self.expect(tt![void])?;
         Ok(Expr {
-            kind: ExprKind::TyVoid,
+            kind: ExprKind::VoidType,
             span: void_ty.span,
         })
     }
@@ -572,7 +571,7 @@ impl<'a> Parser<'a> {
 
         match str::parse::<f64>(float_token.lexeme) {
             Ok(f) => Ok(Expr {
-                kind: todo!(),
+                kind: ExprKind::FloatLit(f),
                 span: float_token.span,
             }),
             Err(err) => Err(ParseError {
@@ -580,6 +579,26 @@ impl<'a> Parser<'a> {
                 span: float_token.span,
             }),
         }
+    }
+
+    fn parse_bool(&mut self) -> ParseResult<Expr> {
+        let token = self.consume()?;
+
+        let val = match token.ty {
+            tt![true] => true,
+            tt![false] => false,
+            tt => {
+                return Err(ParseError {
+                    msg: format!("Expected boolean literal, found: {tt:?}"),
+                    span: token.span,
+                });
+            }
+        };
+
+        Ok(Expr {
+            kind: ExprKind::BoolLit(val),
+            span: token.span,
+        })
     }
 
     fn parse_string(&mut self) -> ParseResult<Expr> {
@@ -590,39 +609,12 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_true(&mut self) -> ParseResult<Expr> {
-        let true_token = self.expect(tt![true])?;
-
-        Ok(Expr {
-            kind: ExprKind::True,
-            span: true_token.span,
-        })
-    }
-
-    fn parse_false(&mut self) -> ParseResult<Expr> {
-        let false_token = self.expect(tt![false])?;
-
-        Ok(Expr {
-            kind: ExprKind::False,
-            span: false_token.span,
-        })
-    }
-
     fn parse_null(&mut self) -> ParseResult<Expr> {
         let null_token = self.expect(tt![null])?;
 
         Ok(Expr {
-            kind: todo!(),
+            kind: ExprKind::NullLit,
             span: null_token.span,
-        })
-    }
-
-    fn parse_void(&mut self) -> ParseResult<Expr> {
-        let void_token = self.expect(tt![void])?;
-
-        Ok(Expr {
-            kind: todo!(),
-            span: void_token.span,
         })
     }
 
@@ -683,7 +675,7 @@ impl<'a> Parser<'a> {
         let close = self.expect(tt![')'])?;
 
         Ok(Expr {
-            kind: todo!(), //ExprKind::Group(self.ast.push_expr(expr)),
+            kind: ExprKind::Group(self.ast.insert_expr(expr)),
             span: open.span.merge(close.span),
         })
     }
@@ -708,7 +700,7 @@ impl<'a> Parser<'a> {
             span: op_token.span.merge(expr.span),
             kind: ExprKind::Unary {
                 op,
-                rhs: self.ast.push_expr(expr),
+                rhs: self.ast.insert_expr(expr),
             },
         })
     }
@@ -727,6 +719,8 @@ impl<'a> Parser<'a> {
             tt![<=] => BinOp::Le,
             tt![>] => BinOp::Gt,
             tt![>=] => BinOp::Ge,
+            tt![and] => BinOp::And,
+            tt![or] => BinOp::Or,
             _ => {
                 return Err(ParseError {
                     msg: format!("Unsupported binary operator: {:?}", op_token.ty),
@@ -742,21 +736,21 @@ impl<'a> Parser<'a> {
             span: lhs.span.merge(rhs.span),
             kind: ExprKind::Binary {
                 op,
-                lhs: self.ast.push_expr(lhs),
-                rhs: self.ast.push_expr(rhs),
+                lhs: self.ast.insert_expr(lhs),
+                rhs: self.ast.insert_expr(rhs),
             },
         })
     }
 
     fn parse_assign(&mut self, tgt: Expr, allow_struct: bool) -> ParseResult<Expr> {
-        /*let op_token = self.consume()?;
+        let op_token = self.consume()?;
         let op = match op_token.ty {
-            tt![=] => AssignOp::Assign,
-            tt![+=] => AssignOp::Add,
-            tt![-=] => AssignOp::Sub,
-            tt![*=] => AssignOp::Mul,
-            tt![/=] => AssignOp::Div,
-            tt![%=] => AssignOp::Mod,
+            tt![=] => AssignOp::Eq,
+            tt![+=] => AssignOp::AddEq,
+            tt![-=] => AssignOp::SubEq,
+            tt![*=] => AssignOp::MulEq,
+            tt![/=] => AssignOp::DivEq,
+            tt![%=] => AssignOp::ModEq,
             _ => {
                 return Err(ParseError {
                     msg: format!("Invalid assignment operator: {:?}", op_token.ty),
@@ -771,11 +765,10 @@ impl<'a> Parser<'a> {
             span: tgt.span.merge(val.span),
             kind: ExprKind::Assign {
                 op,
-                tgt: self.ast.exprs.insert(tgt),
-                val: self.ast.exprs.insert(val),
+                tgt: self.ast.insert_expr(tgt),
+                val: self.ast.insert_expr(val),
             },
-        })*/
-        todo!()
+        })
     }
 
     fn parse_block(&mut self) -> ParseResult<Expr> {
@@ -807,12 +800,12 @@ impl<'a> Parser<'a> {
                     if self.advance_if(tt![;])? {
                         stmts.push(Stmt {
                             span: expr.span,
-                            kind: StmtKind::Semi(self.ast.push_expr(expr)),
+                            kind: StmtKind::Semi(self.ast.insert_expr(expr)),
                         });
                     } else {
                         stmts.push(Stmt {
                             span: expr.span,
-                            kind: StmtKind::Expr(self.ast.push_expr(expr)),
+                            kind: StmtKind::Expr(self.ast.insert_expr(expr)),
                         });
 
                         // Expressions without block and without trailing semicolon
@@ -837,27 +830,27 @@ impl<'a> Parser<'a> {
         let if_token = self.expect(tt![if])?;
 
         let cond = self.parse_expr_no_struct()?;
-        let then = self.parse_block()?;
+        let then_branch = self.parse_block()?;
 
-        let (else_, span) = if self.advance_if(tt![else])? {
+        let (else_branch, span) = if self.advance_if(tt![else])? {
             if self.check(tt![if]) {
                 let expr = self.parse_if()?;
                 let span = if_token.span.merge(expr.span);
-                (Some(self.ast.push_expr(expr)), span)
+                (Some(self.ast.insert_expr(expr)), span)
             } else {
                 let expr = self.parse_block()?;
                 let span = if_token.span.merge(expr.span);
-                (Some(self.ast.push_expr(expr)), span)
+                (Some(self.ast.insert_expr(expr)), span)
             }
         } else {
-            (None, if_token.span.merge(then.span))
+            (None, if_token.span.merge(then_branch.span))
         };
 
         Ok(Expr {
             kind: ExprKind::If {
-                cond: self.ast.push_expr(cond),
-                then: self.ast.push_expr(then),
-                else_,
+                cond: self.ast.insert_expr(cond),
+                then_branch: self.ast.insert_expr(then_branch),
+                else_branch,
             },
             span,
         })
@@ -871,8 +864,8 @@ impl<'a> Parser<'a> {
         Ok(Expr {
             span: while_token.span.merge(body.span),
             kind: ExprKind::While {
-                cond: self.ast.push_expr(cond),
-                body: self.ast.push_expr(body),
+                cond: self.ast.insert_expr(cond),
+                body: self.ast.insert_expr(body),
             },
         })
     }
@@ -883,7 +876,7 @@ impl<'a> Parser<'a> {
 
         Ok(Expr {
             span: loop_token.span.merge(body.span),
-            kind: ExprKind::Loop(self.ast.push_expr(body)),
+            kind: ExprKind::Loop(self.ast.insert_expr(body)),
         })
     }
 

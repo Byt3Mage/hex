@@ -4,10 +4,8 @@ use std::{
 };
 
 use crate::{
-    instruction::{InstType, Instruction, Reg, encode_abx, encode_ax},
-    opcode::Opcode,
-    value::Value,
-    vm::VMResult,
+    VMResult, Value,
+    instruction::{InstType, Instruction, Opcode, Reg, encode_abx, encode_ax},
 };
 
 #[repr(u8)]
@@ -28,7 +26,7 @@ pub struct Module {
     /// Constants used by this module
     pub constants: Box<[Value]>,
     /// Functions defined in this module
-    pub functions: Box<[FunctionDef]>,
+    pub functions: Box<[Function]>,
     /// Native functions defined in this module
     pub native_functions: Box<[NativeFunction]>,
     /// Items this module exposes to other modules
@@ -38,7 +36,7 @@ pub struct Module {
 }
 
 #[derive(Debug, Clone)]
-pub struct FunctionDef {
+pub struct Function {
     /// Function name with full path for debugging
     pub name: String,
     /// Entry point in the list of instructions

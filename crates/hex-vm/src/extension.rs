@@ -1,7 +1,6 @@
 use crate::{
-    instruction::Instruction,
-    opcode::Opcode,
-    vm::{VMError, VMResult, VMState},
+    VMError, VMResult, VMState,
+    instruction::{Instruction, Opcode},
 };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 use std::slice::Iter;
 
-use hex_vm::value::Value;
+use hex_vm::Value;
 
 use crate::heap::{GCHeader, GCPtr};
 

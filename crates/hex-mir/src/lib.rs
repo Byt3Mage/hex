@@ -1,28 +1,17 @@
+pub use hex_vm::Reg;
+
+pub mod constants;
 pub mod liveness;
 pub mod lowering;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct Val(pub u32);
+pub struct Val(pub Reg);
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct Block(u32);
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct FuncRef(u32);
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct NativeFuncRef(u32);
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum Ty {
-    I64,
-    U64,
-    F64,
-    Bool,
+impl std::fmt::Display for Val {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "%{}", self.0)
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -72,7 +61,7 @@ pub enum UnOp {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum ConvOp {
+pub enum CastOp {
     IToF,
     FToI,
     UToF,
@@ -83,155 +72,332 @@ pub enum ConvOp {
 
 #[derive(Debug, Clone)]
 pub enum Inst {
-    IntLit(i64),
-    UintLit(u64),
-    BoolLit(bool),
-    BinOp(BinOp, Val, Val),
-    UnOp(UnOp, Val),
-    Conv(ConvOp, Val),
-    Call(FuncRef, Vec<Val>),
-    CallNative(NativeFuncRef, Vec<Val>),
-    CallIndirect(Val, Vec<Val>),
-    Result(Val, u32),
+    LoadInt {
+        dst: Val,
+        value: i64,
+    },
+    LoadUint {
+        dst: Val,
+        value: u64,
+    },
+    LoadBool {
+        dst: Val,
+        value: bool,
+    },
+    LoadFloat {
+        dst: Val,
+        value: f64,
+    },
+    BinOp {
+        dst: Val,
+        op: BinOp,
+        lhs: Val,
+        rhs: Val,
+    },
+    UnOp {
+        dst: Val,
+        op: UnOp,
+        src: Val,
+    },
+    Cast {
+        dst: Val,
+        op: CastOp,
+        src: Val,
+    },
+    Mov {
+        dst: Val,
+        src: Val,
+    },
+    Call {
+        dst: Val,
+        func: usize,
+        args: Vec<Val>,
+    },
+    CallNative {
+        dst: Val,
+        func: usize,
+        args: Vec<Val>,
+    },
+
+    CallIndirect {
+        dst: Val,
+        func: Val,
+        args: Vec<Val>,
+    },
+    CallNativeIndirect {
+        dst: Val,
+        func: Val,
+        args: Vec<Val>,
+    },
 }
 
 #[derive(Debug, Clone)]
-pub enum Term {
-    Br(Block, Vec<Val>),
-    BrIf(Val, Block, Vec<Val>, Block, Vec<Val>),
+pub enum Terminator {
+    Br {
+        tgt: usize,
+        args: Vec<Val>,
+    },
+    BrIf {
+        cond: Val,
+        then_br: usize,
+        else_br: usize,
+        then_args: Vec<Val>,
+        else_args: Vec<Val>,
+    },
     Ret(Vec<Val>),
 }
 
 #[derive(Debug, Clone)]
-pub struct InstDef {
-    pub val: Val,
-    pub inst: Inst,
-}
-
-#[derive(Debug, Clone)]
-pub struct BlockDef {
+pub struct Block {
     pub params: Vec<Val>,
-    pub insts: Vec<InstDef>,
-    pub term: Term,
+    pub insts: Vec<Inst>,
+    pub term: Terminator,
 }
 
 #[derive(Debug, Clone)]
-pub struct FuncDef {
+pub struct Function {
     pub name: String,
-    pub ret_tys: Vec<Ty>,
-    pub entry: Block,
-    pub blocks: Vec<BlockDef>,
-    val_tys: Vec<Ty>,
-    next_val: u32,
-    next_block: u32,
+    pub blocks: Vec<Block>,
+    pub nreg: Reg,
+    pub narg: Reg,
+    pub nret: Reg,
 }
 
-impl FuncDef {
-    pub fn new(name: impl Into<String>, ret_tys: Vec<Ty>) -> Self {
-        Self {
-            name: name.into(),
-            ret_tys,
-            entry: Block(0),
-            blocks: Vec::new(),
-            val_tys: Vec::new(),
-            next_val: 0,
-            next_block: 0,
+impl Inst {
+    pub fn for_each_def(&self, mut f: impl FnMut(&Val)) {
+        match self {
+            Inst::LoadInt { dst, .. }
+            | Inst::LoadUint { dst, .. }
+            | Inst::LoadBool { dst, .. }
+            | Inst::LoadFloat { dst, .. }
+            | Inst::BinOp { dst, .. }
+            | Inst::UnOp { dst, .. }
+            | Inst::Cast { dst, .. }
+            | Inst::Mov { dst, .. }
+            | Inst::Call { dst, .. }
+            | Inst::CallNative { dst, .. }
+            | Inst::CallIndirect { dst, .. }
+            | Inst::CallNativeIndirect { dst, .. } => f(dst),
         }
     }
 
-    fn alloc_val(&mut self, ty: Ty) -> Val {
+    pub fn for_each_use(&self, mut f: impl FnMut(&Val)) {
+        match self {
+            Inst::LoadInt { .. }
+            | Inst::LoadUint { .. }
+            | Inst::LoadBool { .. }
+            | Inst::LoadFloat { .. } => {}
+            Inst::BinOp { lhs, rhs, .. } => {
+                f(lhs);
+                f(rhs);
+            }
+            Inst::UnOp { src, .. } | Inst::Cast { src, .. } | Inst::Mov { src, .. } => f(src),
+            Inst::Call { args, .. } | Inst::CallNative { args, .. } => args.iter().for_each(f),
+            Inst::CallIndirect { func, args, .. } | Inst::CallNativeIndirect { func, args, .. } => {
+                f(func);
+                args.iter().for_each(f);
+            }
+        }
+    }
+}
+
+impl Terminator {
+    pub fn for_each_use(&self, mut f: impl FnMut(&Val)) {
+        match self {
+            Terminator::Br { args, .. } => args.iter().for_each(f),
+            Terminator::BrIf {
+                cond,
+                then_args,
+                else_args,
+                ..
+            } => {
+                f(cond);
+                then_args.iter().for_each(&mut f);
+                else_args.iter().for_each(&mut f);
+            }
+            Terminator::Ret(vals) => vals.iter().for_each(f),
+        }
+    }
+
+    pub fn for_each_successor(&self, mut f: impl FnMut(usize)) {
+        match self {
+            Terminator::Br { tgt, .. } => f(*tgt),
+            Terminator::BrIf {
+                then_br, else_br, ..
+            } => {
+                f(*then_br);
+                f(*else_br);
+            }
+            Terminator::Ret(_) => {}
+        }
+    }
+}
+
+pub struct FunctionBuilder {
+    blocks: Vec<Block>,
+    current: Vec<Inst>,
+    current_params: Vec<Val>,
+    next_val: Reg,
+    narg: Reg,
+    nret: Reg,
+    name: String,
+}
+
+impl FunctionBuilder {
+    pub fn new(name: impl Into<String>, narg: usize, nret: usize) -> Self {
+        assert!(narg < 256 && nret < 256);
+        Self {
+            blocks: Vec::new(),
+            current: Vec::new(),
+            current_params: Vec::new(),
+            next_val: narg as Reg,
+            narg: narg as Reg,
+            nret: nret as Reg,
+            name: name.into(),
+        }
+    }
+
+    pub fn arg(&self, n: Reg) -> Val {
+        assert!(n < self.narg, "arg index out of bounds");
+        Val(n)
+    }
+
+    fn alloc(&mut self) -> Val {
         let v = Val(self.next_val);
         self.next_val += 1;
-        self.val_tys.push(ty);
         v
     }
 
-    pub fn val_ty(&self, val: Val) -> Ty {
-        self.val_tys[val.0 as usize]
+    pub fn load_int(&mut self, value: i64) -> Val {
+        let dst = self.alloc();
+        self.current.push(Inst::LoadInt { dst, value });
+        dst
     }
 
-    pub fn new_block(&mut self, param_tys: Vec<Ty>) -> (Block, Vec<Val>) {
-        let block = Block(self.next_block);
-        self.next_block += 1;
+    pub fn load_uint(&mut self, value: u64) -> Val {
+        let dst = self.alloc();
+        self.current.push(Inst::LoadUint { dst, value });
+        dst
+    }
 
-        let params: Vec<Val> = param_tys.iter().map(|&ty| self.alloc_val(ty)).collect();
+    pub fn load_float(&mut self, value: f64) -> Val {
+        let dst = self.alloc();
+        self.current.push(Inst::LoadFloat { dst, value });
+        dst
+    }
 
-        self.blocks.push(BlockDef {
-            params: params.clone(),
-            insts: Vec::new(),
-            term: Term::Ret(vec![]),
+    pub fn load_bool(&mut self, value: bool) -> Val {
+        let dst = self.alloc();
+        self.current.push(Inst::LoadBool { dst, value });
+        dst
+    }
+
+    pub fn binop(&mut self, op: BinOp, lhs: Val, rhs: Val) -> Val {
+        let dst = self.alloc();
+        self.current.push(Inst::BinOp { dst, op, lhs, rhs });
+        dst
+    }
+
+    pub fn unop(&mut self, op: UnOp, src: Val) -> Val {
+        let dst = self.alloc();
+        self.current.push(Inst::UnOp { dst, op, src });
+        dst
+    }
+
+    pub fn cast(&mut self, op: CastOp, src: Val) -> Val {
+        let dst = self.alloc();
+        self.current.push(Inst::Cast { dst, op, src });
+        dst
+    }
+
+    pub fn mov(&mut self, src: Val) -> Val {
+        let dst = self.alloc();
+        self.current.push(Inst::Mov { dst, src });
+        dst
+    }
+
+    pub fn call(&mut self, func: usize, args: Vec<Val>) -> Val {
+        let dst = self.alloc();
+        self.current.push(Inst::Call { dst, func, args });
+        dst
+    }
+
+    pub fn call_native(&mut self, func: usize, args: Vec<Val>) -> Val {
+        let dst = self.alloc();
+        self.current.push(Inst::CallNative { dst, func, args });
+        dst
+    }
+
+    pub fn call_indirect(&mut self, func: Val, args: Vec<Val>) -> Val {
+        let dst = self.alloc();
+        self.current.push(Inst::CallIndirect { dst, func, args });
+        dst
+    }
+
+    pub fn block_param(&mut self) -> Val {
+        self.alloc()
+    }
+
+    pub fn begin_block(&mut self, params: Vec<Val>) {
+        self.current_params = params;
+    }
+
+    pub fn br(&mut self, tgt: usize, args: Vec<Val>) {
+        let insts = std::mem::take(&mut self.current);
+        let params = std::mem::take(&mut self.current_params);
+        self.blocks.push(Block {
+            params,
+            insts,
+            term: Terminator::Br { tgt, args },
         });
-
-        (block, params)
     }
 
-    pub fn push_inst(&mut self, block: Block, ty: Ty, inst: Inst) -> Val {
-        let val = self.alloc_val(ty);
-        let block = block.0 as usize;
-        self.blocks[block].insts.push(InstDef { val, inst });
-        val
+    pub fn br_if(
+        &mut self,
+        cond: Val,
+        then_br: usize,
+        then_args: Vec<Val>,
+        else_br: usize,
+        else_args: Vec<Val>,
+    ) {
+        let insts = std::mem::take(&mut self.current);
+        let params = std::mem::take(&mut self.current_params);
+        self.blocks.push(Block {
+            params,
+            insts,
+            term: Terminator::BrIf {
+                cond,
+                then_br,
+                else_br,
+                then_args,
+                else_args,
+            },
+        });
     }
 
-    pub fn set_term(&mut self, block: Block, term: Term) {
-        self.blocks[block.0 as usize].term = term;
+    pub fn ret(&mut self, vals: Vec<Val>) {
+        let insts = std::mem::take(&mut self.current);
+        let params = std::mem::take(&mut self.current_params);
+        self.blocks.push(Block {
+            params,
+            insts,
+            term: Terminator::Ret(vals),
+        });
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct Module {
-    pub name: String,
-    pub functions: Vec<FuncDef>,
-    pub native_functions: Vec<NativeFuncDecl>,
-    pub exports: Vec<Export>,
-    pub imports: Vec<Import>,
-}
-
-#[derive(Debug, Clone)]
-pub struct NativeFuncDecl {
-    pub name: String,
-    pub arg_tys: Vec<Ty>,
-    pub ret_tys: Vec<Ty>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Export {
-    pub name: String,
-    pub func: FuncRef,
-}
-
-#[derive(Debug, Clone)]
-pub struct Import {
-    pub module: String,
-    pub name: String,
-    pub arg_tys: Vec<Ty>,
-    pub ret_tys: Vec<Ty>,
-}
-
-impl std::fmt::Display for Val {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "%{}", self.0)
-    }
-}
-
-impl std::fmt::Display for Block {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "bb{}", self.0)
-    }
-}
-
-impl std::fmt::Display for Inst {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Inst::IntLit(i) => write!(f, "int({i})"),
-            Inst::UintLit(u) => write!(f, "uint({u})"),
-            Inst::BoolLit(b) => write!(f, "bool({b})"),
-            Inst::BinOp(op, a, b) => write!(f, "{op:?} {a} {b}"),
-            Inst::UnOp(op, a) => write!(f, "{op:?} {a}"),
-            Inst::Conv(op, a) => write!(f, "{op:?} {a}"),
-            Inst::Call(func, vals) => write!(f, "call({func:?}) {vals:?}"),
-            Inst::CallNative(func, vals) => write!(f, "call({func:?}) {vals:?}"),
-            Inst::CallIndirect(func, vals) => write!(f, "call({func}) {vals:?}"),
-            Inst::Result(val, idx) => write!(f, "res({val})[{idx}]"),
+    pub fn build(self) -> Function {
+        assert!(self.current.is_empty(), "unterminated block");
+        Function {
+            name: self.name,
+            blocks: self.blocks,
+            nreg: self.next_val,
+            narg: self.narg,
+            nret: self.nret,
         }
     }
+}
+
+pub struct Module {
+    pub name: String,
+    pub functions: Vec<Function>,
 }

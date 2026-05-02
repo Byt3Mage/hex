@@ -5,8 +5,7 @@ mod error;
 mod lexer;
 mod parse_rules;
 mod parser;
-pub mod sema;
-//mod symbol_table;
+mod sema;
 mod tokens;
 
 #[derive(Debug, thiserror::Error)]

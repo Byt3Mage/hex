@@ -6,17 +6,19 @@ use crate::tt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefixRule {
     None,
+
+    // Literals
     LiteralCint,
     LiteralUint,
     LiteralInt,
     LiteralFloat,
     LiteralString,
-    True,
-    False,
+    LiteralBool,
     LiteralNull,
     LiteralVoid,
     LiteralArray,
     LiteralStruct,
+
     Identifier,
     Grouping,
     Unary,
@@ -361,7 +363,7 @@ static RULES: [ParseRule; TokenType::COUNT] = {
     };
 
     rules[tt![false] as usize] = ParseRule {
-        prefix: PrefixRule::False,
+        prefix: PrefixRule::LiteralBool,
         infix: InfixRule::None,
         prec: Precedence::Primary,
         right_assoc: false,
@@ -375,7 +377,7 @@ static RULES: [ParseRule; TokenType::COUNT] = {
     };
 
     rules[tt![true] as usize] = ParseRule {
-        prefix: PrefixRule::True,
+        prefix: PrefixRule::LiteralBool,
         infix: InfixRule::None,
         prec: Precedence::Primary,
         right_assoc: false,

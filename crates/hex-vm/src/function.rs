@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::{program::NativeFunction, value::Value, vm::VMResult};
+use crate::{VMResult, Value, program::NativeFunction};
 
 /// A type that can be constructed from a slice of Values
 pub trait FromValues: Sized + 'static {

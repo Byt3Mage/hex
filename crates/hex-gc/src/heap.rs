@@ -1,5 +1,5 @@
 use crate::{memory::*, object::*};
-use hex_vm::value::Value;
+use hex_vm::Value;
 use std::{ptr::NonNull, usize};
 
 fn try_get_ptr(_: &Value) -> Option<GCPtr> {

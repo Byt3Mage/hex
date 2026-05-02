@@ -1,7 +1,6 @@
 use crate::{
-    instruction::Instruction,
-    opcode::Opcode,
-    value::{IsValue, Value},
+    IsValue, Value,
+    instruction::{Instruction, Opcode},
 };
 
 pub fn disassemble(bytecode: &[Instruction], constants: &[Value]) {
