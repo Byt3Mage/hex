@@ -25,6 +25,6 @@ impl ConstantPool {
     }
 
     pub fn into_values(self) -> Vec<Value> {
-        self.values.into()
+        self.values
     }
 }

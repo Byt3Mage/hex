@@ -1,25 +1,25 @@
 use std::collections::HashSet;
 
-use hex_vm::instruction::{self as hx, InstType, Instruction, Opcode, Reg};
+use hex_vm as hx;
 
 use crate::{
-    BinOp, CastOp, Function, Inst, Module, Terminator, UnOp, Val,
+    BinOp, CastOp, Function, Inst, MirError, Module, Terminator, UnOp, Val,
     constants::ConstantPool,
     liveness::{Liveness, compute_liveness},
 };
 
 pub struct RegAssignment {
-    map: Vec<Reg>,
-    pub nreg: Reg,
+    map: Vec<hx::Reg>,
+    pub nreg: hx::Reg,
 }
 
 impl RegAssignment {
-    pub fn get(&self, v: Val) -> Reg {
+    pub fn get(&self, v: Val) -> hx::Reg {
         self.map[v.0 as usize]
     }
 }
 
-pub fn assign_registers(func: &Function, liveness: &Liveness) -> RegAssignment {
+pub fn assign_registers(func: &Function, liveness: &Liveness) -> Result<RegAssignment, MirError> {
     let num_vals = func.nreg as usize;
 
     let mut block_starts = Vec::with_capacity(func.blocks.len());
@@ -38,7 +38,7 @@ pub fn assign_registers(func: &Function, liveness: &Liveness) -> RegAssignment {
 
         let term_point = base + blk.insts.len();
         blk.term.for_each_use(|v| {
-            live.insert(*v);
+            live.insert(v);
         });
         for &v in &live {
             intervals[v.0 as usize][term_point] = true;
@@ -49,7 +49,7 @@ pub fn assign_registers(func: &Function, liveness: &Liveness) -> RegAssignment {
                 live.remove(&v);
             });
             inst.for_each_use(|v| {
-                live.insert(*v);
+                live.insert(v);
             });
             let p = base + i;
             for &v in &live {
@@ -58,8 +58,8 @@ pub fn assign_registers(func: &Function, liveness: &Liveness) -> RegAssignment {
         }
     }
 
-    let mut map = vec![0 as Reg; num_vals];
-    let mut nreg: Reg = 0;
+    let mut map = vec![0; num_vals];
+    let mut nreg: hx::Reg = 0;
 
     for v in 0..num_vals {
         if !intervals[v].iter().any(|&b| b) {
@@ -68,6 +68,9 @@ pub fn assign_registers(func: &Function, liveness: &Liveness) -> RegAssignment {
 
         let mut reg = 0;
         'search: loop {
+            if reg == hx::Reg::MAX {
+                return Err(MirError::RegisterOverflow);
+            }
             for other in 0..v {
                 if map[other] == reg {
                     let overlaps = intervals[v]
@@ -87,7 +90,7 @@ pub fn assign_registers(func: &Function, liveness: &Liveness) -> RegAssignment {
         nreg = nreg.max(reg + 1);
     }
 
-    RegAssignment { map, nreg }
+    Ok(RegAssignment { map, nreg })
 }
 
 struct JumpPatch {
@@ -95,7 +98,7 @@ struct JumpPatch {
     target_block: usize,
 }
 
-pub fn emit_module(module: &Module) -> hex_vm::Module {
+pub fn emit_program(module: &Module) -> Result<hex_vm::Program, MirError> {
     let mut bc = Vec::new();
     let mut pool = ConstantPool::new();
     let mut functions = Vec::with_capacity(module.functions.len());
@@ -103,7 +106,12 @@ pub fn emit_module(module: &Module) -> hex_vm::Module {
     for func in &module.functions {
         let entry_pc = bc.len();
         let liveness = compute_liveness(func);
-        let regs = assign_registers(func, &liveness);
+        let regs = assign_registers(func, &liveness)?;
+
+        for (i, reg) in regs.map.iter().enumerate() {
+            println!("%{i} -> r{reg}")
+        }
+        
         let mut next_reg = regs.nreg;
         let mut patches = Vec::new();
         let mut blk_offsets = Vec::new();
@@ -112,16 +120,15 @@ pub fn emit_module(module: &Module) -> hex_vm::Module {
             blk_offsets.push(bc.len());
 
             for inst in &blk.insts {
-                emit_inst(inst, &regs, &mut bc, &mut pool, &mut next_reg);
+                emit_inst(inst, &regs, &mut bc, &mut pool, &mut next_reg)?;
             }
 
-            emit_term(&blk.term, func, &regs, &mut bc, &mut patches, &mut next_reg);
+            emit_term(&blk.term, func, &regs, &mut bc, &mut patches, &mut next_reg)?;
         }
 
         patch_jumps(&patches, &mut bc, &blk_offsets);
 
         functions.push(hex_vm::Function {
-            name: func.name.clone(),
             entry_pc,
             nreg: next_reg,
             narg: func.narg,
@@ -129,24 +136,21 @@ pub fn emit_module(module: &Module) -> hex_vm::Module {
         });
     }
 
-    hex_vm::Module {
-        name: module.name.clone(),
-        bytecode: bc.into(),
+    Ok(hx::Program {
+        instructions: bc.into(),
         constants: pool.into_values().into(),
         functions: functions.into(),
-        native_functions: vec![].into(),
-        exports: vec![].into(),
-        imports: vec![].into(),
-    }
+        host_functions: vec![].into(),
+    })
 }
 
 fn emit_inst(
     inst: &Inst,
     regs: &RegAssignment,
-    bc: &mut Vec<Instruction>,
+    bc: &mut Vec<hx::Instruction>,
     pool: &mut ConstantPool,
-    next_reg: &mut Reg,
-) {
+    next_reg: &mut hx::Reg,
+) -> Result<(), MirError> {
     match inst {
         Inst::LoadInt { dst, value } => {
             bc.push(hx::const_(regs.get(*dst), pool.insert(*value as u64)));
@@ -167,6 +171,15 @@ fn emit_inst(
                 bc.push(hx::mov(d, s));
             }
         }
+        Inst::Assign { dst, args } => {
+            let d = regs.get(*dst);
+            let arg_moves: Vec<(hx::Reg, hx::Reg)> = args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (regs.get(*a), d + i as hx::Reg))
+                .collect();
+            resolve_parallel_moves(&arg_moves, next_reg, bc)?;
+        }
         Inst::BinOp { dst, op, lhs, rhs } => {
             bc.push(emit_binop(
                 *op,
@@ -181,68 +194,77 @@ fn emit_inst(
         Inst::Cast { dst, op, src } => {
             emit_cast(*op, regs.get(*dst), regs.get(*src), bc);
         }
-        Inst::Call { dst, func, args } => {
+        Inst::Call {
+            dst, func, args, ..
+        } => {
             let d = regs.get(*dst);
-            let arg_moves: Vec<(Reg, Reg)> = args
+            let arg_moves: Vec<(hx::Reg, hx::Reg)> = args
                 .iter()
                 .enumerate()
-                .map(|(i, a)| (regs.get(*a), d + i as Reg))
+                .map(|(i, a)| (regs.get(*a), d + i as hx::Reg))
                 .collect();
-            resolve_parallel_moves(&arg_moves, next_reg, bc);
-            bc.push(hx::call(d, *func as InstType));
+            resolve_parallel_moves(&arg_moves, next_reg, bc)?;
+            bc.push(hx::call(d, *func as hx::InstType));
         }
-        Inst::CallNative { dst, func, args } => {
+        Inst::CallNative {
+            dst, func, args, ..
+        } => {
             let d = regs.get(*dst);
-            let arg_moves: Vec<(Reg, Reg)> = args
+            let arg_moves: Vec<(hx::Reg, hx::Reg)> = args
                 .iter()
                 .enumerate()
-                .map(|(i, a)| (regs.get(*a), d + i as Reg))
+                .map(|(i, a)| (regs.get(*a), d + i as hx::Reg))
                 .collect();
-            resolve_parallel_moves(&arg_moves, next_reg, bc);
-            bc.push(hx::calln(d, *func as InstType));
+            resolve_parallel_moves(&arg_moves, next_reg, bc)?;
+            bc.push(hx::calln(d, *func as hx::InstType));
         }
-        Inst::CallIndirect { dst, func, args } => {
+        Inst::CallIndirect {
+            dst, func, args, ..
+        } => {
             let f = regs.get(*func);
             let d = regs.get(*dst);
-            let arg_moves: Vec<(Reg, Reg)> = args
+            let arg_moves: Vec<(hx::Reg, hx::Reg)> = args
                 .iter()
                 .enumerate()
-                .map(|(i, a)| (regs.get(*a), d + i as Reg))
+                .map(|(i, a)| (regs.get(*a), d + i as hx::Reg))
                 .collect();
-            resolve_parallel_moves(&arg_moves, next_reg, bc);
+            resolve_parallel_moves(&arg_moves, next_reg, bc)?;
             bc.push(hx::callr(d, f));
         }
-        Inst::CallNativeIndirect { dst, func, args } => {
+        Inst::CallNativeIndirect {
+            dst, func, args, ..
+        } => {
             let f = regs.get(*func);
             let d = regs.get(*dst);
-            let arg_moves: Vec<(Reg, Reg)> = args
+            let arg_moves: Vec<(hx::Reg, hx::Reg)> = args
                 .iter()
                 .enumerate()
-                .map(|(i, a)| (regs.get(*a), d + i as Reg))
+                .map(|(i, a)| (regs.get(*a), d + i as hx::Reg))
                 .collect();
-            resolve_parallel_moves(&arg_moves, next_reg, bc);
+            resolve_parallel_moves(&arg_moves, next_reg, bc)?;
             bc.push(hx::callnr(d, f));
         }
     }
+    Ok(())
 }
 
 fn emit_term(
     term: &Terminator,
     func: &Function,
     regs: &RegAssignment,
-    bc: &mut Vec<Instruction>,
+    bc: &mut Vec<hx::Instruction>,
     patches: &mut Vec<JumpPatch>,
-    next_reg: &mut Reg,
-) {
+    next_reg: &mut hx::Reg,
+) -> Result<(), MirError> {
     match term {
         Terminator::Br { tgt, args } => {
             let target_params = &func.blocks[*tgt].params;
-            let moves: Vec<(Reg, Reg)> = args
+            let moves: Vec<(hx::Reg, hx::Reg)> = args
                 .iter()
                 .zip(target_params.iter())
                 .map(|(a, p)| (regs.get(*a), regs.get(*p)))
                 .collect();
-            resolve_parallel_moves(&moves, next_reg, bc);
+            resolve_parallel_moves(&moves, next_reg, bc)?;
             patches.push(JumpPatch {
                 bc_idx: bc.len(),
                 target_block: *tgt,
@@ -259,14 +281,14 @@ fn emit_term(
             let c = regs.get(*cond);
 
             let then_params = &func.blocks[*then_br].params;
-            let then_moves: Vec<(Reg, Reg)> = then_args
+            let then_moves: Vec<(hx::Reg, hx::Reg)> = then_args
                 .iter()
                 .zip(then_params.iter())
                 .map(|(a, p)| (regs.get(*a), regs.get(*p)))
                 .collect();
 
             let else_params = &func.blocks[*else_br].params;
-            let else_moves: Vec<(Reg, Reg)> = else_args
+            let else_moves: Vec<(hx::Reg, hx::Reg)> = else_args
                 .iter()
                 .zip(else_params.iter())
                 .map(|(a, p)| (regs.get(*a), regs.get(*p)))
@@ -292,16 +314,16 @@ fn emit_term(
                 let jmp_to_else = bc.len();
                 bc.push(hx::jmp_f(c, 0)); // placeholder
 
-                resolve_parallel_moves(&then_moves, next_reg, bc);
+                resolve_parallel_moves(&then_moves, next_reg, bc)?;
                 patches.push(JumpPatch {
                     bc_idx: bc.len(),
                     target_block: *then_br,
                 });
                 bc.push(hx::jmp(0));
 
-                let else_start = bc.len() as InstType;
+                let else_start = bc.len() as hx::InstType;
                 bc[jmp_to_else] = hx::jmp_f(c, else_start);
-                resolve_parallel_moves(&else_moves, next_reg, bc);
+                resolve_parallel_moves(&else_moves, next_reg, bc)?;
                 patches.push(JumpPatch {
                     bc_idx: bc.len(),
                     target_block: *else_br,
@@ -310,18 +332,20 @@ fn emit_term(
             }
         }
         Terminator::Ret(vals) => {
-            let ret_moves: Vec<(Reg, Reg)> = vals
+            let ret_moves: Vec<(hx::Reg, hx::Reg)> = vals
                 .iter()
                 .enumerate()
-                .map(|(i, v)| (regs.get(*v), i as Reg))
+                .map(|(i, v)| (regs.get(*v), i as hx::Reg))
                 .collect();
-            resolve_parallel_moves(&ret_moves, next_reg, bc);
+
+            resolve_parallel_moves(&ret_moves, next_reg, bc)?;
             bc.push(hx::ret());
         }
     }
+    Ok(())
 }
 
-fn emit_binop(op: BinOp, dst: Reg, lhs: Reg, rhs: Reg) -> Instruction {
+fn emit_binop(op: BinOp, dst: hx::Reg, lhs: hx::Reg, rhs: hx::Reg) -> hx::Instruction {
     match op {
         BinOp::IAdd => hx::iadd(dst, lhs, rhs),
         BinOp::ISub => hx::isub(dst, lhs, rhs),
@@ -359,7 +383,7 @@ fn emit_binop(op: BinOp, dst: Reg, lhs: Reg, rhs: Reg) -> Instruction {
     }
 }
 
-fn emit_unop(op: UnOp, dst: Reg, src: Reg) -> Instruction {
+fn emit_unop(op: UnOp, dst: hx::Reg, src: hx::Reg) -> hx::Instruction {
     match op {
         UnOp::INeg => hx::ineg(dst, src),
         UnOp::FNeg => hx::fneg(dst, src),
@@ -369,18 +393,23 @@ fn emit_unop(op: UnOp, dst: Reg, src: Reg) -> Instruction {
     }
 }
 
-fn emit_cast(op: CastOp, _dst: Reg, _src: Reg, _bc: &mut Vec<Instruction>) {
+fn emit_cast(op: CastOp, _dst: hx::Reg, _src: hx::Reg, _bc: &mut Vec<hx::Instruction>) {
     todo!("cast opcodes not yet in hex-vm: {:?}", op)
 }
 
-fn resolve_parallel_moves(moves: &[(Reg, Reg)], next_reg: &mut Reg, bc: &mut Vec<Instruction>) {
+fn resolve_parallel_moves(
+    moves: &[(hx::Reg, hx::Reg)],
+    next_reg: &mut hx::Reg,
+    bc: &mut Vec<hx::Instruction>,
+) -> Result<(), MirError> {
     if moves.is_empty() {
-        return;
+        return Ok(());
     }
 
-    let mut pending: Vec<(Reg, Reg)> = moves.iter().copied().filter(|(s, d)| s != d).collect();
+    let mut pending: Vec<(hx::Reg, hx::Reg)> =
+        moves.iter().copied().filter(|(s, d)| s != d).collect();
     if pending.is_empty() {
-        return;
+        return Ok(());
     }
 
     let mut emitted = vec![false; pending.len()];
@@ -411,28 +440,31 @@ fn resolve_parallel_moves(moves: &[(Reg, Reg)], next_reg: &mut Reg, bc: &mut Vec
             let i = emitted.iter().position(|&e| !e).unwrap();
             let (src, _) = pending[i];
 
-            let tmp = *next_reg;
-            *next_reg += 1;
+            let tmp = next_reg.checked_add(1).ok_or(MirError::RegisterOverflow)?;
+            let old = *next_reg;
+            *next_reg = tmp;
 
-            bc.push(hx::mov(tmp, src));
+            bc.push(hx::mov(old, src));
 
             for j in 0..total {
                 if !emitted[j] && pending[j].0 == src {
-                    pending[j].0 = tmp;
+                    pending[j].0 = old;
                 }
             }
         }
     }
+
+    Ok(())
 }
 
-fn patch_jumps(patches: &[JumpPatch], bc: &mut Vec<Instruction>, blk_offsets: &[usize]) {
+fn patch_jumps(patches: &[JumpPatch], bc: &mut Vec<hx::Instruction>, blk_offsets: &[usize]) {
     for patch in patches {
-        let tgt = blk_offsets[patch.target_block] as InstType;
+        let tgt = blk_offsets[patch.target_block] as hx::InstType;
         let inst = bc[patch.bc_idx];
         bc[patch.bc_idx] = match inst.op() {
-            Opcode::JMP => hx::jmp(tgt),
-            Opcode::JMP_T => hx::jmp_t(inst.a(), tgt),
-            Opcode::JMP_F => hx::jmp_f(inst.a(), tgt),
+            hx::Opcode::JMP => hx::jmp(tgt),
+            hx::Opcode::JMP_T => hx::jmp_t(inst.a(), tgt),
+            hx::Opcode::JMP_F => hx::jmp_f(inst.a(), tgt),
             _ => unreachable!("patching non-jump instruction"),
         };
     }

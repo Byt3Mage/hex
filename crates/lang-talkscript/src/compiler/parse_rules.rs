@@ -1,6 +1,6 @@
 use simple_ternary::tnr;
 
-use super::tokens::TokenType;
+use super::token::TokenType;
 use crate::tt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +35,9 @@ pub enum PrefixRule {
     Int,
     Uint,
     Bool,
+    Float,
     Void,
+    Option,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -455,6 +457,27 @@ static RULES: [ParseRule; TokenType::COUNT] = {
 
     rules[tt![bool] as usize] = ParseRule {
         prefix: PrefixRule::Bool,
+        infix: InfixRule::None,
+        prec: Precedence::Primary,
+        right_assoc: false,
+    };
+
+    rules[tt![float] as usize] = ParseRule {
+        prefix: PrefixRule::Float,
+        infix: InfixRule::None,
+        prec: Precedence::Primary,
+        right_assoc: false,
+    };
+
+    rules[tt![void] as usize] = ParseRule {
+        prefix: PrefixRule::Void,
+        infix: InfixRule::None,
+        prec: Precedence::Primary,
+        right_assoc: false,
+    };
+
+    rules[tt![?] as usize] = ParseRule {
+        prefix: PrefixRule::Option,
         infix: InfixRule::None,
         prec: Precedence::Primary,
         right_assoc: false,

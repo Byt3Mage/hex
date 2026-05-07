@@ -1,6 +1,6 @@
 use crate::{
     arena::{Arena, Ident, define_id},
-    compiler::tokens::Span,
+    compiler::token::Span,
 };
 
 define_id!(ExprId);
@@ -40,7 +40,7 @@ pub enum ExprKind {
     /// ```
     /// [1; 5]
     /// ```
-    ArrayRepeat {
+    ArrayRep {
         value: ExprId,
         count: ExprId,
     },
@@ -133,7 +133,7 @@ pub enum ExprKind {
     /// ```
     /// let x: ?int = point?.x;
     /// ```
-    OptionalField {
+    OptField {
         object: ExprId,
         field: Ident,
     },
@@ -161,7 +161,9 @@ pub enum ExprKind {
     IntType,
     UintType,
     BoolType,
+    FloatType,
     VoidType,
+    OptionType(ExprId),
 }
 
 #[derive(Debug, Clone)]
@@ -173,7 +175,8 @@ pub struct FieldInit {
 
 #[derive(Debug, Clone)]
 pub struct Param {
-    pub is_comptime: bool,
+    pub comptime: bool,
+    pub mutable: bool,
     pub name: Ident,
     pub ty: ExprId,
     pub span: Span,
@@ -195,6 +198,7 @@ pub enum StmtKind {
         name: Ident,
         ty: Option<ExprId>,
         value: ExprId,
+        mutable: bool,
     },
 
     // Expression with semicolon.
@@ -247,13 +251,22 @@ pub enum UnOp {
     Neg,
 }
 
+impl std::fmt::Display for UnOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnOp::Not => f.write_str("!"),
+            UnOp::Neg => f.write_str("-"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BinOp {
     Add,
     Sub,
     Mul,
     Div,
-    Mod,
+    Rem,
     Eq,
     Ne,
     Lt,
@@ -269,6 +282,31 @@ pub enum BinOp {
     Shr,
 }
 
+impl std::fmt::Display for BinOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BinOp::Add => f.write_str("+"),
+            BinOp::Sub => f.write_str("-"),
+            BinOp::Mul => f.write_str("*"),
+            BinOp::Div => f.write_str("/"),
+            BinOp::Rem => f.write_str("%"),
+            BinOp::Eq => f.write_str("=="),
+            BinOp::Ne => f.write_str("!="),
+            BinOp::Lt => f.write_str("<"),
+            BinOp::Le => f.write_str("<="),
+            BinOp::Gt => f.write_str(">"),
+            BinOp::Ge => f.write_str(">="),
+            BinOp::And => f.write_str("and"),
+            BinOp::Or => f.write_str("or"),
+            BinOp::BitAnd => f.write_str("&"),
+            BinOp::BitOr => f.write_str("|"),
+            BinOp::BitXor => f.write_str("^"),
+            BinOp::Shl => f.write_str("<<"),
+            BinOp::Shr => f.write_str(">>"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AssignOp {
     Eq,
@@ -282,6 +320,24 @@ pub enum AssignOp {
     BitXorEq,
     ShlEq,
     ShrEq,
+}
+
+impl std::fmt::Display for AssignOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AssignOp::Eq => f.write_str("="),
+            AssignOp::AddEq => f.write_str("+="),
+            AssignOp::SubEq => f.write_str("-="),
+            AssignOp::MulEq => f.write_str("*="),
+            AssignOp::DivEq => f.write_str("/="),
+            AssignOp::ModEq => f.write_str("%="),
+            AssignOp::BitAndEq => f.write_str("&="),
+            AssignOp::BitOrEq => f.write_str("|="),
+            AssignOp::BitXorEq => f.write_str("^="),
+            AssignOp::ShlEq => f.write_str("<<="),
+            AssignOp::ShrEq => f.write_str(">>="),
+        }
+    }
 }
 
 pub struct Ast {

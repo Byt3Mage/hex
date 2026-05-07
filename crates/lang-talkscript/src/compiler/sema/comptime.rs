@@ -2,11 +2,11 @@ use crate::{
     arena::Ident,
     compiler::{
         ast::{Ast, ExprId, ExprKind},
-        tokens::Span,
+        token::Span,
     },
 };
 
-use super::type_engine::SemaTy;
+use super::sema_type::SemaTy;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ComptimeEvalError {
@@ -64,16 +64,37 @@ impl<'a> ComptimeEval<'a> {
             ExprKind::IntType => Ok(ComptimeVal::Type(SemaTy::Int)),
             ExprKind::UintType => Ok(ComptimeVal::Type(SemaTy::Uint)),
             ExprKind::BoolType => Ok(ComptimeVal::Type(SemaTy::Bool)),
+            ExprKind::FloatType => Ok(ComptimeVal::Type(SemaTy::Float)),
             ExprKind::VoidType => Ok(ComptimeVal::Type(SemaTy::Void)),
-
+            ExprKind::OptionType(ty) => Ok(ComptimeVal::Type(SemaTy::Optional(Box::new(
+                self.eval_type(*ty)?,
+            )))),
             _ => Err(ComptimeEvalError::UnsupportedExpr(expr.span)),
         }
     }
 
     pub fn eval_type(&self, expr_id: ExprId) -> Result<SemaTy, ComptimeEvalError> {
-        match self.eval(expr_id)? {
-            ComptimeVal::Type(ty) => Ok(ty),
-            v => Err(ComptimeEvalError::ExpectedType(v.sema_type())),
+        let expr = self.ast.expr(expr_id);
+
+        match &expr.kind {
+            ExprKind::IntType => Ok(SemaTy::Int),
+            ExprKind::UintType => Ok(SemaTy::Uint),
+            ExprKind::BoolType => Ok(SemaTy::Bool),
+            ExprKind::FloatType => Ok(SemaTy::Float),
+            ExprKind::VoidType => Ok(SemaTy::Void),
+            ExprKind::OptionType(ty) => Ok(SemaTy::Optional(Box::new(self.eval_type(*ty)?))),
+
+            ExprKind::ArrayRep { value, count } => {
+                let len = match self.eval(*count)? {
+                    ComptimeVal::Uint(u) => u as usize,
+                    _ => panic!("expected uint"),
+                };
+
+                let elem_ty = Box::new(self.eval_type(*value)?);
+
+                Ok(SemaTy::Array { elem_ty, len })
+            }
+            _ => Err(ComptimeEvalError::ExpectedType(SemaTy::Infer)),
         }
     }
 }

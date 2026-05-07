@@ -9,7 +9,7 @@ use crate::{
         },
         lexer::{LexError, Lexer},
         parse_rules::{InfixRule, ParseRule, Precedence, PrefixRule},
-        tokens::{Span, Token, TokenType},
+        token::{Span, Token, TokenType},
     },
     tt,
 };
@@ -161,14 +161,17 @@ impl<'a> Parser<'a> {
 
         let mut params = vec![];
         while !matches!(self.current.ty, tt![')'] | tt![eof]) {
+            let comptime = self.advance_if(tt![comptime])?;
+            let mutable = self.advance_if(tt![mut])?;
             let name = self.expect(tt![ident])?;
             self.expect(tt![:])?;
             let ty = self.parse_expr()?;
 
             params.push(Param {
-                span: name.span.merge(ty.span),
-                is_comptime: false,
+                comptime,
+                mutable,
                 name: self.intern.get_or_intern(name.lexeme),
+                span: name.span.merge(ty.span),
                 ty: self.ast.insert_expr(ty),
             });
 
@@ -357,8 +360,14 @@ impl<'a> Parser<'a> {
 
     fn parse_let(&mut self) -> ParseResult<Stmt> {
         let let_token = self.expect(tt![let])?;
+        let mutable = self.advance_if(tt![mut])?;
         let name = self.expect(tt![ident])?;
-        let ty = tnr! {self.advance_if(tt![:])? => Some(self.parse_expr()?) : None};
+        let ty = if self.advance_if(tt![:])? {
+            let ty = self.parse_precedence(Precedence::Coalesce, true)?;
+            Some(self.ast.insert_expr(ty))
+        } else {
+            None
+        };
 
         self.expect(tt![=])?;
 
@@ -368,8 +377,9 @@ impl<'a> Parser<'a> {
         Ok(Stmt {
             kind: StmtKind::Let {
                 name: self.intern.get_or_intern(name.lexeme),
-                ty: ty.map(|t| self.ast.insert_expr(t)),
+                ty,
                 value: self.ast.insert_expr(value),
+                mutable,
             },
             span: let_token.span.merge(semi_token.span),
         })
@@ -430,7 +440,9 @@ impl<'a> Parser<'a> {
             PrefixRule::Int => self.parse_int_type(),
             PrefixRule::Uint => self.parse_uint_type(),
             PrefixRule::Bool => self.parse_bool_type(),
+            PrefixRule::Float => self.parse_float_type(),
             PrefixRule::Void => self.parse_void_type(),
+            PrefixRule::Option => self.parse_option_type(),
             PrefixRule::None => Err(ParseError {
                 msg: format!("Expected expression, found {:?}", self.current.ty),
                 span: self.current.span,
@@ -513,11 +525,28 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_float_type(&mut self) -> ParseResult<Expr> {
+        let float_ty = self.expect(tt![float])?;
+        Ok(Expr {
+            kind: ExprKind::FloatType,
+            span: float_ty.span,
+        })
+    }
+
     fn parse_void_type(&mut self) -> ParseResult<Expr> {
         let void_ty = self.expect(tt![void])?;
         Ok(Expr {
             kind: ExprKind::VoidType,
             span: void_ty.span,
+        })
+    }
+
+    fn parse_option_type(&mut self) -> ParseResult<Expr> {
+        let option_ty = self.expect(tt![?])?;
+        let inner = self.parse_precedence(Precedence::Unary, true)?;
+        Ok(Expr {
+            kind: ExprKind::OptionType(self.ast.insert_expr(inner)),
+            span: option_ty.span,
         })
     }
 
@@ -619,7 +648,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_array(&mut self) -> ParseResult<Expr> {
-        /*let l_brkt = self.expect(tt!['['])?;
+        let l_brkt = self.expect(tt!['['])?;
 
         // Parse empty array literal
         if self.advance_if(tt![']'])? {
@@ -638,21 +667,21 @@ impl<'a> Parser<'a> {
             let len = self.parse_expr()?;
             let r_brkt = self.expect(tt![']'])?;
 
-            let value = self.ast.exprs.insert(first);
-            let count = self.ast.exprs.insert(len);
+            let value = self.ast.insert_expr(first);
+            let count = self.ast.insert_expr(len);
 
             return Ok(Expr {
-                kind: ExprKind::ArrayRepeat { value, count },
+                kind: ExprKind::ArrayRep { value, count },
                 span: l_brkt.span.merge(r_brkt.span),
             });
         }
 
-        let mut elems = vec![self.ast.exprs.insert(first)];
+        let mut elems = vec![self.ast.insert_expr(first)];
 
         if self.advance_if(tt![,])? {
             while !matches!(self.current.ty, tt![']'] | tt![eof]) {
                 let elem = self.parse_expr()?;
-                elems.push(self.ast.exprs.insert(elem));
+                elems.push(self.ast.insert_expr(elem));
 
                 if !self.advance_if(tt![,])? {
                     break;
@@ -665,8 +694,7 @@ impl<'a> Parser<'a> {
         Ok(Expr {
             kind: ExprKind::ArrayLit(elems),
             span: l_brkt.span.merge(r_brkt.span),
-        })*/
-        todo!()
+        })
     }
 
     fn parse_group(&mut self) -> ParseResult<Expr> {
@@ -712,7 +740,7 @@ impl<'a> Parser<'a> {
             tt![-] => BinOp::Sub,
             tt![*] => BinOp::Mul,
             tt![/] => BinOp::Div,
-            tt![%] => BinOp::Mod,
+            tt![%] => BinOp::Rem,
             tt![==] => BinOp::Eq,
             tt![!=] => BinOp::Ne,
             tt![<] => BinOp::Lt,
@@ -976,13 +1004,12 @@ impl<'a> Parser<'a> {
         let index = self.parse_expr()?;
         let r_brkt = self.expect(tt![']'])?;
 
-        /*Ok(Expr {
+        Ok(Expr {
             span: object.span.merge(r_brkt.span),
             kind: ExprKind::Index {
-                object: self.ast.exprs.insert(object),
-                index: self.ast.exprs.insert(index),
+                object: self.ast.insert_expr(object),
+                index: self.ast.insert_expr(index),
             },
-        })*/
-        todo!()
+        })
     }
 }

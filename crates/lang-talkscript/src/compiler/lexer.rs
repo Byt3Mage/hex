@@ -1,7 +1,7 @@
 use simple_ternary::tnr;
 
-use super::tokens::{Span, Token};
-use crate::{compiler::tokens::TokenType, tt};
+use super::token::{Span, Token};
+use crate::{compiler::token::TokenType, tt};
 
 // Error Types
 #[derive(Debug, Clone, Copy, thiserror::Error)]

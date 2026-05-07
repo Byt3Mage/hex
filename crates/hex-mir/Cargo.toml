@@ -6,3 +6,4 @@ edition = "2024"
 
 [dependencies]
 hex-vm = { path = "../hex-vm" }
+thiserror = "2.0.18"

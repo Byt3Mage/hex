@@ -75,8 +75,8 @@ fn print_inst(inst: Instruction, constants: &[Value]) {
 
         Opcode::CALL => print!("call   r{}, fn{}", inst.a(), inst.bx()),
         Opcode::CALLR => print!("callr  r{}, r{}", inst.a(), inst.b()),
-        Opcode::CALLN => print!("calln  r{}, native{}", inst.a(), inst.bx()),
-        Opcode::CALLNR => print!("callnr r{}, r{}", inst.a(), inst.b()),
+        Opcode::CALLH => print!("callh  r{}, native{}", inst.a(), inst.bx()),
+        Opcode::CALLHR => print!("callhr r{}, r{}", inst.a(), inst.b()),
         Opcode::CALLT => print!("callt  r{}, fn{}", inst.a(), inst.bx()),
 
         Opcode::RET => print!("ret"),

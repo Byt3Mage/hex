@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{Function, Val};
+use crate::{Function, Inst, Val};
 
 pub struct Liveness {
     pub live_in: Vec<HashSet<Val>>,
@@ -29,16 +29,16 @@ pub fn compute_liveness(func: &Function) -> Liveness {
             let mut live = out.clone();
 
             block.term.for_each_use(|v| {
-                live.insert(*v);
+                live.insert(v);
             });
 
             // Instructions in reverse
             for inst in block.insts.iter().rev() {
                 inst.for_each_def(|v| {
-                    live.remove(v);
+                    live.remove(&v);
                 });
                 inst.for_each_use(|v| {
-                    live.insert(*v);
+                    live.insert(v);
                 });
             }
 

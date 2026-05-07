@@ -1,19 +1,12 @@
-use crate::{
-    extension::{DispatchResult, ExtensionOps, NoExtensions},
-    instruction::*,
-    program::{CallInfo, FunctionPtr, NativeFunction},
-};
+use crate::extensions::{DispatchResult, ExtensionOps, NoExtensions};
 
 pub mod disassemble;
-pub mod extension;
-pub mod function;
+pub mod extensions;
 pub mod instruction;
 pub mod program;
 
-pub use instruction::Reg;
-pub use program::Function;
-pub use program::Module;
-pub use program::Program;
+pub use instruction::*;
+pub use program::*;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -121,10 +114,10 @@ impl IsValue for u16 {
 
 #[derive(Debug, thiserror::Error)]
 pub enum VMError {
-    #[error("Illegal opcode: {0:?}")]
+    #[error("Illegal opcode: {0}")]
     UnknownOp(Opcode),
     #[error("Invalid argument count: expected {exp}, got {got}")]
-    InvalidArgCount { exp: u8, got: u8 },
+    InvalidArgCount { exp: Reg, got: Reg },
     #[error("Program counter out of bounds")]
     PCOutOfBounds,
 }
@@ -132,12 +125,12 @@ pub enum VMError {
 pub type VMResult<T> = Result<T, VMError>;
 
 struct CallerInfo {
+    base: usize,
     ret_pc: usize,
-    base_reg: usize,
 }
 
 pub struct Frame {
-    callee_info: CallInfo,
+    func: Function,
     caller_info: CallerInfo,
 }
 
@@ -151,7 +144,12 @@ pub struct VMState {
 
 impl VMState {
     #[inline(always)]
-    pub fn reg(&self, reg: Reg) -> Value {
+    pub fn reg<T: IsValue>(&self, reg: Reg) -> T {
+        T::from_value(self.regs[self.base + reg as usize])
+    }
+
+    #[inline(always)]
+    pub fn reg_raw(&self, reg: Reg) -> Value {
         self.regs[self.base + reg as usize]
     }
 
@@ -199,8 +197,13 @@ impl<'p, E: ExtensionOps> VM<'p, E> {
     }
 
     #[inline(always)]
-    fn reg(&self, reg: Reg) -> Value {
+    fn reg<T: IsValue>(&self, reg: Reg) -> T {
         self.state.reg(reg)
+    }
+
+    #[inline(always)]
+    fn reg_raw(&self, reg: Reg) -> Value {
+        self.state.reg_raw(reg)
     }
 
     #[inline(always)]
@@ -215,7 +218,7 @@ impl<'p, E: ExtensionOps> VM<'p, E> {
 
     #[inline(always)]
     fn two_reg<T: IsValue>(&self, reg_a: Reg, reg_b: Reg) -> (T, T) {
-        (self.reg(reg_a).get(), self.reg(reg_b).get())
+        (self.reg(reg_a), self.reg(reg_b))
     }
 
     #[inline(always)]
@@ -224,7 +227,7 @@ impl<'p, E: ExtensionOps> VM<'p, E> {
     }
 
     #[inline(always)]
-    fn call(&mut self, ret_reg: Reg, cinfo: CallInfo) {
+    fn call(&mut self, ret_reg: Reg, func: Function) {
         // Call convention: args are in caller registers[Rret..Rn]
         //
         // We use overlapping register windows for caller and callee
@@ -233,7 +236,7 @@ impl<'p, E: ExtensionOps> VM<'p, E> {
 
         // Callee window starts at caller's return register.
         let base = self.reg_offset(ret_reg);
-        let last = base + cinfo.nreg as usize;
+        let last = base + func.nreg as usize;
 
         // Grow regs to fit callee's full register count beyond the arg base.
         if last > self.state.regs.len() {
@@ -242,44 +245,33 @@ impl<'p, E: ExtensionOps> VM<'p, E> {
 
         // Create new call frame and save caller info
         self.state.call_stack.push(Frame {
-            callee_info: cinfo,
+            func,
             caller_info: CallerInfo {
                 ret_pc: self.state.pc,
-                base_reg: self.state.base,
+                base: self.state.base,
             },
         });
 
         // Jump to callee code
         self.state.base = base;
-        self.state.pc = cinfo.entry_pc;
+        self.state.pc = func.entry_pc;
     }
 
     #[inline(always)]
-    fn calln(&mut self, ret_reg: Reg, func: &NativeFunction) -> VMResult<()> {
-        // Native call convention: args and rets use the same window.
+    fn callh(&mut self, ret_reg: Reg, func: HostFunction) -> VMResult<()> {
+        // Host function call convention: args and rets use the same window.
         // - args are read from  [Rret...Rnarg]
         // - rets are written to [Rret..Rnret]
         //
         // Up to callee not to clobber args before reading from them.
-        // Garbage values obtained if args are read out of bounds.
+        // Garbage values or crash if args are read out of bounds.
         let ret = self.reg_offset(ret_reg);
         (func.func)(&mut self.state.regs[ret..ret + func.nreg as usize])
     }
 
-    fn exec_ret(&mut self) -> bool {
-        match self.state.call_stack.pop() {
-            None => true,
-            Some(frame) => {
-                self.state.base = frame.caller_info.base_reg;
-                self.state.pc = frame.caller_info.ret_pc;
-                false
-            }
-        }
-    }
-
     fn exec_callt(&mut self, i: Instruction) {
-        let cinfo = self.program.funcs[i.bx() as usize];
-        let last = self.reg_offset(cinfo.nreg);
+        let func = self.program.functions[i.bx() as usize];
+        let last = self.reg_offset(func.nreg);
 
         // Grow regs to fit callee's full register count beyond the arg base.
         if last > self.state.regs.len() {
@@ -288,7 +280,7 @@ impl<'p, E: ExtensionOps> VM<'p, E> {
 
         // copy args into the same window
         let start = self.reg_offset(i.a());
-        let end = start + cinfo.narg as usize;
+        let end = start + func.narg as usize;
         self.state.regs.copy_within(start..end, self.state.base);
 
         // Reuse current frame and update the callee info.
@@ -296,36 +288,29 @@ impl<'p, E: ExtensionOps> VM<'p, E> {
         // for caller and tail callee, so we don't need to update
         // callee info.
         if let Some(frame) = self.state.call_stack.last_mut() {
-            frame.callee_info = cinfo;
+            frame.func = func;
             todo!("validate argument above")
         }
 
-        self.state.pc = cinfo.entry_pc;
+        self.state.pc = func.entry_pc;
     }
 
     fn run(&mut self) -> VMResult<()> {
-        while self.state.pc < self.program.bytecode.len() {
-            let i = self.program.bytecode[self.state.pc];
+        while self.state.pc < self.program.instructions.len() {
+            let i = self.program.instructions[self.state.pc];
             self.state.pc += 1;
 
             match i.op() {
                 // Moves
-                Opcode::MOV => self.set_reg_raw(i.a(), self.reg(i.b())),
-                Opcode::CONST => self.set_reg_raw(i.a(), self.program.consts[i.bx() as usize]),
+                Opcode::MOV => self.set_reg_raw(i.a(), self.reg_raw(i.b())),
+                Opcode::CONST => self.set_reg_raw(i.a(), self.program.constants[i.bx() as usize]),
 
                 // Unary operations
-                Opcode::BNOT => {
-                    let a = self.reg(i.b());
-                    self.set_reg(i.a(), !a.get::<bool>());
-                }
-                Opcode::INOT => {
-                    let a = self.reg(i.b());
-                    self.set_reg(i.a(), !a.get::<i64>());
-                }
-                Opcode::UNOT => {
-                    let a = self.reg(i.b());
-                    self.set_reg(i.a(), !a.get::<u64>());
-                }
+                Opcode::INOT => self.set_reg(i.a(), !self.reg::<i64>(i.b())),
+                Opcode::UNOT => self.set_reg(i.a(), !self.reg::<u64>(i.b())),
+                Opcode::INEG => self.set_reg(i.a(), -self.reg::<i64>(i.b())),
+                Opcode::FNEG => self.set_reg(i.a(), -self.reg::<f64>(i.b())),
+                Opcode::BNOT => self.set_reg(i.a(), !self.reg::<bool>(i.b())),
 
                 // Signed integer arithmetic
                 Opcode::IADD => {
@@ -474,43 +459,41 @@ impl<'p, E: ExtensionOps> VM<'p, E> {
                 // Jumps
                 Opcode::JMP => self.state.pc = i.ax() as usize,
                 Opcode::JMP_T => {
-                    if self.reg(i.a()).get::<bool>() {
+                    if self.reg::<bool>(i.a()) {
                         self.state.pc = i.bx() as usize;
                     }
                 }
                 Opcode::JMP_F => {
-                    if !self.reg(i.a()).get::<bool>() {
+                    if !self.reg::<bool>(i.a()) {
                         self.state.pc = i.bx() as usize;
                     }
                 }
 
                 // Calls
                 Opcode::CALL => {
-                    let func = self.program.funcs[i.bx() as usize];
-                    self.call(i.a(), func);
+                    self.call(i.a(), self.program.functions[i.bx() as usize]);
                 }
                 Opcode::CALLR => {
-                    let func = self.reg(i.b()).get::<FunctionPtr>();
-                    let func = self.program.funcs[func as usize];
-                    self.call(i.a(), func);
+                    let func = self.reg::<FunctionPtr>(i.b());
+                    self.call(i.a(), self.program.functions[func as usize]);
                 }
-                Opcode::CALLN => {
-                    let func = &self.program.native_funcs[i.bx() as usize];
-                    self.calln(i.a(), func)?;
+                Opcode::CALLH => {
+                    self.callh(i.a(), self.program.host_functions[i.bx() as usize])?;
                 }
-                Opcode::CALLNR => {
-                    let func_id = self.reg(i.b()).get::<FunctionPtr>() as usize;
-                    let func = &self.program.native_funcs[func_id];
-                    self.calln(i.a(), func)?;
+                Opcode::CALLHR => {
+                    let func = self.reg::<FunctionPtr>(i.b());
+                    self.callh(i.a(), self.program.host_functions[func as usize])?;
                 }
                 Opcode::CALLT => {
                     self.exec_callt(i);
                 }
-                Opcode::RET => {
-                    if self.exec_ret() {
-                        return Ok(());
+                Opcode::RET => match self.state.call_stack.pop() {
+                    Some(frame) => {
+                        self.state.base = frame.caller_info.base;
+                        self.state.pc = frame.caller_info.ret_pc;
                     }
-                }
+                    None => return Ok(()),
+                },
 
                 Opcode::HALT => return Ok(()),
 
@@ -525,25 +508,23 @@ impl<'p, E: ExtensionOps> VM<'p, E> {
     }
 
     pub fn execute(&mut self, entry: FunctionPtr, args: &[Value]) -> VMResult<&[Value]> {
-        // Reset VM state before running top level function.
-        self.reset();
+        let func = self.program.functions[entry as usize];
+        let argc = args.len() as Reg;
 
-        let cinfo = self.program.funcs[entry as usize];
-        let argc = args.len() as u8;
-
-        if cinfo.narg != argc {
+        if func.narg != argc {
             return Err(VMError::InvalidArgCount {
-                exp: cinfo.narg,
+                exp: func.narg,
                 got: argc,
             });
         }
 
-        self.state.regs.resize(cinfo.nreg as usize, Value::ZERO);
+        self.reset();
+        self.state.regs.resize(func.nreg as usize, Value::ZERO);
         self.state.regs[..args.len()].copy_from_slice(args);
         self.state.base = 0;
-        self.state.pc = cinfo.entry_pc;
+        self.state.pc = func.entry_pc;
 
         self.run()?;
-        Ok(&self.state.regs[..cinfo.nret as usize])
+        Ok(&self.state.regs[..func.nret as usize])
     }
 }

@@ -86,56 +86,17 @@ macro_rules! define_opcodes {
 }
 
 define_opcodes! {
-    MOV,
-    CONST,
-    BNOT,
-    INOT,
-    UNOT,
-    INEG,
-    FNEG,
-    IADD,
-    ISUB,
-    IMUL,
-    IDIV,
-    IREM,
-    UADD,
-    USUB,
-    UMUL,
-    UDIV,
-    UREM,
-    FADD,
-    FSUB,
-    FMUL,
-    FDIV,
-    FREM,
-    IEQ,
-    INE,
-    ILT,
-    IGT,
-    ILE,
-    IGE,
-    UEQ,
-    UNE,
-    ULT,
-    UGT,
-    ULE,
-    UGE,
-    FEQ,
-    FNE,
-    FLT,
-    FGT,
-    FLE,
-    FGE,
-    JMP,
-    JMP_T,
-    JMP_F,
-    RET,
-    CALL,
-    CALLT,
-    CALLN,
-    CALLR,
-    CALLNR,
-    HALT,
+    MOV, CONST, // Move ops
+    BNOT, INOT, UNOT, INEG, FNEG, // Unary operations
+    IADD, ISUB, IMUL, IDIV, IREM, // signed int arithmetic
+    UADD, USUB, UMUL, UDIV, UREM, // unsigned int arithmetic
+    FADD, FSUB, FMUL, FDIV, FREM, // floating point arithmetic
+    IEQ, INE, ILT, IGT, ILE, IGE, // signed int comparison
+    UEQ, UNE, ULT, UGT, ULE, UGE, // unsigned int comparison
+    FEQ, FNE, FLT, FGT, FLE, FGE, // floating point comparison
+    JMP, JMP_T, JMP_F, // Jump ops
+    RET, CALL, CALLT, CALLH, CALLR, CALLHR, // Return and call ops
+    HALT, // end program
 }
 
 // Instruction encoding
@@ -460,12 +421,12 @@ pub const fn callr(ret: Reg, func: Reg) -> Instruction {
 
 #[inline(always)]
 pub const fn calln(ret: Reg, func: InstType) -> Instruction {
-    encode_abx(Opcode::CALLN, ret, func)
+    encode_abx(Opcode::CALLH, ret, func)
 }
 
 #[inline(always)]
 pub const fn callnr(ret: Reg, func: Reg) -> Instruction {
-    encode_abc(Opcode::CALLNR, ret, func, R0)
+    encode_abc(Opcode::CALLHR, ret, func, R0)
 }
 
 #[inline(always)]
