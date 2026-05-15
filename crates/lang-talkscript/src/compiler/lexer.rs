@@ -1,5 +1,3 @@
-use simple_ternary::tnr;
-
 use super::token::{Span, Token};
 use crate::{compiler::token::TokenType, tt};
 
@@ -12,21 +10,17 @@ pub enum LexErrorKind {
     UnterminatedString,
     #[error("Invalid escape character `{0}`")]
     InvalidEscape(char),
-    #[error("Malformed number")]
-    MalformedNumber,
     #[error("Invalid suffix `{0}` for token type `{1:?}`")]
     InvalidSuffix(char, TokenType),
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("Lexer error: {kind} encountered at {span:?} \n hint: {hint}")]
-pub struct LexError {
+#[error("{kind} encountered at {span:?}\n{hint}")]
+pub struct LexerError {
     pub kind: LexErrorKind,
     pub span: Span,
-    pub hint: String,
+    pub hint: &'static str,
 }
-
-pub type LexResult<'a> = Result<Token<'a>, LexError>;
 
 pub struct Lexer<'a> {
     input: &'a str,
@@ -80,7 +74,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    pub fn next_token(&mut self) -> LexResult<'a> {
+    pub fn next_token(&mut self) -> Result<Token<'a>, LexerError> {
         self.skip_whitespace();
 
         let Some((o, ch)) = self.current else {
@@ -127,10 +121,10 @@ impl<'a> Lexer<'a> {
             // Idents
             c if c.is_ascii_alphabetic() || c == '_' => Ok(self.make_ident_or_kw(o)),
 
-            c => Err(LexError {
+            c => Err(LexerError {
                 kind: LexErrorKind::UnexpectedChar(c),
                 span: Span::new(o, self.byte_pos, self.line, self.column),
-                hint: tnr! {ch == '`' => "Did you mean a single quote (')?" : ""}.into(),
+                hint: "",
             }),
         }
     }
@@ -234,11 +228,11 @@ impl<'a> Lexer<'a> {
         match self.current {
             Some((_, '=')) => self.make_single(tt![<=], start_byte),
             Some((_, '<')) => self.make_double('=', tt![<<], tt![<<=], start_byte),
-            _ => self.make_token(tt![>], start_byte, &self.input[start_byte..self.byte_pos]),
+            _ => self.make_token(tt![<], start_byte, &self.input[start_byte..self.byte_pos]),
         }
     }
 
-    fn make_string(&mut self, start_byte: usize) -> LexResult<'a> {
+    fn make_string(&mut self, start_byte: usize) -> Result<Token<'a>, LexerError> {
         let start_line = self.line;
         let start_col = self.column;
 
@@ -270,10 +264,10 @@ impl<'a> Lexer<'a> {
                         self.advance();
                     }
                     _ => {
-                        return Err(LexError {
+                        return Err(LexerError {
                             kind: LexErrorKind::InvalidEscape(ch),
                             span: Span::new(byte, end_byte, self.line, self.column),
-                            hint: r#"Valid escapes: \n, \t, \r, \\, \", \'"#.into(),
+                            hint: r#"hint: Valid escapes: \n, \t, \r, \\, \", \'"#,
                         });
                     }
                 },
@@ -285,14 +279,14 @@ impl<'a> Lexer<'a> {
         }
 
         // EOF reached without closing quote
-        Err(LexError {
+        Err(LexerError {
             kind: LexErrorKind::UnterminatedString,
             span: Span::new(start_byte, self.byte_pos, start_line, start_col),
-            hint: r#"Did you forget a closing `"`?"#.into(),
+            hint: r#"hint: Did you forget a closing `"`?"#,
         })
     }
 
-    fn make_number(&mut self, start_byte: usize) -> LexResult<'a> {
+    fn make_number(&mut self, start_byte: usize) -> Result<Token<'a>, LexerError> {
         let mut ty = tt![cint_lit];
         let mut end_byte = start_byte;
 
@@ -315,10 +309,10 @@ impl<'a> Lexer<'a> {
         if let Some((b, ch)) = self.current {
             match (ch, ty) {
                 ('i' | 'u', tt![float_lit]) => {
-                    return Err(LexError {
+                    return Err(LexerError {
                         kind: LexErrorKind::InvalidSuffix(ch, ty),
                         span: Span::new(start_byte, b + ch.len_utf8(), self.line, self.column),
-                        hint: format!("Float literals cannot have integer suffixes"),
+                        hint: "hint: float literals cannot have integer suffixes",
                     });
                 }
 

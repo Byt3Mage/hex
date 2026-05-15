@@ -8,16 +8,16 @@ pub type Ident = SymbolU32;
 macro_rules! define_id {
     ($name:ident) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        pub struct $name(usize);
+        pub struct $name(u32);
 
-        impl From<usize> for $name {
-            fn from(v: usize) -> Self {
+        impl From<u32> for $name {
+            fn from(v: u32) -> Self {
                 Self(v)
             }
         }
 
-        impl From<$name> for usize {
-            fn from(v: $name) -> usize {
+        impl From<$name> for u32 {
+            fn from(v: $name) -> u32 {
                 v.0
             }
         }
@@ -26,6 +26,7 @@ macro_rules! define_id {
 
 pub(crate) use define_id;
 
+#[derive(Debug)]
 pub struct Arena<I, T> {
     items: Vec<T>,
     _marker: PhantomData<I>,
@@ -33,7 +34,7 @@ pub struct Arena<I, T> {
 
 impl<I, T> Arena<I, T>
 where
-    I: From<usize> + Into<usize> + Copy,
+    I: From<u32> + Into<u32> + Copy,
 {
     pub fn new() -> Self {
         Self {
@@ -45,7 +46,7 @@ where
     pub fn insert(&mut self, item: T) -> I {
         let id = self.items.len();
         self.items.push(item);
-        I::from(id)
+        I::from(id as u32)
     }
 
     pub fn get(&self, id: I) -> &T {
@@ -57,7 +58,10 @@ where
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (I, &T)> {
-        self.items.iter().enumerate().map(|(i, t)| (I::from(i), t))
+        self.items
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (I::from(i as u32), t))
     }
 
     pub fn len(&self) -> usize {

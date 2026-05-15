@@ -13,7 +13,7 @@ pub fn disassemble(bytecode: &[Instruction], constants: &[Value]) {
 
 fn print_inst(inst: Instruction, constants: &[Value]) {
     match inst.op() {
-        Opcode::MOV => print!("mov    r{}, r{}", inst.a(), inst.b()),
+        Opcode::COPY => print!("copy   r{}, r{}", inst.a(), inst.b()),
         Opcode::CONST => {
             let idx = inst.bx() as usize;
             let val = if idx < constants.len() {
@@ -24,15 +24,12 @@ fn print_inst(inst: Instruction, constants: &[Value]) {
             print!("const  r{}, {}", inst.a(), val)
         }
 
-        Opcode::IADD => print!("iadd   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
-        Opcode::ISUB => print!("isub   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
-        Opcode::IMUL => print!("imul   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
-        Opcode::IDIV => print!("idiv   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
-        Opcode::IREM => print!("irem   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
+        Opcode::ADD => print!("add   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
+        Opcode::SUB => print!("sub   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
+        Opcode::MUL => print!("mul   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
 
-        Opcode::UADD => print!("uadd   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
-        Opcode::USUB => print!("usub   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
-        Opcode::UMUL => print!("umul   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
+        Opcode::SDIV => print!("idiv   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
+        Opcode::SREM => print!("irem   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
         Opcode::UDIV => print!("udiv   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
         Opcode::UREM => print!("urem   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
 
@@ -42,15 +39,14 @@ fn print_inst(inst: Instruction, constants: &[Value]) {
         Opcode::FDIV => print!("fdiv   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
         Opcode::FREM => print!("frem   r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
 
-        Opcode::IEQ => print!("ieq    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
-        Opcode::INE => print!("ine    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
+        Opcode::EQ => print!("eq    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
+        Opcode::NE => print!("ne    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
+
         Opcode::ILT => print!("ilt    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
         Opcode::IGT => print!("igt    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
         Opcode::ILE => print!("ile    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
         Opcode::IGE => print!("ige    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
 
-        Opcode::UEQ => print!("ueq    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
-        Opcode::UNE => print!("une    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
         Opcode::ULT => print!("ult    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
         Opcode::UGT => print!("ugt    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
         Opcode::ULE => print!("ule    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
@@ -63,23 +59,19 @@ fn print_inst(inst: Instruction, constants: &[Value]) {
         Opcode::FLE => print!("fle    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
         Opcode::FGE => print!("fge    r{}, r{}, r{}", inst.a(), inst.b(), inst.c()),
 
+        Opcode::NOT => print!("not   r{}, r{}", inst.a(), inst.b()),
         Opcode::BNOT => print!("bnot   r{}, r{}", inst.a(), inst.b()),
-        Opcode::INOT => print!("inot   r{}, r{}", inst.a(), inst.b()),
-        Opcode::UNOT => print!("unot   r{}, r{}", inst.a(), inst.b()),
         Opcode::INEG => print!("ineg   r{}, r{}", inst.a(), inst.b()),
         Opcode::FNEG => print!("fneg   r{}, r{}", inst.a(), inst.b()),
 
         Opcode::JMP => print!("jmp    @{}", inst.ax()),
-        Opcode::JMP_T => print!("jmp_t  r{}, @{}", inst.a(), inst.bx()),
-        Opcode::JMP_F => print!("jmp_f  r{}, @{}", inst.a(), inst.bx()),
+        Opcode::JMP_T => print!("jmpt  r{}, @{}", inst.a(), inst.bx()),
+        Opcode::JMP_F => print!("jmpf  r{}, @{}", inst.a(), inst.bx()),
 
         Opcode::CALL => print!("call   r{}, fn{}", inst.a(), inst.bx()),
         Opcode::CALLR => print!("callr  r{}, r{}", inst.a(), inst.b()),
-        Opcode::CALLH => print!("callh  r{}, native{}", inst.a(), inst.bx()),
-        Opcode::CALLHR => print!("callhr r{}, r{}", inst.a(), inst.b()),
-        Opcode::CALLT => print!("callt  r{}, fn{}", inst.a(), inst.bx()),
-
         Opcode::RET => print!("ret"),
+
         Opcode::HALT => print!("halt"),
 
         op => print!("??? op={}", op),

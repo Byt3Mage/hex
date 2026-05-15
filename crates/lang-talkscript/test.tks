@@ -1,4 +1,9 @@
-fn test_opt(a: int, b: int, c: int): [int; 4u] {
-    let d: int = a + b + c;
-    [a; 4u]
+fn abs(n: uint): uint {
+    if n < 0 {-n} else {n}
+}
+
+mod math {
+    fn square(n: int): int {
+        n * n
+    }
 }

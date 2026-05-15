@@ -1,8 +1,8 @@
 
 [workspace]
 members = [
-    "crates/hex-gc",
     "crates/hex-mir",
+    "crates/hex-runtime",
     "crates/hex-vm",
     "crates/lang-talkscript",
 ]

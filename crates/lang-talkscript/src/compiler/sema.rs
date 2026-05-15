@@ -1,78 +1,59 @@
-use std::ops::Deref;
-
 use ahash::AHashMap;
-use hex_mir::{self as hxm};
+use hex_mir::ConstVal;
 
 use crate::{
     arena::Ident,
     compiler::{
         ast::{Ast, BinOp, ExprId, ExprKind, Param, Stmt, StmtKind, UnOp},
-        sema::{
-            comptime::{ComptimeEval, ComptimeEvalError, ComptimeVal},
-            sema_type::{SemaTy, TypeError},
-        },
+        ir,
     },
 };
 
+use comptime::{ComptimeEval, ComptimeEvalError, ComptimeVal};
+use types::Ty;
+
 pub mod comptime;
-pub mod sema_type;
+pub mod typed_ast;
+pub mod types;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SemaError {
     #[error("undefined variable: {0:?}")]
     UndefinedVariable(Ident),
     #[error("type mismatch: expected {exp}, got {got}")]
-    TypeMismatch { exp: SemaTy, got: SemaTy },
+    TypeMismatch { exp: Ty, got: Ty },
     #[error("unsupported binary op {0} for lhs: {1} and rhs: {2}")]
-    InvalidBinOp(BinOp, SemaTy, SemaTy),
+    InvalidBinOp(BinOp, Ty, Ty),
     #[error("unsupported unary op {0} for type {1}")]
-    InvalidUnOp(UnOp, SemaTy),
+    InvalidUnOp(UnOp, Ty),
     #[error("comptime evaluation error: {0}")]
     ComptimeEvalError(#[from] ComptimeEvalError),
-    #[error("mir codegen error: {0}")]
-    MirCodegenError(#[from] hxm::MirError),
     #[error("attempted field access on non-struct/union type: {0}")]
-    InvalidFieldAccess(SemaTy),
+    InvalidFieldAccess(Ty),
     #[error("invalid optional field access on non-optional type: {0}")]
-    InvalidOptFieldAccess(SemaTy),
-    #[error(transparent)]
-    TypeError(#[from] TypeError),
+    InvalidOptFieldAccess(Ty),
+    #[error("integer literal {val} out of range for {tgt}")]
+    IntLitOutOfRange { val: u64, tgt: Ty },
+    #[error("division by zero in comptime evaluation")]
+    DivisionByZero,
 }
 
 #[derive(Debug, Clone)]
-struct ExprResult {
-    base: hxm::Val,
-    ty: SemaTy,
-}
+struct Expr(Ty, Vec<ir::Val>);
 
-const VOID_EXPR: ExprResult = ExprResult {
-    base: hxm::ZERO_VAL,
-    ty: SemaTy::Void,
-};
-
-const NEVER_EXPR: ExprResult = ExprResult {
-    base: hxm::ZERO_VAL,
-    ty: SemaTy::Never,
-};
-
-impl ExprResult {
-    fn vals(&self) -> impl Iterator<Item = hxm::Val> {
-        (0..self.ty.width()).map(|i| self.base.add(i as hxm::RegTy))
-    }
-
-    fn field(&self, offset: usize) -> hxm::Val {
-        self.base.add(offset as hxm::RegTy)
-    }
-}
+const VOID_EXPR: Expr = Expr(Ty::Void, vec![]);
+const NEVER_EXPR: Expr = Expr(Ty::Never, vec![]);
+const NULL_EXPR: Expr = Expr(Ty::Null, vec![]);
 
 struct Binding {
-    value: ExprResult,
+    value: Expr,
     mutable: bool,
 }
 
 pub struct Sema<'a> {
     ast: &'a Ast,
-    func: hxm::FunctionBuilder,
+    func: ir::FunctionBuilder,
+    ret_ty: Ty,
     scopes: Vec<AHashMap<Ident, Binding>>,
     comp_eval: ComptimeEval<'a>,
 }
@@ -86,7 +67,7 @@ impl<'a> Sema<'a> {
         self.scopes.pop();
     }
 
-    fn define(&mut self, name: Ident, value: ExprResult, mutable: bool) {
+    fn define(&mut self, name: Ident, value: Expr, mutable: bool) {
         self.scopes
             .last_mut()
             .unwrap()
@@ -103,65 +84,117 @@ impl<'a> Sema<'a> {
         Err(SemaError::UndefinedVariable(name))
     }
 
-    fn lower_expr(&mut self, expr_id: ExprId) -> Result<ExprResult, SemaError> {
+    #[inline(always)]
+    fn emit(&mut self, inst: ir::Inst) {
+        self.func.emit(inst);
+    }
+
+    #[inline(always)]
+    fn constant(&mut self, dst: ir::Val, val: ConstVal) {
+        self.emit(ir::Inst::Const { dst, val });
+    }
+
+    fn alloc(&mut self, ty: &[ir::Ty]) -> Vec<ir::Val> {
+        ty.iter().map(|&t| self.func.new_val(t)).collect()
+    }
+
+    fn lower_expr(&mut self, expr_id: ExprId, expected: Option<&Ty>) -> Result<Expr, SemaError> {
         let expr = self.ast.expr(expr_id);
 
         let result = match &expr.kind {
-            ExprKind::VoidLit => VOID_EXPR,
+            ExprKind::CintLit(c) => {
+                let tgt = match expected {
+                    Some(Ty::Uint) => Ty::Uint,
+                    Some(Ty::Int) | None => Ty::Int,
+                    _ => Ty::Int,
+                };
+
+                let val = *c;
+
+                match tgt {
+                    Ty::Int => {
+                        if val > i64::MAX as u64 {
+                            return Err(SemaError::IntLitOutOfRange { val, tgt });
+                        }
+                        let dst = self.func.new_val(ir::Ty::Int);
+                        self.emit(ir::Inst::Const {
+                            dst,
+                            val: ir::ConstVal::Int(val as i64),
+                        });
+                        Expr(tgt, vec![dst])
+                    }
+                    Ty::Uint => {
+                        let dst = self.func.new_val(ir::Ty::Uint);
+                        self.emit(ir::Inst::Const {
+                            dst,
+                            val: ir::ConstVal::Uint(val),
+                        });
+                        Expr(tgt, vec![dst])
+                    }
+                    _ => unreachable!(),
+                }
+            }
             ExprKind::IntLit(i) => {
-                let base = self.func.alloc_n(1)?;
-                let ty = SemaTy::Int;
-                self.func.load_int(base, *i);
-                ExprResult { base, ty }
+                let dst = self.func.new_val(ir::Ty::Int);
+                self.constant(dst, ir::ConstVal::Int(*i));
+                Expr(Ty::Int, vec![dst])
             }
             ExprKind::UintLit(u) => {
-                let base = self.func.alloc_n(1)?;
-                let ty = SemaTy::Uint;
-                self.func.load_uint(base, *u);
-                ExprResult { base, ty }
+                let dst = self.func.new_val(ir::Ty::Uint);
+                self.constant(dst, ir::ConstVal::Uint(*u));
+                Expr(Ty::Uint, vec![dst])
             }
             ExprKind::BoolLit(b) => {
-                let base = self.func.alloc_n(1)?;
-                let ty = SemaTy::Bool;
-                self.func.load_bool(base, *b);
-                ExprResult { base, ty }
+                let dst = self.func.new_val(ir::Ty::Bool);
+                self.constant(dst, ir::ConstVal::Bool(*b));
+                Expr(Ty::Bool, vec![dst])
             }
             ExprKind::FloatLit(f) => {
-                let base = self.func.alloc_n(1)?;
-                let ty = SemaTy::Float;
-                self.func.load_float(base, *f);
-                ExprResult { base, ty }
+                let dst = self.func.new_val(ir::Ty::Float);
+                self.constant(dst, ir::ConstVal::Float(*f));
+                Expr(Ty::Float, vec![dst])
             }
-
-            ExprKind::NullLit => todo!(),
-            ExprKind::ArrayLit(elems) => self.lower_arr_lit(elems)?,
-            ExprKind::ArrayRep { value, count } => self.lower_arr_rep(*value, *count)?,
-
+            ExprKind::VoidLit => VOID_EXPR,
+            ExprKind::NullLit => NULL_EXPR,
+            ExprKind::ArrayLit(elems) => {
+                let elem_expected = match expected {
+                    Some(Ty::Array { elem_ty, .. }) => Some(elem_ty.as_ref()),
+                    _ => None,
+                };
+                self.lower_arr_lit(elems, elem_expected)?
+            }
+            ExprKind::ArrayRep { value, count } => {
+                let elem_expected = match expected {
+                    Some(Ty::Array { elem_ty, .. }) => Some(elem_ty.as_ref()),
+                    _ => None,
+                };
+                self.lower_arr_rep(*value, *count, elem_expected)?
+            }
             ExprKind::Ident(name) => self.lookup(*name)?.value.clone(),
-            ExprKind::Group(inner) => self.lower_expr(*inner)?,
-            ExprKind::Binary { op, lhs, rhs } => self.lower_binary(*op, *lhs, *rhs)?,
-            ExprKind::Unary { op, rhs } => self.lower_unary(*op, *rhs)?,
-            ExprKind::Block(stmts) => self.lower_block(stmts)?,
+            ExprKind::Group(inner) => self.lower_expr(*inner, expected)?,
+            ExprKind::Binary { op, lhs, rhs } => self.lower_binary(*op, *lhs, *rhs, expected)?,
+            ExprKind::Unary { op, rhs } => self.lower_unary(*op, *rhs, None)?,
+            ExprKind::Block(stmts) => self.lower_block(stmts, None)?,
 
             ExprKind::If {
                 cond,
                 then_branch,
                 else_branch,
-            } => self.lower_if(*cond, *then_branch, *else_branch)?,
+            } => self.lower_if(*cond, *then_branch, *else_branch, None)?,
 
             ExprKind::Return(value) => self.lower_return(*value)?,
             ExprKind::StructLit { ty, fields } => todo!(),
             ExprKind::Assign { op, tgt, val } => todo!(),
-            ExprKind::Cast { expr, ty } => todo!(),
             ExprKind::While { cond, body } => todo!(),
             ExprKind::Loop(expr_id) => todo!(),
             ExprKind::Break(expr_id) => todo!(),
             ExprKind::Continue => todo!(),
             ExprKind::Call { callee, args } => todo!(),
-            ExprKind::Field { object, field } => self.lower_field(*object, *field)?,
-            ExprKind::OptField { object, field } => self.lower_opt_field(*object, *field)?,
+            ExprKind::Field { object, field } => self.lower_field(*object, *field, None)?,
+            ExprKind::OptField { object, field } => self.lower_opt_field(*object, *field, None)?,
             ExprKind::Index { object, index } => todo!(),
             ExprKind::Comptime(expr_id) => todo!(),
+
             ExprKind::IntType => todo!(),
             ExprKind::UintType => todo!(),
             ExprKind::BoolType => todo!(),
@@ -178,110 +211,92 @@ impl<'a> Sema<'a> {
         op: BinOp,
         lhs: ExprId,
         rhs: ExprId,
-    ) -> Result<ExprResult, SemaError> {
-        let lhs = self.lower_expr(lhs)?;
-        let rhs = self.lower_expr(rhs)?;
+        expected: Option<&Ty>,
+    ) -> Result<Expr, SemaError> {
+        let lhs_expected = if op.is_comparison() { None } else { expected };
+        let Expr(lhs_ty, lhs) = self.lower_expr(lhs, lhs_expected)?;
+        let Expr(rhs_ty, rhs) = self.lower_expr(rhs, Some(&lhs_ty))?;
 
-        let result = match (op, &lhs.ty, &rhs.ty) {
-            (BinOp::Add, SemaTy::Int, SemaTy::Int) => ExprResult {
-                base: self.func.binop(hxm::BinOp::IAdd, lhs.base, rhs.base)?,
-                ty: SemaTy::Int,
-            },
-            (BinOp::Sub, SemaTy::Int, SemaTy::Int) => ExprResult {
-                base: self.func.binop(hxm::BinOp::ISub, lhs.base, rhs.base)?,
-                ty: SemaTy::Int,
-            },
-            (BinOp::Mul, SemaTy::Int, SemaTy::Int) => ExprResult {
-                base: self.func.binop(hxm::BinOp::IMul, lhs.base, rhs.base)?,
-                ty: SemaTy::Int,
-            },
-            (BinOp::Div, SemaTy::Int, SemaTy::Int) => ExprResult {
-                base: self.func.binop(hxm::BinOp::IDiv, lhs.base, rhs.base)?,
-                ty: SemaTy::Int,
-            },
-            (BinOp::Rem, SemaTy::Int, SemaTy::Int) => ExprResult {
-                base: self.func.binop(hxm::BinOp::IRem, lhs.base, rhs.base)?,
-                ty: SemaTy::Int,
-            },
+        let (op, ty, ir_ty) = match (op, lhs_ty, rhs_ty) {
+            (BinOp::Add, Ty::Int, Ty::Int) => (ir::BinOp::Add, Ty::Int, ir::Ty::Int),
+            (BinOp::Sub, Ty::Int, Ty::Int) => (ir::BinOp::Sub, Ty::Int, ir::Ty::Int),
+            (BinOp::Mul, Ty::Int, Ty::Int) => (ir::BinOp::Mul, Ty::Int, ir::Ty::Int),
+            (BinOp::Div, Ty::Int, Ty::Int) => (ir::BinOp::SDiv, Ty::Int, ir::Ty::Int),
+            (BinOp::Rem, Ty::Int, Ty::Int) => (ir::BinOp::SRem, Ty::Int, ir::Ty::Int),
 
-            (BinOp::Add, SemaTy::Uint, SemaTy::Uint) => ExprResult {
-                base: self.func.binop(hxm::BinOp::UAdd, lhs.base, rhs.base)?,
-                ty: SemaTy::Uint,
-            },
-            (BinOp::Sub, SemaTy::Uint, SemaTy::Uint) => ExprResult {
-                base: self.func.binop(hxm::BinOp::USub, lhs.base, rhs.base)?,
-                ty: SemaTy::Uint,
-            },
-            (BinOp::Mul, SemaTy::Uint, SemaTy::Uint) => ExprResult {
-                base: self.func.binop(hxm::BinOp::UMul, lhs.base, rhs.base)?,
-                ty: SemaTy::Uint,
-            },
-            (BinOp::Div, SemaTy::Uint, SemaTy::Uint) => ExprResult {
-                base: self.func.binop(hxm::BinOp::UDiv, lhs.base, rhs.base)?,
-                ty: SemaTy::Uint,
-            },
-            (BinOp::Rem, SemaTy::Uint, SemaTy::Uint) => ExprResult {
-                base: self.func.binop(hxm::BinOp::URem, lhs.base, rhs.base)?,
-                ty: SemaTy::Uint,
-            },
+            (BinOp::Add, Ty::Uint, Ty::Uint) => (ir::BinOp::Add, Ty::Uint, ir::Ty::Uint),
+            (BinOp::Sub, Ty::Uint, Ty::Uint) => (ir::BinOp::Sub, Ty::Uint, ir::Ty::Uint),
+            (BinOp::Mul, Ty::Uint, Ty::Uint) => (ir::BinOp::Mul, Ty::Uint, ir::Ty::Uint),
+            (BinOp::Div, Ty::Uint, Ty::Uint) => (ir::BinOp::UDiv, Ty::Uint, ir::Ty::Uint),
+            (BinOp::Rem, Ty::Uint, Ty::Uint) => (ir::BinOp::URem, Ty::Uint, ir::Ty::Uint),
 
-            (BinOp::Add, SemaTy::Float, SemaTy::Float) => ExprResult {
-                base: self.func.binop(hxm::BinOp::FAdd, lhs.base, rhs.base)?,
-                ty: SemaTy::Float,
-            },
-            (BinOp::Sub, SemaTy::Float, SemaTy::Float) => ExprResult {
-                base: self.func.binop(hxm::BinOp::FSub, lhs.base, rhs.base)?,
-                ty: SemaTy::Float,
-            },
-            (BinOp::Mul, SemaTy::Float, SemaTy::Float) => ExprResult {
-                base: self.func.binop(hxm::BinOp::FMul, lhs.base, rhs.base)?,
-                ty: SemaTy::Float,
-            },
-            (BinOp::Div, SemaTy::Float, SemaTy::Float) => ExprResult {
-                base: self.func.binop(hxm::BinOp::FDiv, lhs.base, rhs.base)?,
-                ty: SemaTy::Float,
-            },
-            (BinOp::Rem, SemaTy::Float, SemaTy::Float) => ExprResult {
-                base: self.func.binop(hxm::BinOp::FRem, lhs.base, rhs.base)?,
-                ty: SemaTy::Float,
-            },
-            _ => return Err(SemaError::InvalidBinOp(op, lhs.ty, rhs.ty)),
+            (BinOp::Eq, Ty::Int, Ty::Int) => (ir::BinOp::Eq, Ty::Bool, ir::Ty::Bool),
+            (BinOp::Ne, Ty::Int, Ty::Int) => (ir::BinOp::Ne, Ty::Bool, ir::Ty::Bool),
+            (BinOp::Eq, Ty::Uint, Ty::Uint) => (ir::BinOp::Eq, Ty::Bool, ir::Ty::Bool),
+            (BinOp::Ne, Ty::Uint, Ty::Uint) => (ir::BinOp::Ne, Ty::Bool, ir::Ty::Bool),
+
+            (BinOp::Gt, Ty::Int, Ty::Int) => (ir::BinOp::SGt, Ty::Bool, ir::Ty::Bool),
+            (BinOp::Lt, Ty::Int, Ty::Int) => (ir::BinOp::SLt, Ty::Bool, ir::Ty::Bool),
+            (BinOp::Ge, Ty::Int, Ty::Int) => (ir::BinOp::SGe, Ty::Bool, ir::Ty::Bool),
+            (BinOp::Le, Ty::Int, Ty::Int) => (ir::BinOp::SLe, Ty::Bool, ir::Ty::Bool),
+
+            (BinOp::Gt, Ty::Uint, Ty::Uint) => (ir::BinOp::UGt, Ty::Bool, ir::Ty::Bool),
+            (BinOp::Lt, Ty::Uint, Ty::Uint) => (ir::BinOp::ULt, Ty::Bool, ir::Ty::Bool),
+            (BinOp::Ge, Ty::Uint, Ty::Uint) => (ir::BinOp::UGe, Ty::Bool, ir::Ty::Bool),
+            (BinOp::Le, Ty::Uint, Ty::Uint) => (ir::BinOp::ULe, Ty::Bool, ir::Ty::Bool),
+
+            (BinOp::Gt, Ty::Float, Ty::Float) => (ir::BinOp::FGt, Ty::Bool, ir::Ty::Bool),
+            (BinOp::Lt, Ty::Float, Ty::Float) => (ir::BinOp::FLt, Ty::Bool, ir::Ty::Bool),
+            (BinOp::Ge, Ty::Float, Ty::Float) => (ir::BinOp::FGe, Ty::Bool, ir::Ty::Bool),
+            (BinOp::Le, Ty::Float, Ty::Float) => (ir::BinOp::FLe, Ty::Bool, ir::Ty::Bool),
+
+            (BinOp::Coalesce, Ty::Optional(inner), rhs_ty) if *inner == rhs_ty => {
+                todo!("null coalesce")
+            }
+
+            (op, lhs, rhs) => return Err(SemaError::InvalidBinOp(op, lhs, rhs)),
         };
 
-        Ok(result)
+        let dst = self.func.new_val(ir_ty);
+        self.func.emit(ir::Inst::Binary {
+            dst,
+            op,
+            lhs: lhs[0],
+            rhs: rhs[0],
+        });
+
+        Ok(Expr(ty, vec![dst]))
     }
 
-    fn lower_unary(&mut self, op: UnOp, rhs: ExprId) -> Result<ExprResult, SemaError> {
-        let rhs = self.lower_expr(rhs)?;
-        let result = match (op, &rhs.ty) {
-            (UnOp::Neg, SemaTy::Int) => ExprResult {
-                base: self.func.unop(hxm::UnOp::INeg, rhs.base)?,
-                ty: SemaTy::Int,
-            },
-            (UnOp::Neg, SemaTy::Float) => ExprResult {
-                base: self.func.unop(hxm::UnOp::FNeg, rhs.base)?,
-                ty: SemaTy::Float,
-            },
+    fn lower_unary(
+        &mut self,
+        op: UnOp,
+        rhs: ExprId,
+        expected: Option<&Ty>,
+    ) -> Result<Expr, SemaError> {
+        let Expr(rhs_ty, rhs) = self.lower_expr(rhs, expected)?;
 
-            (UnOp::Not, SemaTy::Int) => ExprResult {
-                base: self.func.unop(hxm::UnOp::INot, rhs.base)?,
-                ty: SemaTy::Int,
-            },
-            (UnOp::Not, SemaTy::Uint) => ExprResult {
-                base: self.func.unop(hxm::UnOp::UNot, rhs.base)?,
-                ty: SemaTy::Uint,
-            },
-            (UnOp::Not, SemaTy::Bool) => ExprResult {
-                base: self.func.unop(hxm::UnOp::BNot, rhs.base)?,
-                ty: SemaTy::Bool,
-            },
-            _ => return Err(SemaError::InvalidUnOp(op, rhs.ty)),
+        let (op, ty, ir_ty) = match (op, rhs_ty) {
+            (UnOp::Not, Ty::Int) => (ir::UnOp::Not, Ty::Int, ir::Ty::Int),
+            (UnOp::Not, Ty::Uint) => (ir::UnOp::Not, Ty::Uint, ir::Ty::Uint),
+            (UnOp::Not, Ty::Bool) => (ir::UnOp::BNot, Ty::Bool, ir::Ty::Bool),
+            (UnOp::Neg, Ty::Int) => (ir::UnOp::INeg, Ty::Int, ir::Ty::Int),
+            (UnOp::Neg, Ty::Float) => (ir::UnOp::FNeg, Ty::Float, ir::Ty::Float),
+
+            (op, ty) => return Err(SemaError::InvalidUnOp(op, ty)),
         };
 
-        Ok(result)
+        let dst = self.func.new_val(ir_ty);
+        self.emit(ir::Inst::Unary {
+            dst,
+            op,
+            src: rhs[0],
+        });
+
+        Ok(Expr(ty, vec![dst]))
     }
 
-    fn lower_block(&mut self, stmts: &[Stmt]) -> Result<ExprResult, SemaError> {
+    fn lower_block(&mut self, stmts: &[Stmt], expected: Option<&Ty>) -> Result<Expr, SemaError> {
         self.push_scope();
 
         let last = stmts.len() - 1;
@@ -295,46 +310,41 @@ impl<'a> Sema<'a> {
                     value,
                     mutable,
                 } => {
-                    let val = self.lower_expr(*value)?;
-
-                    let expr = match ty {
-                        Some(ty) => {
-                            let ty = self.comp_eval.eval_type(*ty)?;
-                            let base = self.func.alloc_n(ty.width())?;
-                            self.coerce(base, &ty, &val)?;
-                            ExprResult { base, ty }
-                        }
-                        None => {
-                            let base = self.func.alloc_n(val.ty.width())?;
-                            self.func.assign(base, val.vals().collect());
-                            ExprResult { base, ty: val.ty }
-                        }
+                    let tgt_ty = match ty {
+                        Some(ty_expr) => Some(self.comp_eval.eval_type(*ty_expr)?),
+                        None => None,
                     };
 
-                    self.define(*name, expr, *mutable);
+                    let val = self.lower_expr(*value, tgt_ty.as_ref())?;
+
+                    let bound = match &tgt_ty {
+                        None => val,
+                        Some(t) => self.coerce(t, val)?,
+                    };
+
+                    self.define(*name, bound, *mutable);
                     result = VOID_EXPR;
                 }
 
                 StmtKind::Semi(expr_id) => {
                     // Lower expression, but result is supressed.
                     // Diverging expressions always diverge the block.
-                    let val = self.lower_expr(*expr_id)?;
-                    result = match val.ty {
-                        SemaTy::Never => NEVER_EXPR,
+                    let Expr(val_ty, _) = self.lower_expr(*expr_id, None)?;
+                    result = match val_ty {
+                        Ty::Never => NEVER_EXPR,
                         _ => VOID_EXPR,
                     };
                 }
 
                 StmtKind::Expr(expr_id) => {
-                    let val = self.lower_expr(*expr_id)?;
-
                     // Expression without semicolon must be the last or coerce to void type.
                     // We use coerce instead of direct comparison to support diverging expressions.
                     // E.g. `return (x, y)` // no semi colon.
+                    let val = self.lower_expr(*expr_id, if i == last { expected } else { None })?;
                     if i == last {
                         result = val;
                     } else {
-                        self.coerce(VOID_EXPR.base, &VOID_EXPR.ty, &val)?;
+                        self.coerce(&Ty::Void, val)?;
                     }
                 }
             }
@@ -349,161 +359,238 @@ impl<'a> Sema<'a> {
         cond: ExprId,
         then_expr: ExprId,
         else_expr: Option<ExprId>,
-    ) -> Result<ExprResult, SemaError> {
-        let cond = self.lower_expr(cond)?;
+        expected: Option<&Ty>,
+    ) -> Result<Expr, SemaError> {
+        let cond = self.lower_expr(cond, expected)?;
+        let Expr(_, cond) = self.coerce(&Ty::Bool, cond)?;
 
-        let then_block = self.func.begin_block(vec![]);
-        let else_block = self.func.begin_block(vec![]);
+        let then_blk = self.func.new_block();
+        let else_blk = self.func.new_block();
+        let join_blk = self.func.new_block();
 
-        todo!()
-    }
+        self.func.set_term(ir::Term::Branch {
+            cond: cond[0],
+            then_blk,
+            then_args: vec![],
+            else_blk,
+            else_args: vec![],
+        });
 
-    fn lower_return(&mut self, value: Option<ExprId>) -> Result<ExprResult, SemaError> {
-        todo!()
-    }
+        self.func.switch_to(then_blk);
+        let Expr(then_ty, then_res) = self.lower_expr(then_expr, expected)?;
+        let then_terminates = matches!(then_ty, Ty::Never);
 
-    fn lower_arr_lit(&mut self, elems: &[ExprId]) -> Result<ExprResult, SemaError> {
-        let [first, rest @ ..] = elems else {
-            todo!("handle empty array")
+        self.func.switch_to(else_blk);
+        let Expr(else_ty, else_res) = match else_expr {
+            Some(e) => self.lower_expr(e, expected)?,
+            None => VOID_EXPR,
+        };
+        let else_terminates = matches!(else_ty, Ty::Never);
+
+        // Determine the unified result type.
+        let res_ty = match (then_terminates, else_terminates) {
+            (true, true) => {
+                // Both branches diverge. No join block needed; just close out
+                // both branches with whatever they ended on (presumably already
+                // terminated). The if-expression's type is Never.
+                return Ok(NEVER_EXPR);
+            }
+            (true, false) => else_ty.clone(),
+            (false, true) => then_ty.clone(),
+            (false, false) => {
+                // TODO: proper unify
+                if then_ty != else_ty {
+                    return Err(SemaError::TypeMismatch {
+                        exp: then_ty,
+                        got: else_ty,
+                    });
+                }
+                then_ty.clone()
+            }
         };
 
-        let first = self.lower_expr(*first)?;
-        let width = first.ty.width();
-        let len = elems.len();
+        let res_vals: Vec<ir::Val> = res_ty
+            .to_ir()
+            .iter()
+            .map(|&t| self.func.add_param(join_blk, t))
+            .collect();
 
-        let base = self.func.alloc_n(width * len)?;
-        self.coerce(base, &first.ty, &first)?;
-
-        let width = width as hxm::RegTy;
-        let mut dst = base;
-
-        for elem in rest {
-            dst = dst.add(width);
-            let elem = self.lower_expr(*elem)?;
-            self.coerce(dst, &first.ty, &elem)?;
+        if !then_terminates {
+            self.func.switch_to(then_blk);
+            self.func.set_term(ir::Term::Jump {
+                tgt: join_blk,
+                args: then_res,
+            });
         }
 
-        Ok(ExprResult {
-            base,
-            ty: SemaTy::Array {
-                elem_ty: Box::new(first.ty),
-                len,
-            },
-        })
+        if !else_terminates {
+            self.func.switch_to(else_blk);
+            self.func.set_term(ir::Term::Jump {
+                tgt: join_blk,
+                args: else_res,
+            });
+        }
+
+        self.func.switch_to(join_blk);
+
+        Ok(Expr(res_ty, res_vals))
     }
 
-    fn lower_arr_rep(&mut self, value: ExprId, count: ExprId) -> Result<ExprResult, SemaError> {
-        let value = self.lower_expr(value)?;
+    fn lower_return(&mut self, value: Option<ExprId>) -> Result<Expr, SemaError> {
+        let ret_ty = self.ret_ty.clone();
+
+        let val = match value {
+            Some(expr) => self.lower_expr(expr, Some(&ret_ty))?,
+            None => VOID_EXPR,
+        };
+
+        let Expr(_, vals) = self.coerce(&ret_ty, val)?;
+        self.func.set_term(ir::Term::Return { vals });
+        Ok(NEVER_EXPR)
+    }
+
+    fn lower_arr_lit(
+        &mut self,
+        elems: &[ExprId],
+        expected: Option<&Ty>,
+    ) -> Result<Expr, SemaError> {
+        let [first, rest @ ..] = elems else {
+            todo!("lower empty array")
+        };
+
+        let Expr(first_ty, first) = self.lower_expr(*first, expected)?;
+        let ty = Ty::array(first_ty.clone(), elems.len());
+        let mut vals = first.clone();
+
+        for elem in rest {
+            let elem = self.lower_expr(*elem, expected)?;
+            let Expr(_, elem) = self.coerce(&first_ty, elem)?;
+            vals.extend(elem);
+        }
+
+        Ok(Expr(ty, vals))
+    }
+
+    fn lower_arr_rep(
+        &mut self,
+        value: ExprId,
+        count: ExprId,
+        expected: Option<&Ty>,
+    ) -> Result<Expr, SemaError> {
+        let Expr(val_ty, value) = self.lower_expr(value, expected)?;
         let len = match self.comp_eval.eval(count)? {
             ComptimeVal::Uint(len) => len as usize,
             val => {
                 return Err(SemaError::TypeMismatch {
-                    exp: SemaTy::Uint,
-                    got: val.sema_type(),
+                    exp: Ty::Uint,
+                    got: self.comp_eval.value_ty(&val),
                 });
             }
         };
 
-        debug_assert!(len != 0);
-
-        let base = self.func.alloc_n(value.ty.width() * len)?;
-        let vals = (0..len).flat_map(|_| value.vals()).collect();
-        self.func.assign(base, vals);
-
-        Ok(ExprResult {
-            base,
-            ty: SemaTy::Array {
-                elem_ty: Box::new(value.ty),
-                len,
-            },
-        })
+        let ty = Ty::array(val_ty.clone(), len);
+        let mut vals = Vec::with_capacity(value.len() * len);
+        (0..len).for_each(|_| vals.extend(&value));
+        Ok(Expr(ty, vals))
     }
 
-    fn lower_field(&mut self, object: ExprId, field: Ident) -> Result<ExprResult, SemaError> {
-        let object = self.lower_expr(object)?;
+    fn lower_field(
+        &mut self,
+        object: ExprId,
+        field: Ident,
+        expected: Option<&Ty>,
+    ) -> Result<Expr, SemaError> {
+        let Expr(obj_ty, obj) = self.lower_expr(object, expected)?;
 
-        match &object.ty {
-            SemaTy::Struct(ty) => {
-                let field = ty.field(field)?;
-                Ok(ExprResult {
-                    base: object.field(field.offset),
-                    ty: field.ty.clone(),
-                })
+        match &obj_ty {
+            Ty::Struct(ty) => {
+                let (offset, field) = ty.field(field).unwrap();
+                let ty = field.ty.clone();
+                let vals = Vec::from(&obj[offset..offset + ty.size()]);
+                Ok(Expr(ty, vals))
             }
-            SemaTy::Union(ty) => {
-                let field = ty.field(field)?;
-
-                // TODO: lower field access for union
-                // Compare tag, then create optional aggregate
-
-                Ok(ExprResult {
-                    base: object.field(field.offset),
-                    ty: SemaTy::Optional(Box::new(field.ty.clone())),
-                })
+            Ty::Union(ty) => {
+                let (idx, field) = ty.field(field).unwrap();
+                let field_tag = self.func.new_val(ir::Ty::Uint);
+                let opt_tag = self.func.new_val(ir::Ty::Bool);
+                self.constant(field_tag, ir::ConstVal::Uint(idx as u64));
+                self.emit(ir::Inst::Binary {
+                    dst: opt_tag,
+                    op: ir::BinOp::Eq,
+                    lhs: obj[0],
+                    rhs: field_tag,
+                });
+                let mut vals = vec![opt_tag];
+                vals.extend(&obj[1..1 + field.ty.size()]);
+                Ok(Expr(Ty::option(field.ty.clone()), vals))
             }
-            _ => Err(SemaError::InvalidFieldAccess(object.ty)),
+            _ => Err(SemaError::InvalidFieldAccess(obj_ty)),
         }
     }
 
-    fn lower_opt_field(&mut self, object: ExprId, field: Ident) -> Result<ExprResult, SemaError> {
-        let object = self.lower_expr(object)?;
-        let SemaTy::Optional(obj_ty) = &object.ty else {
-            return Err(SemaError::InvalidOptFieldAccess(object.ty));
+    fn lower_opt_field(
+        &mut self,
+        object: ExprId,
+        field: Ident,
+        expected: Option<&Ty>,
+    ) -> Result<Expr, SemaError> {
+        let Expr(obj_ty, obj) = self.lower_expr(object, expected)?;
+        let Ty::Optional(obj_ty) = obj_ty else {
+            return Err(SemaError::InvalidOptFieldAccess(obj_ty));
         };
 
-        match obj_ty.deref() {
-            SemaTy::Struct(ty) => {
-                let field = ty.field(field)?;
-                let opt_ty = SemaTy::Optional(Box::new(field.ty.clone()));
-                let base = self.func.alloc_n(opt_ty.width())?;
-
-                todo!("branching code")
+        match *obj_ty {
+            Ty::Struct(ty) => {
+                let (offset, field) = ty.field(field).unwrap();
+                let mut vals = vec![obj[0]];
+                vals.extend(&obj[offset..offset + field.ty.size()]);
+                Ok(Expr(Ty::option(field.ty.clone()), vals))
             }
-            _ => Err(SemaError::InvalidFieldAccess(SemaTy::clone(obj_ty))),
+
+            ty => Err(SemaError::InvalidFieldAccess(ty)),
         }
     }
 
-    fn coerce(
-        &mut self,
-        dst: hxm::Val,
-        dst_ty: &SemaTy,
-        val: &ExprResult,
-    ) -> Result<(), SemaError> {
-        if dst_ty == &val.ty {
-            self.func.assign(dst, val.vals().collect());
-            return Ok(());
+    fn coerce(&mut self, tgt: &Ty, Expr(val_ty, val): Expr) -> Result<Expr, SemaError> {
+        if tgt == &val_ty {
+            return Ok(Expr(val_ty, val));
         }
 
-        match (dst_ty, &val.ty) {
-            (_, SemaTy::Never) => Ok(()),
+        match (tgt, &val_ty) {
+            (_, Ty::Never) => Ok(Expr(tgt.clone(), vec![])),
 
-            (SemaTy::Optional(inner), _) if **inner == val.ty => {
-                // Writing value before setting the tag sees to produce better bytecode
-                self.func.assign(dst.add(1), val.vals().collect());
-                self.func.load_bool(dst, true);
-                Ok(())
+            (Ty::Optional(inner), _) if **inner == val_ty => {
+                let tag = self.func.new_val(ir::Ty::Bool);
+                self.constant(tag, ir::ConstVal::Bool(true));
+
+                let mut vals = vec![tag];
+                vals.extend(&val);
+                Ok(Expr(tgt.clone(), vals))
             }
 
-            (SemaTy::Optional(_), SemaTy::Null) => {
-                // TODO: consider writing zero values
-                self.func.load_bool(dst, false);
-                Ok(())
+            (Ty::Optional(_), Ty::Null) => {
+                let vals = self.alloc(&tgt.to_ir());
+                self.constant(vals[0], ir::ConstVal::Bool(false));
+                for &v in &vals[1..] {
+                    self.constant(v, ConstVal::Uint(0));
+                }
+                Ok(Expr(tgt.clone(), vals))
             }
 
             (
-                SemaTy::Pointer {
+                Ty::Pointer {
                     pointee: tgt_ptr,
                     is_mut: false,
                 },
-                SemaTy::Pointer {
+                Ty::Pointer {
                     pointee: val_ptr,
                     is_mut: val_mut,
                 },
             ) if tgt_ptr == val_ptr => todo!("pointer coerce"),
 
             _ => Err(SemaError::TypeMismatch {
-                exp: dst_ty.clone(),
-                got: val.ty.clone(),
+                exp: tgt.clone(),
+                got: val_ty.clone(),
             }),
         }
     }
@@ -515,48 +602,51 @@ pub fn lower_function<'a>(
     params: &[Param],
     ret: Option<ExprId>,
     body: ExprId,
-) -> Result<hxm::Function, SemaError> {
+) -> Result<ir::Function, SemaError> {
     let comp_eval = ComptimeEval::new(ast);
-    let mut func = hxm::FunctionBuilder::new(name);
-    let mut param_bindings = AHashMap::new();
 
+    let ret_ty = match ret {
+        Some(r) => comp_eval.eval_type(r)?,
+        None => Ty::Void,
+    };
+
+    let ret_ir_ty = ret_ty.to_ir();
+
+    let mut func = ir::FunctionBuilder::new(name, ret_ir_ty.clone());
+    let entry = func.entry();
+
+    let mut param_bindings = AHashMap::new();
     for param in params {
         let ty = comp_eval.eval_type(param.ty)?;
-        let base = func.add_arg(ty.width())?;
+        let ir_ty = ty.to_ir();
+        let vals = ir_ty.iter().map(|&ty| func.add_param(entry, ty)).collect();
+
         param_bindings.insert(
             param.name,
             Binding {
-                value: ExprResult { base, ty },
+                value: Expr(ty, vals),
                 mutable: param.mutable,
             },
         );
     }
 
-    let ret_ty = match ret {
-        Some(r) => comp_eval.eval_type(r)?,
-        None => SemaTy::Void,
-    };
-
-    func.set_ret(ret_ty.width())?;
-
     let mut sema = Sema {
         ast,
         func,
+        ret_ty,
         scopes: vec![param_bindings],
         comp_eval,
     };
 
-    let result = sema.lower_expr(body)?;
-    let ret = ExprResult {
-        base: sema.func.alloc_n(ret_ty.width())?,
-        ty: ret_ty,
-    };
+    sema.func.switch_to(entry);
 
-    sema.coerce(ret.base, &ret.ty, &result)?;
+    let result = sema.lower_expr(body, None)?;
 
     if !sema.func.is_terminated() {
-        sema.func.ret(ret.vals().collect());
+        let ret_ty = sema.ret_ty.clone();
+        let Expr(_, vals) = sema.coerce(&ret_ty, result)?;
+        sema.func.set_term(ir::Term::Return { vals });
     }
 
-    Ok(sema.func.build())
+    Ok(sema.func.finish())
 }

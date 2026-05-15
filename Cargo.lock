@@ -59,14 +59,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "hex-gc"
+name = "hex-mir"
 version = "0.1.0"
 dependencies = [
  "hex-vm",
+ "thiserror",
 ]
 
 [[package]]
-name = "hex-mir"
+name = "hex-runtime"
 version = "0.1.0"
 dependencies = [
  "hex-vm",

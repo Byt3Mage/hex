@@ -15,17 +15,14 @@ pub struct Expr {
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     // Primitive Literals
-    // CintLit(ComptimeInt),
+    CintLit(u64),
     UintLit(u64),
     IntLit(i64),
     FloatLit(f64),
     BoolLit(bool),
     NullLit,
     VoidLit,
-
-    // Identifiers
     Ident(Ident),
-
     /// Array literal value for arrays and tuples.
     ///
     /// Example:
@@ -33,7 +30,6 @@ pub enum ExprKind {
     /// [1, 2, 3], [69, "hello", false]
     /// ```
     ArrayLit(Vec<ExprId>),
-
     /// Array repeat syntax.
     ///
     /// Example:
@@ -44,7 +40,6 @@ pub enum ExprKind {
         value: ExprId,
         count: ExprId,
     },
-
     /// Struct literal value for both structs and unions
     ///
     /// Example:
@@ -57,7 +52,6 @@ pub enum ExprKind {
         ty: ExprId,
         fields: Vec<FieldInit>,
     },
-
     /// Grouped expression in parenthesis
     ///
     /// Example:
@@ -65,48 +59,33 @@ pub enum ExprKind {
     /// ((x * y) + sqrt(5 % 9))
     /// ```
     Group(ExprId),
-
     Unary {
         op: UnOp,
         rhs: ExprId,
     },
-
     Binary {
         op: BinOp,
         lhs: ExprId,
         rhs: ExprId,
     },
-
     Assign {
         op: AssignOp,
         tgt: ExprId,
         val: ExprId,
     },
 
-    /// Explicit value cast
-    ///
-    /// Example:
-    /// ```
-    /// 78 as uint, true as int
-    /// ```
-    Cast {
-        expr: ExprId,
-        ty: ExprId,
-    },
+    Block(Vec<Stmt>),
 
-    // Control flow
     If {
         cond: ExprId,
         then_branch: ExprId,
         else_branch: Option<ExprId>,
     },
+    Loop(ExprId),
     While {
         cond: ExprId,
         body: ExprId,
     },
-    Loop(ExprId),
-
-    Block(Vec<Stmt>),
     Return(Option<ExprId>),
     Break(Option<ExprId>),
     Continue,
@@ -280,6 +259,16 @@ pub enum BinOp {
     BitXor,
     Shl,
     Shr,
+    Coalesce,
+}
+
+impl BinOp {
+    pub fn is_comparison(&self) -> bool {
+        matches!(
+            self,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        )
+    }
 }
 
 impl std::fmt::Display for BinOp {
@@ -303,6 +292,7 @@ impl std::fmt::Display for BinOp {
             BinOp::BitXor => f.write_str("^"),
             BinOp::Shl => f.write_str("<<"),
             BinOp::Shr => f.write_str(">>"),
+            BinOp::Coalesce => f.write_str("?:"),
         }
     }
 }

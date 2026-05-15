@@ -7,7 +7,7 @@ use crate::{
             AssignOp, Ast, BinOp, Decl, DeclId, DeclKind, Expr, ExprKind, Param, Stmt, StmtKind,
             UnOp, Visibility,
         },
-        lexer::{LexError, Lexer},
+        lexer::{Lexer, LexerError},
         parse_rules::{InfixRule, ParseRule, Precedence, PrefixRule},
         token::{Span, Token, TokenType},
     },
@@ -21,49 +21,52 @@ pub struct ParseError {
     span: Span,
 }
 
+impl From<LexerError> for ParseError {
+    fn from(err: LexerError) -> Self {
+        Self {
+            msg: err.to_string(),
+            span: err.span,
+        }
+    }
+}
+
 type ParseResult<T> = std::result::Result<T, ParseError>;
 
 pub struct Parser<'a> {
-    lexer: &'a mut Lexer<'a>,
-    intern: &'a mut Interner,
     ast: &'a mut Ast,
+    intern: &'a mut Interner,
+    lexer: Lexer<'a>,
     current: Token<'a>,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(
-        lexer: &'a mut Lexer<'a>,
-        intern: &'a mut Interner,
         ast: &'a mut Ast,
-    ) -> Result<Parser<'a>, LexError> {
+        intern: &'a mut Interner,
+        source: &'a str,
+    ) -> Result<Parser<'a>, ParseError> {
+        let mut lexer = Lexer::new(source);
+        let current = lexer.next_token()?;
+
         Ok(Parser {
-            current: lexer.next_token()?,
-            lexer,
-            intern,
             ast,
+            intern,
+            lexer,
+            current,
         })
     }
 
     pub fn advance(&mut self) -> ParseResult<()> {
-        match self.lexer.next_token() {
-            Ok(token) => {
-                self.current = token;
-                Ok(())
-            }
-            Err(err) => Err(ParseError {
-                msg: format!("Lexer error: {:?}", err),
-                span: err.span,
-            }),
-        }
+        Ok(self.current = self.lexer.next_token()?)
     }
 
     fn advance_if(&mut self, ty: TokenType) -> ParseResult<bool> {
-        if self.current.ty == ty {
+        Ok(if self.current.ty == ty {
             self.advance()?;
-            Ok(true)
+            true
         } else {
-            Ok(false)
-        }
+            false
+        })
     }
 
     fn consume(&mut self) -> ParseResult<Token<'a>> {
@@ -91,19 +94,20 @@ impl<'a> Parser<'a> {
     /// Parse a source file, returning the ID of the module declaration.
     ///
     /// Each source file corresponds to a single module declaration.
-    pub fn parse_source(&mut self, source_name: &str) -> ParseResult<DeclId> {
-        let mut items = vec![];
+    pub fn parse(&mut self) -> ParseResult<DeclId> {
+        let span = self.current.span;
 
+        let mut decls = vec![];
         while !self.check(tt![eof]) {
             let decl = self.parse_decl()?;
-            items.push(self.ast.insert_decl(decl));
+            decls.push(self.ast.insert_decl(decl));
         }
 
         let module = Decl {
             vis: Visibility::Public,
-            name: self.intern.get_or_intern(source_name),
-            kind: DeclKind::Mod(items),
-            span: Span::default().merge(self.current.span),
+            name: self.intern.get_or_intern("crate"),
+            kind: DeclKind::Mod(decls),
+            span: span.merge(self.current.span),
         };
 
         Ok(self.ast.insert_decl(module))
@@ -555,11 +559,11 @@ impl<'a> Parser<'a> {
 
         match str::parse::<u64>(int_token.lexeme) {
             Ok(u) => Ok(Expr {
-                kind: todo!(),
+                kind: ExprKind::CintLit(u),
                 span: int_token.span,
             }),
             Err(err) => Err(ParseError {
-                msg: format!("Error parsing int literal: {err}"),
+                msg: format!("Error parsing cint literal: {err}"),
                 span: int_token.span,
             }),
         }
@@ -574,7 +578,7 @@ impl<'a> Parser<'a> {
                 span: int_token.span,
             }),
             Err(err) => Err(ParseError {
-                msg: format!("Error parsing int literal: {err}"),
+                msg: format!("Error parsing uint literal: {err}"),
                 span: int_token.span,
             }),
         }
@@ -651,8 +655,8 @@ impl<'a> Parser<'a> {
         let l_brkt = self.expect(tt!['['])?;
 
         // Parse empty array literal
-        if self.advance_if(tt![']'])? {
-            let r_brkt = self.expect(tt![']'])?;
+        if self.check(tt![']']) {
+            let r_brkt = self.consume()?;
 
             return Ok(Expr {
                 kind: ExprKind::ArrayLit(vec![]),
@@ -749,6 +753,12 @@ impl<'a> Parser<'a> {
             tt![>=] => BinOp::Ge,
             tt![and] => BinOp::And,
             tt![or] => BinOp::Or,
+            tt![&] => BinOp::BitAnd,
+            tt![|] => BinOp::BitOr,
+            tt![^] => BinOp::BitXor,
+            tt![<<] => BinOp::Shl,
+            tt![>>] => BinOp::Shr,
+            tt![?:] => BinOp::Coalesce,
             _ => {
                 return Err(ParseError {
                     msg: format!("Unsupported binary operator: {:?}", op_token.ty),
@@ -916,10 +926,10 @@ impl<'a> Parser<'a> {
         let return_token = self.expect(tt![return])?;
         let mut span = return_token.span;
 
-        /*let expr = if self.can_start_expr() {
+        let expr = if self.can_start_expr() {
             let expr = self.parse_expr()?;
             span = span.merge(expr.span);
-            Some(self.ast.exprs.insert(expr))
+            Some(self.ast.insert_expr(expr))
         } else {
             None
         };
@@ -927,8 +937,7 @@ impl<'a> Parser<'a> {
         Ok(Expr {
             kind: ExprKind::Return(expr),
             span,
-        })*/
-        todo!()
+        })
     }
 
     fn parse_break(&mut self) -> ParseResult<Expr> {
@@ -1012,4 +1021,9 @@ impl<'a> Parser<'a> {
             },
         })
     }
+}
+
+#[inline(always)]
+pub fn parse(ast: &mut Ast, intern: &mut Interner, source: &str) -> Result<DeclId, ParseError> {
+    Parser::new(ast, intern, source)?.parse()
 }

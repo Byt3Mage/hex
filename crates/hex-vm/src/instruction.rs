@@ -58,7 +58,7 @@ macro_rules! replace_expr {
 
 macro_rules! define_opcodes {
     ($($name:ident),* $(,)?) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         #[repr(transparent)]
         pub struct Opcode(pub u8);
 
@@ -86,37 +86,42 @@ macro_rules! define_opcodes {
 }
 
 define_opcodes! {
-    MOV, CONST, // Move ops
-    BNOT, INOT, UNOT, INEG, FNEG, // Unary operations
-    IADD, ISUB, IMUL, IDIV, IREM, // signed int arithmetic
-    UADD, USUB, UMUL, UDIV, UREM, // unsigned int arithmetic
+    COPY, CONST, // Move ops
+    NOT, BNOT, INEG, FNEG, // Unary operations
+    ADD, SUB, MUL, // signed/unsigned int arithmetic
+    SDIV, SREM, // signed int division
+    UDIV, UREM, // unsigned int division
     FADD, FSUB, FMUL, FDIV, FREM, // floating point arithmetic
-    IEQ, INE, ILT, IGT, ILE, IGE, // signed int comparison
-    UEQ, UNE, ULT, UGT, ULE, UGE, // unsigned int comparison
+    EQ, NE, // signed/unsigned int equality
+    ILT, IGT, ILE, IGE, // signed int comparison
+    ULT, UGT, ULE, UGE, // unsigned int comparison
     FEQ, FNE, FLT, FGT, FLE, FGE, // floating point comparison
     JMP, JMP_T, JMP_F, // Jump ops
-    RET, CALL, CALLT, CALLH, CALLR, CALLHR, // Return and call ops
+    RET, CALL, CALLR, // Return and call ops
+    LOAD, STORE, // Heap memory ops
     HALT, // end program
 }
 
-// Instruction encoding
-//
-// ABC: [opcode(8)] [a: Reg] [b: Reg] [c: Reg]
-// ABx: [opcode(8)] [a: Reg] [bx: remaining bits]
-// Ax:  [opcode(8)] [ax: remaining bits]
-
-#[derive(Debug, Clone, Copy)]
+/// Instruction encoding:
+/// - **ABC**: `[opcode(8)] [a: Reg] [b: Reg] [c: Reg]`
+/// - **ABx**: `[opcode(8)] [a: Reg] [bx: remaining bits]`
+/// - **Ax**:  `[opcode(8)] [ax: remaining bits]`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct Instruction(InstType);
 
 impl Instruction {
+    #[inline(always)]
+    pub const fn raw(self) -> InstType {
+        self.0
+    }
+
     #[inline(always)]
     pub const fn op(self) -> Opcode {
         Opcode((self.0 & 0xFF) as u8)
     }
 
     // ABC format
-
     #[inline(always)]
     pub const fn a(self) -> Reg {
         decode_reg((self.0 >> FIELD_A) & REG_MASK)
@@ -133,7 +138,6 @@ impl Instruction {
     }
 
     // ABx Format
-
     #[inline(always)]
     pub const fn bx(self) -> InstType {
         (self.0 >> FIELD_B) & BX_MASK
@@ -153,7 +157,6 @@ impl Instruction {
     }
 
     // Ax Format
-
     #[inline(always)]
     pub const fn ax(self) -> InstType {
         (self.0 >> FIELD_A) & AX_MASK
@@ -174,20 +177,20 @@ pub const fn encode_abc(Opcode(op): Opcode, a: Reg, b: Reg, c: Reg) -> Instructi
 
 #[inline(always)]
 pub const fn encode_abx(Opcode(op): Opcode, a: Reg, bx: InstType) -> Instruction {
-    debug_assert!(bx <= BX_MASK, "bx field overflow");
+    assert!(bx <= BX_MASK, "bx field overflow");
     Instruction((op as InstType) | (encode_reg(a) << FIELD_A) | (bx << FIELD_B))
 }
 
 #[inline(always)]
 pub const fn encode_ax(Opcode(op): Opcode, ax: InstType) -> Instruction {
-    debug_assert!(ax <= AX_MASK, "ax field overflow");
+    assert!(ax <= AX_MASK, "ax field overflow");
     Instruction((op as InstType) | (ax << FIELD_A))
 }
 
 // Move
 #[inline(always)]
-pub const fn mov(dst: Reg, src: Reg) -> Instruction {
-    encode_abc(Opcode::MOV, dst, src, R0)
+pub const fn copy(dst: Reg, src: Reg) -> Instruction {
+    encode_abc(Opcode::COPY, dst, src, R0)
 }
 
 #[inline(always)]
@@ -197,18 +200,13 @@ pub const fn const_(dst: Reg, idx: InstType) -> Instruction {
 
 // Unary ops
 #[inline(always)]
+pub const fn not(dst: Reg, src: Reg) -> Instruction {
+    encode_abc(Opcode::NOT, dst, src, R0)
+}
+
+#[inline(always)]
 pub const fn bnot(dst: Reg, src: Reg) -> Instruction {
     encode_abc(Opcode::BNOT, dst, src, R0)
-}
-
-#[inline(always)]
-pub const fn inot(dst: Reg, src: Reg) -> Instruction {
-    encode_abc(Opcode::INOT, dst, src, R0)
-}
-
-#[inline(always)]
-pub const fn unot(dst: Reg, src: Reg) -> Instruction {
-    encode_abc(Opcode::UNOT, dst, src, R0)
 }
 
 #[inline(always)]
@@ -221,48 +219,34 @@ pub const fn fneg(dst: Reg, src: Reg) -> Instruction {
     encode_abc(Opcode::FNEG, dst, src, R0)
 }
 
-// Signed integer arithmetic
+// Signed/unsigned integer arithmetic
 #[inline(always)]
-pub const fn iadd(dst: Reg, a: Reg, b: Reg) -> Instruction {
-    encode_abc(Opcode::IADD, dst, a, b)
+pub const fn add(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::ADD, dst, a, b)
 }
 
 #[inline(always)]
-pub const fn isub(dst: Reg, a: Reg, b: Reg) -> Instruction {
-    encode_abc(Opcode::ISUB, dst, a, b)
+pub const fn sub(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::SUB, dst, a, b)
 }
 
 #[inline(always)]
-pub const fn imul(dst: Reg, a: Reg, b: Reg) -> Instruction {
-    encode_abc(Opcode::IMUL, dst, a, b)
+pub const fn mul(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::MUL, dst, a, b)
+}
+
+// Signed integer division
+#[inline(always)]
+pub const fn sdiv(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::SDIV, dst, a, b)
 }
 
 #[inline(always)]
-pub const fn idiv(dst: Reg, a: Reg, b: Reg) -> Instruction {
-    encode_abc(Opcode::IDIV, dst, a, b)
+pub const fn srem(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::SREM, dst, a, b)
 }
 
-#[inline(always)]
-pub const fn irem(dst: Reg, a: Reg, b: Reg) -> Instruction {
-    encode_abc(Opcode::IREM, dst, a, b)
-}
-
-// Unsigned integer arithmetic
-#[inline(always)]
-pub const fn uadd(dst: Reg, a: Reg, b: Reg) -> Instruction {
-    encode_abc(Opcode::UADD, dst, a, b)
-}
-
-#[inline(always)]
-pub const fn usub(dst: Reg, a: Reg, b: Reg) -> Instruction {
-    encode_abc(Opcode::USUB, dst, a, b)
-}
-
-#[inline(always)]
-pub const fn umul(dst: Reg, a: Reg, b: Reg) -> Instruction {
-    encode_abc(Opcode::UMUL, dst, a, b)
-}
-
+// Unsigned integer division
 #[inline(always)]
 pub const fn udiv(dst: Reg, a: Reg, b: Reg) -> Instruction {
     encode_abc(Opcode::UDIV, dst, a, b)
@@ -275,13 +259,13 @@ pub const fn urem(dst: Reg, a: Reg, b: Reg) -> Instruction {
 
 // Signed integer comparisons
 #[inline(always)]
-pub const fn ieq(dst: Reg, a: Reg, b: Reg) -> Instruction {
-    encode_abc(Opcode::IEQ, dst, a, b)
+pub const fn eq(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::EQ, dst, a, b)
 }
 
 #[inline(always)]
-pub const fn ine(dst: Reg, a: Reg, b: Reg) -> Instruction {
-    encode_abc(Opcode::INE, dst, a, b)
+pub const fn ne(dst: Reg, a: Reg, b: Reg) -> Instruction {
+    encode_abc(Opcode::NE, dst, a, b)
 }
 
 #[inline(always)]
@@ -305,16 +289,6 @@ pub const fn ige(dst: Reg, a: Reg, b: Reg) -> Instruction {
 }
 
 // Unsigned integer comparisons
-#[inline(always)]
-pub const fn ueq(dst: Reg, a: Reg, b: Reg) -> Instruction {
-    encode_abc(Opcode::UEQ, dst, a, b)
-}
-
-#[inline(always)]
-pub const fn une(dst: Reg, a: Reg, b: Reg) -> Instruction {
-    encode_abc(Opcode::UNE, dst, a, b)
-}
-
 #[inline(always)]
 pub const fn ult(dst: Reg, a: Reg, b: Reg) -> Instruction {
     encode_abc(Opcode::ULT, dst, a, b)
@@ -417,21 +391,6 @@ pub const fn call(ret: Reg, func: InstType) -> Instruction {
 #[inline(always)]
 pub const fn callr(ret: Reg, func: Reg) -> Instruction {
     encode_abc(Opcode::CALLR, ret, func, R0)
-}
-
-#[inline(always)]
-pub const fn calln(ret: Reg, func: InstType) -> Instruction {
-    encode_abx(Opcode::CALLH, ret, func)
-}
-
-#[inline(always)]
-pub const fn callnr(ret: Reg, func: Reg) -> Instruction {
-    encode_abc(Opcode::CALLHR, ret, func, R0)
-}
-
-#[inline(always)]
-pub const fn callt(ret: Reg, func: InstType) -> Instruction {
-    encode_abx(Opcode::CALLT, ret, func)
 }
 
 #[inline(always)]

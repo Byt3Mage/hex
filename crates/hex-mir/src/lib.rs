@@ -1,515 +1,252 @@
-pub mod constants;
-pub mod liveness;
-pub mod lowering;
+use std::num::NonZeroU32;
+
+pub(crate) use hex_vm as vm;
+
+pub mod codegen;
+mod constants;
+mod dominator;
+pub mod fmt;
+pub mod instruction;
+mod liveness;
+pub mod op;
+mod register_alloc;
+
+pub use instruction::*;
+pub use op::*;
 
 pub type RegTy = hex_vm::Reg;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct Val(RegTy);
-
-pub const ZERO_VAL: Val = Val(0);
-
-impl std::fmt::Display for Val {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "%{}", self.0)
-    }
-}
+/// SSA value. Defined exactly once, by an instruction or a block parameter.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct Val(NonZeroU32);
 
 impl Val {
-    pub fn add(&self, i: RegTy) -> Val {
-        Val(self.0 + i)
+    fn from_idx(i: usize) -> Self {
+        let n = u32::try_from(i + 1).expect("Val idx overflow");
+        Self(NonZeroU32::new(n).unwrap())
+    }
+
+    fn from_idx_unchecked(n: std::num::NonZeroU32) -> Self {
+        Self(n)
+    }
+
+    pub fn idx(self) -> usize {
+        (self.0.get() - 1) as usize
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Basic block identifier.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct BlockId(NonZeroU32);
+
+impl BlockId {
+    fn from_idx(i: usize) -> Self {
+        let n = u32::try_from(i + 1).expect("BlockId idx overflow");
+        Self(NonZeroU32::new(n).unwrap())
+    }
+
+    fn from_idx_unchecked(i: usize) -> Self {
+        let n = u32::try_from(i + 1).expect("BlockId idx overflow");
+        BlockId(NonZeroU32::new(n).unwrap())
+    }
+
+    pub fn idx(self) -> usize {
+        (self.0.get() - 1) as usize
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(u8)]
-pub enum BinOp {
-    IAdd,
-    ISub,
-    IMul,
-    IDiv,
-    IRem,
-
-    UAdd,
-    USub,
-    UMul,
-    UDiv,
-    URem,
-    FAdd,
-    FSub,
-    FMul,
-    FDiv,
-    FRem,
-    IEq,
-    INe,
-    ILt,
-    IGt,
-    ILe,
-    IGe,
-    UEq,
-    UNe,
-    ULt,
-    UGt,
-    ULe,
-    UGe,
-    FEq,
-    FNe,
-    FLt,
-    FGt,
-    FLe,
-    FGe,
+pub enum Ty {
+    Int,
+    Uint,
+    Bool,
+    Float,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum UnOp {
-    INeg,
-    FNeg,
-    BNot,
-    INot,
-    UNot,
+#[derive(Copy, Clone, Debug)]
+pub enum ConstVal {
+    Int(i64),
+    Uint(u64),
+    Bool(bool),
+    Float(f64),
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum CastOp {
-    IToF,
-    FToI,
-    UToF,
-    FToU,
-    IToU,
-    UToI,
+impl ConstVal {
+    pub fn ty(self) -> Ty {
+        match self {
+            ConstVal::Int(_) => Ty::Int,
+            ConstVal::Uint(_) => Ty::Uint,
+            ConstVal::Bool(_) => Ty::Bool,
+            ConstVal::Float(_) => Ty::Float,
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
-pub enum Inst {
-    LoadInt {
-        dst: Val,
-        value: i64,
-    },
-    LoadUint {
-        dst: Val,
-        value: u64,
-    },
-    LoadBool {
-        dst: Val,
-        value: bool,
-    },
-    LoadFloat {
-        dst: Val,
-        value: f64,
-    },
-    BinOp {
-        dst: Val,
-        op: BinOp,
-        lhs: Val,
-        rhs: Val,
-    },
-    UnOp {
-        dst: Val,
-        op: UnOp,
-        src: Val,
-    },
-    Cast {
-        dst: Val,
-        op: CastOp,
-        src: Val,
-    },
-    Mov {
-        dst: Val,
-        src: Val,
-    },
-    Assign {
-        dst: Val,
-        args: Vec<Val>,
-    },
-    Call {
-        dst: Val,
-        func: usize,
-        args: Vec<Val>,
-        nret: RegTy,
-    },
-    CallNative {
-        dst: Val,
-        func: usize,
-        args: Vec<Val>,
-        nret: RegTy,
-    },
-
-    CallIndirect {
-        dst: Val,
-        func: Val,
-        args: Vec<Val>,
-        nret: RegTy,
-    },
-    CallNativeIndirect {
-        dst: Val,
-        func: Val,
-        args: Vec<Val>,
-        nret: RegTy,
-    },
+pub struct ValInfo {
+    pub ty: Ty,
 }
 
-#[derive(Debug, Clone)]
-pub enum Terminator {
-    Br {
-        tgt: usize,
-        args: Vec<Val>,
-    },
-    BrIf {
-        cond: Val,
-        then_br: usize,
-        else_br: usize,
-        then_args: Vec<Val>,
-        else_args: Vec<Val>,
-    },
-    Ret(Vec<Val>),
-}
-
-#[derive(Debug, Clone)]
-pub struct Block {
+pub struct BasicBlock {
+    pub id: BlockId,
     pub params: Vec<Val>,
     pub insts: Vec<Inst>,
-    pub term: Terminator,
+    pub term: Term,
 }
 
-#[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
-    pub blocks: Vec<Block>,
-    pub nreg: RegTy,
-    pub narg: RegTy,
-    pub nret: RegTy,
+    pub ret_tys: Vec<Ty>,
+    pub blocks: Vec<BasicBlock>,
+    pub vals: Vec<ValInfo>,
+    pub entry: BlockId,
 }
 
-impl Inst {
-    pub fn for_each_def(&self, mut f: impl FnMut(Val)) {
-        match self {
-            Inst::Call { dst, nret, .. }
-            | Inst::CallNative { dst, nret, .. }
-            | Inst::CallIndirect { dst, nret, .. }
-            | Inst::CallNativeIndirect { dst, nret, .. } => {
-                for i in 0..*nret {
-                    f(Val(dst.0 + i));
-                }
-            }
-            Inst::Assign { dst, args } => {
-                for i in 0..args.len() as RegTy {
-                    f(Val(dst.0 + i));
-                }
-            }
-
-            Inst::LoadInt { dst, .. }
-            | Inst::LoadUint { dst, .. }
-            | Inst::LoadBool { dst, .. }
-            | Inst::LoadFloat { dst, .. }
-            | Inst::BinOp { dst, .. }
-            | Inst::UnOp { dst, .. }
-            | Inst::Cast { dst, .. }
-            | Inst::Mov { dst, .. } => f(*dst),
-        }
+impl Function {
+    pub fn block(&self, id: BlockId) -> &BasicBlock {
+        &self.blocks[id.idx()]
     }
 
-    pub fn for_each_use(&self, mut f: impl FnMut(Val)) {
-        match self {
-            Inst::LoadInt { .. }
-            | Inst::LoadUint { .. }
-            | Inst::LoadBool { .. }
-            | Inst::LoadFloat { .. } => {}
-            Inst::BinOp { lhs, rhs, .. } => {
-                f(*lhs);
-                f(*rhs);
-            }
-            Inst::UnOp { src, .. } | Inst::Cast { src, .. } | Inst::Mov { src, .. } => f(*src),
-            Inst::Assign { args, .. } | Inst::Call { args, .. } | Inst::CallNative { args, .. } => {
-                args.iter().copied().for_each(f)
-            }
-            Inst::CallIndirect { func, args, .. } | Inst::CallNativeIndirect { func, args, .. } => {
-                f(*func);
-                args.iter().copied().for_each(f);
+    pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock {
+        &mut self.blocks[id.idx()]
+    }
+
+    pub fn val_ty(&self, v: Val) -> Ty {
+        self.vals[v.idx()].ty
+    }
+
+    /// Iterate over all blocks in id order.
+    pub fn iter_blocks(&self) -> impl Iterator<Item = &BasicBlock> {
+        self.blocks.iter()
+    }
+
+    /// Compute predecessors for every block. Recomputed on demand
+    /// rather than stored, so CFG edits don't have to maintain it.
+    pub fn predecessors(&self) -> Predecessors {
+        let mut preds: Vec<Vec<BlockId>> = vec![Vec::new(); self.blocks.len()];
+        for block in &self.blocks {
+            for succ in block.term.successors() {
+                preds[succ.idx()].push(block.id);
             }
         }
+        Predecessors { preds }
     }
 }
 
-impl Terminator {
-    pub fn for_each_use(&self, mut f: impl FnMut(Val)) {
-        match self {
-            Terminator::Br { args, .. } => args.iter().copied().for_each(f),
-            Terminator::BrIf {
-                cond,
-                then_args,
-                else_args,
-                ..
-            } => {
-                f(*cond);
-                then_args.iter().copied().for_each(&mut f);
-                else_args.iter().copied().for_each(&mut f);
-            }
-            Terminator::Ret(vals) => vals.iter().copied().for_each(f),
-        }
-    }
+pub struct Predecessors {
+    preds: Vec<Vec<BlockId>>,
+}
 
-    pub fn for_each_successor(&self, mut f: impl FnMut(usize)) {
-        match self {
-            Terminator::Br { tgt, .. } => f(*tgt),
-            Terminator::BrIf {
-                then_br, else_br, ..
-            } => {
-                f(*then_br);
-                f(*else_br);
-            }
-            Terminator::Ret(_) => {}
-        }
+impl Predecessors {
+    pub fn of(&self, b: BlockId) -> &[BlockId] {
+        &self.preds[b.idx()]
     }
 }
 
 pub struct FunctionBuilder {
-    blocks: Vec<Block>,
-    current: Vec<Inst>,
-    current_params: Vec<Val>,
-    next_val: RegTy,
-    narg: RegTy,
-    nret: RegTy,
-    name: String,
-    terminated: bool,
+    func: Function,
+    current: Option<BlockId>,
 }
 
 impl FunctionBuilder {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            blocks: Vec::new(),
-            current: Vec::new(),
-            current_params: Vec::new(),
-            next_val: 0,
-            narg: 0,
-            nret: 0,
-            name: name.into(),
-            terminated: false,
+    /// Start building a new function. Creates the entry block but does
+    /// not switch to it; call `switch_to(entry)` to begin emitting.
+    pub fn new(name: impl Into<String>, ret_tys: Vec<Ty>) -> Self {
+        let entry = BlockId::from_idx(0);
+        FunctionBuilder {
+            func: Function {
+                name: name.into(),
+                ret_tys,
+                blocks: vec![BasicBlock {
+                    id: entry,
+                    params: Vec::new(),
+                    insts: Vec::new(),
+                    term: Term::Unreachable,
+                }],
+                vals: vec![],
+                entry,
+            },
+            current: None,
         }
+    }
+
+    pub fn entry(&self) -> BlockId {
+        self.func.entry
     }
 
     pub fn is_terminated(&self) -> bool {
-        self.terminated
+        self.current.is_none()
     }
 
-    pub fn alloc_n(&mut self, n: usize) -> Result<Val, MirError> {
-        let base = self.next_val;
-        let new_next = (base as usize)
-            .checked_add(n)
-            .filter(|&v| v <= RegTy::MAX as usize)
-            .ok_or(MirError::ValueOverflow)?;
-        self.next_val = new_next as RegTy;
-        Ok(Val(base))
-    }
-
-    pub fn add_arg(&mut self, width: usize) -> Result<Val, MirError> {
-        let base = self.alloc_n(width)?;
-        self.narg += width as RegTy;
-        Ok(base)
-    }
-
-    pub fn set_ret(&mut self, width: usize) -> Result<(), MirError> {
-        if (self.nret as usize) + width > (RegTy::MAX as usize) {
-            return Err(MirError::ValueOverflow);
-        }
-        self.nret = width as RegTy;
-        Ok(())
-    }
-
-    #[inline(always)]
-    pub fn load_int(&mut self, dst: Val, value: i64) {
-        self.current.push(Inst::LoadInt { dst, value });
-    }
-
-    #[inline(always)]
-    pub fn load_uint(&mut self, dst: Val, value: u64) {
-        self.current.push(Inst::LoadUint { dst, value });
-    }
-
-    #[inline(always)]
-    pub fn load_float(&mut self, dst: Val, value: f64) {
-        self.current.push(Inst::LoadFloat { dst, value });
-    }
-
-    #[inline(always)]
-    pub fn load_bool(&mut self, dst: Val, value: bool) {
-        self.current.push(Inst::LoadBool { dst, value });
-    }
-
-    #[inline(always)]
-    pub fn binop(&mut self, op: BinOp, lhs: Val, rhs: Val) -> Result<Val, MirError> {
-        let dst = self.alloc_n(1)?;
-        self.current.push(Inst::BinOp { dst, op, lhs, rhs });
-        Ok(dst)
-    }
-
-    pub fn unop(&mut self, op: UnOp, src: Val) -> Result<Val, MirError> {
-        let dst = self.alloc_n(1)?;
-        self.current.push(Inst::UnOp { dst, op, src });
-        Ok(dst)
-    }
-
-    pub fn cast(&mut self, op: CastOp, src: Val) -> Result<Val, MirError> {
-        let dst = self.alloc_n(1)?;
-        self.current.push(Inst::Cast { dst, op, src });
-        Ok(dst)
-    }
-
-    pub fn mov(&mut self, src: Val) -> Result<Val, MirError> {
-        let dst = self.alloc_n(1)?;
-        self.current.push(Inst::Mov { dst, src });
-        Ok(dst)
-    }
-
-    #[inline(always)]
-    pub fn assign(&mut self, dst: Val, args: Vec<Val>) {
-        self.current.push(Inst::Assign { dst, args });
-    }
-
-    pub fn call(&mut self, func: usize, args: Vec<Val>, nret: RegTy) -> Result<Val, MirError> {
-        let dst = self.alloc_n(nret as usize)?;
-        self.current.push(Inst::Call {
-            dst,
-            func,
-            args,
-            nret,
+    /// Allocate a fresh block. The block starts with `Terminator::Unreachable`
+    /// as a placeholder; you must overwrite it via `set_terminator` before
+    /// finishing.
+    pub fn new_block(&mut self) -> BlockId {
+        let id = BlockId::from_idx(self.func.blocks.len());
+        self.func.blocks.push(BasicBlock {
+            id,
+            params: Vec::new(),
+            insts: Vec::new(),
+            term: Term::Unreachable,
         });
-        Ok(dst)
+        id
     }
 
-    pub fn call_native(
-        &mut self,
-        func: usize,
-        args: Vec<Val>,
-        nret: RegTy,
-    ) -> Result<Val, MirError> {
-        let dst = self.alloc_n(nret as usize)?;
-        self.current.push(Inst::CallNative {
-            dst,
-            func,
-            args,
-            nret,
-        });
-        Ok(dst)
+    /// Allocate a fresh SSA value with the given type. Not yet attached
+    /// to any definition site — the caller is responsible for ensuring
+    /// the value is defined exactly once (by an instruction or block param).
+    pub fn new_val(&mut self, ty: Ty) -> Val {
+        let v = Val::from_idx(self.func.vals.len());
+        self.func.vals.push(ValInfo { ty });
+        v
     }
 
-    pub fn call_indirect(
-        &mut self,
-        func: Val,
-        args: Vec<Val>,
-        nret: RegTy,
-    ) -> Result<Val, MirError> {
-        let dst = self.alloc_n(nret as usize)?;
-        self.current.push(Inst::CallIndirect {
-            dst,
-            func,
-            args,
-            nret,
-        });
-        Ok(dst)
+    /// Add a parameter of the given type to a block, returning its `Val`.
+    pub fn add_param(&mut self, block: BlockId, ty: Ty) -> Val {
+        let v = self.new_val(ty);
+        self.func.blocks[block.idx()].params.push(v);
+        v
     }
 
-    pub fn call_native_indirect(
-        &mut self,
-        func: Val,
-        args: Vec<Val>,
-        nret: RegTy,
-    ) -> Result<Val, MirError> {
-        let dst = self.alloc_n(nret as usize)?;
-        self.current.push(Inst::CallNativeIndirect {
-            dst,
-            func,
-            args,
-            nret,
-        });
-        Ok(dst)
+    /// Switch the cursor to a block. Subsequent `emit` and `set_terminator`
+    /// calls operate on this block.
+    pub fn switch_to(&mut self, block: BlockId) {
+        self.current = Some(block);
     }
 
-    pub fn block_param(&mut self) -> Result<Val, MirError> {
-        self.alloc_n(1)
+    /// Append an instruction to the current block.
+    ///
+    /// Panics if no block is current (e.g. after `set_terminator` without
+    /// a subsequent `switch_to`).
+    pub fn emit(&mut self, inst: Inst) {
+        let b = self
+            .current
+            .expect("FunctionBuilder::emit with no current block");
+        self.func.blocks[b.idx()].insts.push(inst);
     }
 
-    pub fn begin_block(&mut self, params: Vec<Val>) {
-        if !self.terminated {
-            panic!("previous block not terminated");
-        }
-
-        self.terminated = false;
-        self.current_params = params;
+    /// Set the terminator of the current block and clear the cursor.
+    /// You must `switch_to` another block before emitting again.
+    pub fn set_term(&mut self, term: Term) {
+        let b = self
+            .current
+            .expect("FunctionBuilder::set_terminator with no current block");
+        self.func.blocks[b.idx()].term = term;
+        self.current = None;
     }
 
-    pub fn br(&mut self, tgt: usize, args: Vec<Val>) {
-        if self.terminated {
-            return;
-        }
-
-        let insts = std::mem::take(&mut self.current);
-        let params = std::mem::take(&mut self.current_params);
-        self.blocks.push(Block {
-            params,
-            insts,
-            term: Terminator::Br { tgt, args },
-        });
-
-        self.terminated = true;
-    }
-
-    pub fn br_if(
-        &mut self,
-        cond: Val,
-        then_br: usize,
-        then_args: Vec<Val>,
-        else_br: usize,
-        else_args: Vec<Val>,
-    ) {
-        let insts = std::mem::take(&mut self.current);
-        let params = std::mem::take(&mut self.current_params);
-        self.blocks.push(Block {
-            params,
-            insts,
-            term: Terminator::BrIf {
-                cond,
-                then_br,
-                else_br,
-                then_args,
-                else_args,
-            },
-        });
-    }
-
-    pub fn ret(&mut self, vals: Vec<Val>) {
-        let insts = std::mem::take(&mut self.current);
-        let params = std::mem::take(&mut self.current_params);
-        self.blocks.push(Block {
-            params,
-            insts,
-            term: Terminator::Ret(vals),
-        });
-    }
-
-    pub fn build(self) -> Function {
-        assert!(self.current.is_empty(), "unterminated block");
-        Function {
-            name: self.name,
-            blocks: self.blocks,
-            nreg: self.next_val,
-            narg: self.narg,
-            nret: self.nret,
-        }
+    /// Finish construction and return the built function.
+    ///
+    /// Panics if any block still has `Terminator::Unreachable` as a
+    /// placeholder when the caller didn't intend that — actually, we
+    /// can't tell intent, so we don't check here. Run `validate` for
+    /// real diagnostics.
+    pub fn finish(self) -> Function {
+        self.func
     }
 }
 
 pub struct Module {
     pub name: String,
     pub functions: Vec<Function>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum MirError {
-    #[error("value allocation overflowed max value size")]
-    ValueOverflow,
-    #[error("register assignment overflowed max register size")]
-    RegisterOverflow,
 }
