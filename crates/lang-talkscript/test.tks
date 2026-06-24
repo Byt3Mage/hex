@@ -1,9 +1,0 @@
-fn abs(n: uint): uint {
-    if n < 0 {-n} else {n}
-}
-
-mod math {
-    fn square(n: int): int {
-        n * n
-    }
-}

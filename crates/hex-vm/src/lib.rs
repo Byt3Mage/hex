@@ -1,204 +1,95 @@
-use crate::memory::{Buffer, Memory, MemoryError};
-
-pub mod disassemble;
+mod disassemble;
+mod error;
+mod host;
 mod instruction;
-pub mod memory;
+mod interrupt;
 mod program;
+mod value;
 
+pub use disassemble::disassemble;
+pub use error::*;
+pub use host::{Flow, Host, HostCtx, Syscode};
 pub use instruction::*;
+pub use interrupt::*;
 pub use program::*;
+pub use value::{Args, IsValue, Value};
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct Value(u64);
-
-impl Value {
-    pub const ZERO: Self = Self(0);
-
-    pub const fn from_bits(bits: u64) -> Self {
-        Self(bits)
-    }
-
-    pub const fn bits(self) -> u64 {
-        self.0
-    }
-
-    pub const fn from_le_bytes(bytes: [u8; 8]) -> Self {
-        Self(u64::from_le_bytes(bytes))
-    }
-
-    pub const fn to_le_bytes(self) -> [u8; 8] {
-        self.0.to_le_bytes()
-    }
-
-    #[inline(always)]
-    pub fn get<T: IsValue>(self) -> T {
-        T::from_value(self)
-    }
-
-    #[inline(always)]
-    pub fn set<T: IsValue>(&mut self, v: T) {
-        *self = v.into_value();
-    }
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+pub enum RunOutcome {
+    /// HALT or top-level RET. Returns are in registers.
+    Completed,
+    /// A syscall suspended execution. Resumable: call run() again.
+    Suspended,
+    /// The program faulted. The language decides what to do next.
+    Trapped(Fault),
 }
 
-pub trait IsValue: Copy {
-    fn from_value(v: Value) -> Self;
-    fn into_value(self) -> Value;
-}
+#[allow(non_camel_case_types)]
+pub type word = u64;
 
-impl IsValue for usize {
-    #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        v.0 as usize
-    }
-    #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self as u64)
-    }
-}
-
-impl IsValue for u64 {
-    #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        v.0
-    }
-    #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self)
-    }
-}
-
-impl IsValue for i64 {
-    #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        v.0 as i64
-    }
-    #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self as u64)
-    }
-}
-
-impl IsValue for f64 {
-    #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        f64::from_bits(v.0)
-    }
-    #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self.to_bits())
-    }
-}
-
-impl IsValue for bool {
-    #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        v.0 != 0
-    }
-    #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self as u64)
-    }
-}
-
-impl IsValue for u32 {
-    #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        v.0 as u32
-    }
-    #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self as u64)
-    }
-}
-
-impl IsValue for u16 {
-    #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        v.0 as u16
-    }
-    #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self as u64)
-    }
-}
-
-#[derive(thiserror::Error, Copy, Clone, Debug)]
-pub enum VMError {
-    #[error("Unknown opcode: {0}")]
-    UnknownOp(Opcode),
-    #[error("Program counter out of bounds")]
-    PCOutOfBounds,
-    #[error("Division by zero")]
-    DivisionByZero,
-    #[error("Memory error: {0}")]
-    MemoryError(#[from] MemoryError),
-    #[error("Empty call stack")]
-    EmptyCallStack,
-}
-
-pub type VMResult<T> = Result<T, VMError>;
-
+#[derive(Debug, Default, Clone, Copy)]
 pub struct Frame {
     pub ret_pc: usize,
     pub ret_base: usize,
 }
 
-pub struct VM<'p, B: Buffer> {
+#[derive(Debug, Default, Clone)]
+pub struct VM {
     pub registers: Vec<Value>,
-    pub call_stack: Vec<Frame>,
-    pub pc: usize,
-    pub base: usize,
-    pub memory: Memory<B>,
-    pub pending_interrupt: Option<Interrupt>,
-    pub program: &'p Program,
+    call_stack: Vec<Frame>,
+    pc: usize,
+    base: usize,
 }
 
-impl<'p, B: Buffer> VM<'p, B> {
-    pub fn new(buffer: B, program: &'p Program) -> Self {
-        Self {
-            registers: Vec::new(),
-            call_stack: Vec::new(),
-            pc: 0,
-            base: 0,
-            memory: Memory::new(buffer),
-            pending_interrupt: None,
-            program,
-        }
+impl VM {
+    pub fn from_entry(program: &Program, func: FunctionId, args: Args<'_>) -> Result<Self, Error> {
+        let mut vm = Self::default();
+        vm.set_entry(program, func, args)?;
+        Ok(vm)
     }
 
     #[inline(always)]
     pub fn reset(&mut self) {
-        self.memory.reset();
         self.registers.clear();
         self.call_stack.clear();
         self.pc = 0;
         self.base = 0;
     }
 
-    #[inline(always)]
-    pub fn reg<T: IsValue>(&self, reg: Reg) -> T {
-        T::from_value(self.registers[self.base + reg as usize])
+    #[inline]
+    pub fn pc(&self) -> usize {
+        self.pc
+    }
+
+    #[inline]
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
+    #[inline]
+    pub fn call_stack(&self) -> &[Frame] {
+        &self.call_stack
     }
 
     #[inline(always)]
-    pub fn reg_raw(&self, reg: Reg) -> Value {
+    fn reg_raw(&self, reg: Reg) -> Value {
+        // TODO: add program validation and change to get_unchecked.
         self.registers[self.base + reg as usize]
     }
 
     #[inline(always)]
-    pub fn reg_mut(&mut self, reg: Reg) -> &mut Value {
-        &mut self.registers[self.base + reg as usize]
+    fn reg<T: IsValue>(&self, reg: Reg) -> T {
+        T::from_value(self.registers[self.base + reg as usize])
     }
 
     #[inline(always)]
-    pub fn set_reg(&mut self, reg: Reg, value: impl IsValue) {
+    fn set_reg(&mut self, reg: Reg, value: impl IsValue) {
         self.registers[self.base + reg as usize] = value.into_value();
     }
 
     #[inline(always)]
-    pub fn set_reg_raw(&mut self, reg: Reg, value: Value) {
+    fn set_reg_raw(&mut self, reg: Reg, value: Value) {
         self.registers[self.base + reg as usize] = value;
     }
 
@@ -213,12 +104,7 @@ impl<'p, B: Buffer> VM<'p, B> {
     }
 
     #[inline(always)]
-    fn pop_frame(&mut self) -> VMResult<Frame> {
-        self.call_stack.pop().ok_or(VMError::EmptyCallStack)
-    }
-
-    #[inline(always)]
-    fn call_vm(&mut self, ret_reg: Reg, entry_pc: usize, nreg: Reg) {
+    fn callvm(&mut self, ret: Reg, entry: usize, nreg: Reg) {
         // Call convention: args are in caller registers[Rret..Rn]
         //
         // We use overlapping register windows for caller and callee
@@ -226,7 +112,7 @@ impl<'p, B: Buffer> VM<'p, B> {
         // registers are not clobbered by caller until callee returns.
 
         // Callee window starts at caller's return register.
-        let base = self.reg_offset(ret_reg);
+        let base = self.reg_offset(ret);
         let last = base + nreg as usize;
 
         // Grow regs to fit callee's full register count beyond the arg base.
@@ -235,235 +121,382 @@ impl<'p, B: Buffer> VM<'p, B> {
         }
 
         // Create new call frame and save return point
-        self.call_stack.push(Frame {
-            ret_pc: self.pc,
-            ret_base: self.base,
-        });
+        self.call_stack.push(Frame { ret_pc: self.pc, ret_base: self.base });
 
         // Jump to callee code
         self.base = base;
-        self.pc = entry_pc;
+        self.pc = entry;
     }
 
     #[inline(always)]
-    fn call_host(&mut self, ret_reg: Reg, func: HostFn, nreg: Reg) -> VMResult<()> {
-        // Host function call convention: args and rets use the same window.
-        // - args are read from  [Rret...Rnarg]
-        // - rets are written to [Rret..Rnret]
-        //
-        // Up to callee not to clobber args before reading from them.
-        // Garbage values or crash if args are read out of bounds.
-        let ret = self.reg_offset(ret_reg);
-        func(&mut self.registers[ret..ret + nreg as usize])
+    fn callh<H: Host>(
+        &mut self,
+        ret: Reg,
+        host: &mut H,
+        syscode: Syscode,
+        narg: Reg,
+        nret: Reg,
+    ) -> Result<Flow, Error> {
+        host.syscall(syscode, HostCtx { base: self.reg_offset(ret), narg, nret, vm: self })
     }
 
-    #[inline(always)]
-    pub fn fetch(&mut self) -> VMResult<Instruction> {
-        match self.program.instructions.get(self.pc) {
-            Some(&instr) => Ok(instr),
-            None => Err(VMError::PCOutOfBounds),
+    pub fn set_entry(&mut self, program: &Program, entry: FunctionId, args: Args) -> Result<(), Error> {
+        let func = program.function(entry);
+        let argc = args.count();
+
+        if argc != func.narg {
+            return Err(Error::ArgcMismatch { exp: func.narg, got: argc });
         }
-    }
 
-    #[inline]
-    pub fn execute(&mut self, i: Instruction) -> VMResult<()> {
-        match i.op() {
+        self.reset();
+        self.registers.resize(func.nreg as usize, Value::ZERO);
+        self.registers[..args.len()].copy_from_slice(&args);
+        self.pc = func.ty.entry_pc()?;
+        self.base = 0;
+
+        Ok(())
+    }
+}
+
+#[inline(always)]
+fn cmp_branch(vm: &mut VM, program: &Program, jmp: bool) {
+    vm.pc = if jmp { program.instruction(vm.pc) as usize } else { vm.pc + 1 };
+}
+
+#[inline(always)]
+pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [u8]) -> Result<RunOutcome, Error> {
+    while vm.pc < program.len() {
+        let i = program.instruction(vm.pc);
+        vm.pc += 1;
+
+        match inst::op(i) {
             // Moves
-            Opcode::COPY => self.set_reg_raw(i.a(), self.reg_raw(i.b())),
-            Opcode::CONST => self.set_reg_raw(i.a(), self.program.constants[i.bx() as usize]),
+            Opcode::COPY => vm.set_reg_raw(inst::a(i), vm.reg_raw(inst::b(i))),
+            Opcode::LOADK => vm.set_reg_raw(inst::a(i), program.constant(inst::bx(i) as usize)),
+            Opcode::LOADI => vm.set_reg(inst::a(i), inst::bx_imm(i)),
+            Opcode::LOADF => vm.set_reg(inst::a(i), inst::bx_imm(i) as f64),
 
             // Unary operations
-            Opcode::NOT => self.set_reg(i.a(), !self.reg::<u64>(i.b())),
-            Opcode::BNOT => self.set_reg(i.a(), !self.reg::<bool>(i.b())),
-            Opcode::INEG => self.set_reg(i.a(), -self.reg::<i64>(i.b())),
-            Opcode::FNEG => self.set_reg(i.a(), -self.reg::<f64>(i.b())),
+            Opcode::NOT => vm.set_reg(inst::a(i), !vm.reg::<u64>(inst::b(i))),
+            Opcode::BNOT => vm.set_reg(inst::a(i), !vm.reg::<bool>(inst::b(i))),
+            Opcode::INEG => vm.set_reg(inst::a(i), -vm.reg::<i64>(inst::b(i))),
+            Opcode::FNEG => vm.set_reg(inst::a(i), -vm.reg::<f64>(inst::b(i))),
 
             // Signed/unsigned integer arithmetic
             Opcode::ADD => {
-                let (a, b) = self.two_reg::<u64>(i.b(), i.c());
-                self.set_reg(i.a(), a.wrapping_add(b));
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a.wrapping_add(b));
             }
             Opcode::SUB => {
-                let (a, b) = self.two_reg::<u64>(i.b(), i.c());
-                self.set_reg(i.a(), a.wrapping_sub(b));
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a.wrapping_sub(b));
             }
             Opcode::MUL => {
-                let (a, b) = self.two_reg::<u64>(i.b(), i.c());
-                self.set_reg(i.a(), a.wrapping_mul(b));
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a.wrapping_mul(b));
+            }
+            Opcode::ADDI => {
+                let src = vm.reg::<u64>(inst::b(i));
+                vm.set_reg(inst::a(i), src.wrapping_add(inst::imm8(i) as u64));
+            }
+            Opcode::SUBI => {
+                let src = vm.reg::<u64>(inst::b(i));
+                vm.set_reg(inst::a(i), src.wrapping_sub(inst::imm8(i) as u64));
+            }
+            Opcode::MULI => {
+                let src = vm.reg::<u64>(inst::b(i));
+                vm.set_reg(inst::a(i), src.wrapping_mul(inst::imm8(i) as u64));
+            }
+            Opcode::ADDK => {
+                let a = vm.reg::<u64>(inst::b(i));
+                let k = program.constant(inst::c(i) as usize).get::<u64>();
+                vm.set_reg(inst::a(i), a.wrapping_add(k));
+            }
+            Opcode::SUBK => {
+                let a = vm.reg::<u64>(inst::b(i));
+                let k = program.constant(inst::c(i) as usize).get::<u64>();
+                vm.set_reg(inst::a(i), a.wrapping_sub(k));
+            }
+            Opcode::MULK => {
+                let a = vm.reg::<u64>(inst::b(i));
+                let k = program.constant(inst::c(i) as usize).get::<u64>();
+                vm.set_reg(inst::a(i), a.wrapping_mul(k));
+            }
+
+            // Float arithmetic with constant-pool operand
+            Opcode::FADDK => {
+                let a = vm.reg::<f64>(inst::b(i));
+                let k = program.constant(inst::c(i) as usize).get::<f64>();
+                vm.set_reg(inst::a(i), a + k);
+            }
+            Opcode::FSUBK => {
+                let a = vm.reg::<f64>(inst::b(i));
+                let k = program.constant(inst::c(i) as usize).get::<f64>();
+                vm.set_reg(inst::a(i), a - k);
+            }
+            Opcode::FMULK => {
+                let a = vm.reg::<f64>(inst::b(i));
+                let k = program.constant(inst::c(i) as usize).get::<f64>();
+                vm.set_reg(inst::a(i), a * k);
+            }
+            Opcode::FDIVK => {
+                let a = vm.reg::<f64>(inst::b(i));
+                let k = program.constant(inst::c(i) as usize).get::<f64>();
+                vm.set_reg(inst::a(i), a / k);
             }
 
             // Signed/unsigned integer division
             Opcode::SDIV => {
-                let (a, b) = self.two_reg::<i64>(i.b(), i.c());
-                self.set_reg(i.a(), a.checked_div(b).ok_or(VMError::DivisionByZero)?);
+                let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
+                match a.checked_div(b) {
+                    Some(v) => vm.set_reg(inst::a(i), v),
+                    None => return Ok(RunOutcome::Trapped(Fault::DivisionByZero)),
+                }
             }
             Opcode::SREM => {
-                let (a, b) = self.two_reg::<i64>(i.b(), i.c());
-                self.set_reg(i.a(), a.checked_rem(b).ok_or(VMError::DivisionByZero)?);
+                let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
+                match a.checked_rem(b) {
+                    Some(v) => vm.set_reg(inst::a(i), v),
+                    None => return Ok(RunOutcome::Trapped(Fault::DivisionByZero)),
+                }
             }
             Opcode::UDIV => {
-                let (a, b) = self.two_reg::<u64>(i.b(), i.c());
-                self.set_reg(i.a(), a.checked_div(b).ok_or(VMError::DivisionByZero)?);
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                match a.checked_div(b) {
+                    Some(v) => vm.set_reg(inst::a(i), v),
+                    None => return Ok(RunOutcome::Trapped(Fault::DivisionByZero)),
+                }
             }
             Opcode::UREM => {
-                let (a, b) = self.two_reg::<u64>(i.b(), i.c());
-                self.set_reg(i.a(), a.checked_rem(b).ok_or(VMError::DivisionByZero)?);
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                match a.checked_rem(b) {
+                    Some(v) => vm.set_reg(inst::a(i), v),
+                    None => return Ok(RunOutcome::Trapped(Fault::DivisionByZero)),
+                }
             }
 
             // Floating point arithmetic
             Opcode::FADD => {
-                let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-                self.set_reg(i.a(), a + b);
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a + b);
             }
             Opcode::FSUB => {
-                let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-                self.set_reg(i.a(), a - b);
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a - b);
             }
             Opcode::FMUL => {
-                let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-                self.set_reg(i.a(), a * b);
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a * b);
             }
             Opcode::FDIV => {
-                let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-                self.set_reg(i.a(), a / b);
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a / b);
             }
             Opcode::FREM => {
-                let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-                self.set_reg(i.a(), a % b);
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a % b);
             }
 
             Opcode::EQ => {
-                let (a, b) = self.two_reg::<u64>(i.b(), i.c());
-                self.set_reg(i.a(), a == b);
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a == b);
             }
             Opcode::NE => {
-                let (a, b) = self.two_reg::<u64>(i.b(), i.c());
-                self.set_reg(i.a(), a != b);
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a != b);
             }
 
-            Opcode::IGT => {
-                let (a, b) = self.two_reg::<i64>(i.b(), i.c());
-                self.set_reg(i.a(), a > b);
+            Opcode::SGT => {
+                let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a > b);
             }
-            Opcode::ILT => {
-                let (a, b) = self.two_reg::<i64>(i.b(), i.c());
-                self.set_reg(i.a(), a < b);
+            Opcode::SLT => {
+                let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a < b);
             }
-            Opcode::IGE => {
-                let (a, b) = self.two_reg::<i64>(i.b(), i.c());
-                self.set_reg(i.a(), a >= b);
+            Opcode::SGE => {
+                let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a >= b);
             }
-            Opcode::ILE => {
-                let (a, b) = self.two_reg::<i64>(i.b(), i.c());
-                self.set_reg(i.a(), a <= b);
+            Opcode::SLE => {
+                let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a <= b);
             }
 
             Opcode::UGT => {
-                let (a, b) = self.two_reg::<u64>(i.b(), i.c());
-                self.set_reg(i.a(), a > b);
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a > b);
             }
             Opcode::ULT => {
-                let (a, b) = self.two_reg::<u64>(i.b(), i.c());
-                self.set_reg(i.a(), a < b);
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a < b);
             }
             Opcode::UGE => {
-                let (a, b) = self.two_reg::<u64>(i.b(), i.c());
-                self.set_reg(i.a(), a >= b);
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a >= b);
             }
             Opcode::ULE => {
-                let (a, b) = self.two_reg::<u64>(i.b(), i.c());
-                self.set_reg(i.a(), a <= b);
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a <= b);
             }
 
             Opcode::FEQ => {
-                let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-                self.set_reg(i.a(), a == b);
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a == b);
             }
             Opcode::FNE => {
-                let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-                self.set_reg(i.a(), a != b);
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a != b);
             }
             Opcode::FGT => {
-                let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-                self.set_reg(i.a(), a > b);
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a > b);
             }
             Opcode::FLT => {
-                let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-                self.set_reg(i.a(), a < b);
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a < b);
             }
             Opcode::FGE => {
-                let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-                self.set_reg(i.a(), a >= b);
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a >= b);
             }
             Opcode::FLE => {
-                let (a, b) = self.two_reg::<f64>(i.b(), i.c());
-                self.set_reg(i.a(), a <= b);
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                vm.set_reg(inst::a(i), a <= b);
             }
 
             // Jumps
-            Opcode::JMP => self.pc = i.ax() as usize,
+            Opcode::JMP => {
+                vm.pc = inst::ax(i) as usize;
+            }
             Opcode::JMP_T => {
-                if self.reg::<bool>(i.a()) {
-                    self.pc = i.bx() as usize;
+                if vm.reg::<bool>(inst::a(i)) {
+                    vm.pc = inst::bx(i) as usize;
                 }
             }
             Opcode::JMP_F => {
-                if !self.reg::<bool>(i.a()) {
-                    self.pc = i.bx() as usize;
+                if !vm.reg::<bool>(inst::a(i)) {
+                    vm.pc = inst::bx(i) as usize;
+                }
+            }
+            Opcode::JEQ => {
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a == b);
+            }
+            Opcode::JNE => {
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a != b);
+            }
+            Opcode::JSLT => {
+                let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a < b);
+            }
+            Opcode::JSGT => {
+                let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a > b);
+            }
+            Opcode::JSLE => {
+                let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a <= b);
+            }
+            Opcode::JSGE => {
+                let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a >= b);
+            }
+            Opcode::JULT => {
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a < b);
+            }
+            Opcode::JUGT => {
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a > b);
+            }
+            Opcode::JULE => {
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a <= b);
+            }
+            Opcode::JUGE => {
+                let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a >= b);
+            }
+            Opcode::JFEQ => {
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a == b);
+            }
+            Opcode::JFNE => {
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a != b);
+            }
+            Opcode::JFLT => {
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a < b);
+            }
+            Opcode::JFGT => {
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a > b);
+            }
+            Opcode::JFLE => {
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a <= b);
+            }
+            Opcode::JFGE => {
+                let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
+                cmp_branch(vm, program, a >= b);
+            }
+
+            // Memory ops
+            Opcode::LOAD => {
+                let (ptr, off) = vm.two_reg::<word>(inst::b(i), inst::c(i));
+                let start = (ptr + off) as usize;
+                match memory.get(start..start + size_of::<Value>()) {
+                    Some(slice) => vm.set_reg_raw(inst::a(i), Value::copy_from_slice(slice)),
+                    None => return Ok(RunOutcome::Trapped(Fault::MemoryOOB)),
+                }
+            }
+            Opcode::STORE => {
+                let (ptr, off) = vm.two_reg::<word>(inst::b(i), inst::c(i));
+                let start = (ptr + off) as usize;
+                match memory.get_mut(start..start + size_of::<Value>()) {
+                    Some(slice) => slice.copy_from_slice(&Value::to_le_bytes(vm.reg_raw(inst::a(i)))),
+                    None => return Ok(RunOutcome::Trapped(Fault::MemoryOOB)),
                 }
             }
 
             // Calls
             Opcode::CALL => {
-                let func = self.program.functions[i.bx() as usize];
-                match func.callable {
-                    Callable::Vm(entry) => self.call_vm(i.a(), entry, func.nreg),
-                    Callable::Host(host) => self.call_host(i.a(), host, func.nreg)?,
+                let id = inst::bx(i) as FunctionId;
+                let func = program.function(id);
+                match func.ty {
+                    FnType::Hxvm { entry_pc } => vm.callvm(inst::a(i), entry_pc, func.nreg),
+                    FnType::Host { syscode } => match vm.callh(inst::a(i), host, syscode, func.narg, func.nret)? {
+                        Flow::Suspend => return Ok(RunOutcome::Suspended),
+                        Flow::Continue => {}
+                    },
                 }
             }
-            Opcode::CALLR => {
-                let id = self.reg::<FunctionId>(i.b());
-                let func = self.program.functions[id as usize];
-                match func.callable {
-                    Callable::Vm(entry) => self.call_vm(i.a(), entry, func.nreg),
-                    Callable::Host(host) => self.call_host(i.a(), host, func.nreg)?,
+            Opcode::CALL_INDIRECT => {
+                let id = vm.reg::<FunctionId>(inst::b(i));
+                let func = program.function(id);
+                match func.ty {
+                    FnType::Hxvm { entry_pc } => vm.callvm(inst::a(i), entry_pc, func.nreg),
+                    FnType::Host { syscode } => match vm.callh(inst::a(i), host, syscode, func.narg, func.nret)? {
+                        Flow::Suspend => return Ok(RunOutcome::Suspended),
+                        Flow::Continue => {}
+                    },
                 }
             }
-            Opcode::RET => {
-                let frame = self.pop_frame()?;
-                self.pc = frame.ret_pc;
-                self.base = frame.ret_base;
-            }
+            Opcode::RET => match vm.call_stack.pop() {
+                Some(frame) => {
+                    vm.pc = frame.ret_pc;
+                    vm.base = frame.ret_base;
+                }
+                None => return Ok(RunOutcome::Completed),
+            },
 
-            Opcode::LOAD => {
-                let (ptr, off) = self.two_reg::<usize>(i.b(), i.c());
-                let val = self.memory.load_value(ptr + off)?;
-                self.set_reg_raw(i.a(), val);
-            }
-            Opcode::STORE => {
-                let (ptr, off) = self.two_reg::<usize>(i.a(), i.b());
-                let val = self.reg_raw(i.c());
-                self.memory.store_value(ptr + off, val)?;
-            }
+            Opcode::HALT => return Ok(RunOutcome::Completed),
 
-            Opcode::HALT => return Ok(()),
-
-            op => return Err(VMError::UnknownOp(op)),
+            op => return Err(Error::UnknownOp(op)),
         }
-
-        Ok(())
     }
-
-    #[inline(always)]
-    pub fn raise_interrupt(&mut self, interrupt: Interrupt) {
-        self.pending_interrupt = Some(interrupt);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Interrupt {
-    Timer,
-    Io,
-    Trap,
-    Fault,
+    Err(Error::PcOOB)
 }

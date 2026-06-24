@@ -129,20 +129,61 @@ pub enum ExprKind {
         index: ExprId,
     },
 
+    /// Access a memeber from a scope (module, enum, struct)
+    ///
+    /// Example:
+    /// ```
+    /// mod math { fn square(x: int): int { x * x } }
+    /// let x = math::square(5);
+    /// ```
+    ScopeAccess {
+        base: ExprId,
+        member: Ident,
+    },
+
     /// Expression to be evaluated at compile time
     ///
     /// Example
     /// ```
     /// let x = comptime fibonacci(n);
     /// ```
-    Comptime(ExprId),
+    Const(ExprId),
 
+    // Types
     IntType,
     UintType,
     BoolType,
     FloatType,
     VoidType,
+
+    /// `?T` optional type
     OptionType(ExprId),
+
+    /// `[T; N]` array type. elem and len are exprs.
+    ArrayType {
+        elem: ExprId,
+        len: ExprId,
+    },
+
+    /// `fn(T, U): R` function type
+    FnType {
+        params: Vec<ExprId>,
+        ret: ExprId,
+    },
+
+    /// `struct { ... }`  type value
+    StructType {
+        fields: Vec<FieldDef>,
+        //TODO: declarations
+    },
+
+    /// tagged `union { ... }` type value
+    UnionType {
+        variants: Vec<FieldDef>,
+    },
+
+    /// non-instantiable `mod { ... }` type value
+    ModuleType(Vec<DeclId>),
 }
 
 #[derive(Debug, Clone)]
@@ -154,8 +195,15 @@ pub struct FieldInit {
 
 #[derive(Debug, Clone)]
 pub struct Param {
-    pub comptime: bool,
-    pub mutable: bool,
+    pub name: Ident,
+    pub ty: ExprId,
+    pub is_const: bool,
+    pub is_mut: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldDef {
     pub name: Ident,
     pub ty: ExprId,
     pub span: Span,
@@ -201,18 +249,8 @@ pub struct Decl {
     pub span: Span,
 }
 
-impl Decl {
-    pub fn as_module(&self) -> Option<&[DeclId]> {
-        match &self.kind {
-            DeclKind::Mod(module) => Some(module),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum DeclKind {
-    Mod(Vec<DeclId>),
     Func {
         params: Vec<Param>,
         ret: Option<ExprId>,
@@ -331,8 +369,8 @@ impl std::fmt::Display for AssignOp {
 }
 
 pub struct Ast {
-    exprs: Arena<ExprId, Expr>,
-    decls: Arena<DeclId, Decl>,
+    pub exprs: Arena<ExprId, Expr>,
+    pub decls: Arena<DeclId, Decl>,
 }
 
 impl Ast {

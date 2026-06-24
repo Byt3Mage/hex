@@ -4,8 +4,8 @@ use crate::{
     arena::Interner,
     compiler::{
         ast::{
-            AssignOp, Ast, BinOp, Decl, DeclId, DeclKind, Expr, ExprKind, Param, Stmt, StmtKind,
-            UnOp, Visibility,
+            AssignOp, Ast, BinOp, Decl, DeclId, DeclKind, Expr, ExprId, ExprKind, Param, Stmt,
+            StmtKind, UnOp, Visibility,
         },
         lexer::{Lexer, LexerError},
         parse_rules::{InfixRule, ParseRule, Precedence, PrefixRule},
@@ -94,7 +94,7 @@ impl<'a> Parser<'a> {
     /// Parse a source file, returning the ID of the module declaration.
     ///
     /// Each source file corresponds to a single module declaration.
-    pub fn parse(&mut self) -> ParseResult<DeclId> {
+    pub fn parse(&mut self) -> ParseResult<ExprId> {
         let span = self.current.span;
 
         let mut decls = vec![];
@@ -103,26 +103,20 @@ impl<'a> Parser<'a> {
             decls.push(self.ast.insert_decl(decl));
         }
 
-        let module = Decl {
-            vis: Visibility::Public,
-            name: self.intern.get_or_intern("crate"),
-            kind: DeclKind::Mod(decls),
+        let module = Expr {
+            kind: ExprKind::ModuleType(decls),
             span: span.merge(self.current.span),
         };
 
-        Ok(self.ast.insert_decl(module))
+        Ok(self.ast.insert_expr(module))
     }
 
     fn parse_decl(&mut self) -> ParseResult<Decl> {
         let vis = self.parse_visibility()?;
 
         match self.current.ty {
-            tt![mod] => self.parse_mod_decl(vis),
             tt![fn] => self.parse_func_decl(vis),
             tt![const] => self.parse_const_decl(vis),
-            //tt![struct] => self.parse_struct_decl(vis),
-            //tt![union] => self.parse_union_decl(vis),
-            //tt![enum] => self.parse_enum_decl(vis),
             tt => Err(ParseError {
                 msg: format!("Expected declaration, found {tt:?}"),
                 span: self.current.span,
@@ -134,29 +128,6 @@ impl<'a> Parser<'a> {
         Ok(tnr! { self.advance_if(tt![pub])? => Visibility::Public : Visibility::Private})
     }
 
-    fn parse_mod_decl(&mut self, vis: Visibility) -> ParseResult<Decl> {
-        let mod_token = self.expect(tt![mod])?;
-        let mod_name = self.expect(tt![ident])?;
-
-        self.expect(tt!['{'])?;
-
-        let mut decls = vec![];
-
-        while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
-            let item = self.parse_decl()?;
-            decls.push(self.ast.insert_decl(item));
-        }
-
-        let r_brace = self.expect(tt!['}'])?;
-
-        Ok(Decl {
-            vis,
-            name: self.intern.get_or_intern(mod_name.lexeme),
-            kind: DeclKind::Mod(decls),
-            span: mod_token.span.merge(r_brace.span),
-        })
-    }
-
     fn parse_func_decl(&mut self, vis: Visibility) -> ParseResult<Decl> {
         let fn_token = self.expect(tt![fn])?;
         let func_name = self.expect(tt![ident])?;
@@ -165,18 +136,21 @@ impl<'a> Parser<'a> {
 
         let mut params = vec![];
         while !matches!(self.current.ty, tt![')'] | tt![eof]) {
-            let comptime = self.advance_if(tt![comptime])?;
-            let mutable = self.advance_if(tt![mut])?;
+            let is_const = self.advance_if(tt![const])?;
+            let is_mutable = self.advance_if(tt![mut])?;
             let name = self.expect(tt![ident])?;
+
             self.expect(tt![:])?;
+
             let ty = self.parse_expr()?;
+            let span = name.span.merge(ty.span);
 
             params.push(Param {
-                comptime,
-                mutable,
                 name: self.intern.get_or_intern(name.lexeme),
-                span: name.span.merge(ty.span),
                 ty: self.ast.insert_expr(ty),
+                is_const,
+                is_mut: is_mutable,
+                span,
             });
 
             if !self.advance_if(tt![,])? {
@@ -447,6 +421,7 @@ impl<'a> Parser<'a> {
             PrefixRule::Float => self.parse_float_type(),
             PrefixRule::Void => self.parse_void_type(),
             PrefixRule::Option => self.parse_option_type(),
+            PrefixRule::Module => self.parse_module_type(),
             PrefixRule::None => Err(ParseError {
                 msg: format!("Expected expression, found {:?}", self.current.ty),
                 span: self.current.span,
@@ -551,6 +526,25 @@ impl<'a> Parser<'a> {
         Ok(Expr {
             kind: ExprKind::OptionType(self.ast.insert_expr(inner)),
             span: option_ty.span,
+        })
+    }
+
+    fn parse_module_type(&mut self) -> ParseResult<Expr> {
+        let mod_token = self.expect(tt![mod])?;
+
+        self.expect(tt!['{'])?;
+
+        let mut decls = vec![];
+        while !matches!(self.current.ty, tt!['}'] | tt![eof]) {
+            let decl = self.parse_decl()?;
+            decls.push(self.ast.insert_decl(decl));
+        }
+
+        let r_brace = self.expect(tt!['}'])?;
+
+        Ok(Expr {
+            kind: ExprKind::ModuleType(decls),
+            span: mod_token.span.merge(r_brace.span),
         })
     }
 
@@ -944,10 +938,10 @@ impl<'a> Parser<'a> {
         let break_token = self.expect(tt![break])?;
         let mut span = break_token.span;
 
-        /*let expr = if self.can_start_expr() {
+        let expr = if self.can_start_expr() {
             let expr = self.parse_expr()?;
             span = span.merge(expr.span);
-            Some(self.ast.exprs.insert(expr))
+            Some(self.ast.insert_expr(expr))
         } else {
             None
         };
@@ -955,18 +949,16 @@ impl<'a> Parser<'a> {
         Ok(Expr {
             kind: ExprKind::Break(expr),
             span,
-        })*/
-        todo!()
+        })
     }
 
     fn parse_continue(&mut self) -> ParseResult<Expr> {
         let continue_token = self.expect(tt![continue])?;
 
-        /*  Ok(Expr {
+        Ok(Expr {
             kind: ExprKind::Continue,
             span: continue_token.span,
-        })*/
-        todo!()
+        })
     }
 
     fn parse_call(&mut self, callee: Expr) -> ParseResult<Expr> {
@@ -998,14 +990,13 @@ impl<'a> Parser<'a> {
         self.expect(tt![.])?;
         let field = self.expect(tt![ident])?;
 
-        /*Ok(Expr {
+        Ok(Expr {
             span: object.span.merge(field.span),
             kind: ExprKind::Field {
-                object: self.ast.exprs.insert(object),
+                object: self.ast.insert_expr(object),
                 field: self.intern.get_or_intern(field.lexeme),
             },
-        })*/
-        todo!()
+        })
     }
 
     fn parse_index(&mut self, object: Expr) -> ParseResult<Expr> {
@@ -1024,6 +1015,6 @@ impl<'a> Parser<'a> {
 }
 
 #[inline(always)]
-pub fn parse(ast: &mut Ast, intern: &mut Interner, source: &str) -> Result<DeclId, ParseError> {
+pub fn parse(ast: &mut Ast, intern: &mut Interner, source: &str) -> Result<ExprId, ParseError> {
     Parser::new(ast, intern, source)?.parse()
 }

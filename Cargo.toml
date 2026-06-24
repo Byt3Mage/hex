@@ -1,6 +1,6 @@
 
 [workspace]
-members = [
+members = ["crates/hex-asm",
     "crates/hex-mir",
     "crates/hex-runtime",
     "crates/hex-vm",

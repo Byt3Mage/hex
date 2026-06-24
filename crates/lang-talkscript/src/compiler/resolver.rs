@@ -21,10 +21,10 @@ pub struct Symbol {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
-    Var(bool),
-    Mod(DeclId),
-    Func(DeclId),
-    Const(DeclId),
+    Module(DeclId),
+    Function(DeclId),
+    Constant(DeclId),
+    Variable { is_mut: bool },
 }
 
 define_id!(ScopeId);
@@ -147,7 +147,7 @@ impl<'a> SymbolTable<'a> {
                     in_scope,
                     Symbol {
                         name: decl.name,
-                        kind: SymbolKind::Mod(decl_id),
+                        kind: SymbolKind::Module(decl_id),
                         span: decl.span,
                     },
                 )?;
@@ -162,7 +162,7 @@ impl<'a> SymbolTable<'a> {
                     in_scope,
                     Symbol {
                         name: decl.name,
-                        kind: SymbolKind::Func(decl_id),
+                        kind: SymbolKind::Function(decl_id),
                         span: decl.span,
                     },
                 )?;
@@ -174,7 +174,7 @@ impl<'a> SymbolTable<'a> {
                     in_scope,
                     Symbol {
                         name: decl.name,
-                        kind: SymbolKind::Const(decl_id),
+                        kind: SymbolKind::Constant(decl_id),
                         span: decl.span,
                     },
                 )?;
@@ -203,7 +203,9 @@ impl<'a> SymbolTable<'a> {
                         scope,
                         Symbol {
                             name: param.name,
-                            kind: SymbolKind::Var(param.mutable),
+                            kind: SymbolKind::Variable {
+                                is_mut: param.is_mut,
+                            },
                             span: param.span,
                         },
                     )?;
@@ -256,9 +258,7 @@ impl<'a> SymbolTable<'a> {
                     self.resolve_expr(in_scope, field.value)?;
                 }
             }
-            ExprKind::Group(expr) | ExprKind::Comptime(expr) => {
-                self.resolve_expr(in_scope, *expr)?
-            }
+            ExprKind::Group(expr) | ExprKind::Const(expr) => self.resolve_expr(in_scope, *expr)?,
             ExprKind::Unary { rhs, .. } => self.resolve_expr(in_scope, *rhs)?,
             ExprKind::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(in_scope, *lhs)?;
@@ -321,7 +321,18 @@ impl<'a> SymbolTable<'a> {
             | ExprKind::BoolType
             | ExprKind::FloatType
             | ExprKind::VoidType => {}
+
             ExprKind::OptionType(expr) => self.resolve_expr(in_scope, *expr)?,
+            ExprKind::ModuleType(decls) => {
+                for decl in decls {
+                    self.resolve_decl(in_scope, *decl)?;
+                }
+            }
+            ExprKind::ScopeAccess { base, member } => todo!(),
+            ExprKind::ArrayType { elem, len } => todo!(),
+            ExprKind::FnType { params, ret } => todo!(),
+            ExprKind::StructType { fields } => todo!(),
+            ExprKind::UnionType { variants } => todo!(),
         }
 
         Ok(())
@@ -343,7 +354,7 @@ impl<'a> SymbolTable<'a> {
                     in_scope,
                     Symbol {
                         name: *name,
-                        kind: SymbolKind::Var(*mutable),
+                        kind: SymbolKind::Variable { is_mut: *mutable },
                         span: stmt.span,
                     },
                 )?;
@@ -371,7 +382,7 @@ pub fn resolve<'a>(
         scope,
         Symbol {
             name: decl.name,
-            kind: SymbolKind::Mod(module),
+            kind: SymbolKind::Module(module),
             span: decl.span,
         },
     )?;

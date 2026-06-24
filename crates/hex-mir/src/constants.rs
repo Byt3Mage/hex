@@ -4,18 +4,15 @@ use crate::{ConstVal, vm};
 
 pub struct ConstantPool {
     values: Vec<vm::Value>,
-    dedup: HashMap<u64, vm::InstType>,
+    dedup: HashMap<u64, vm::Instruction>,
 }
 
 impl ConstantPool {
     pub fn new() -> Self {
-        Self {
-            values: Vec::new(),
-            dedup: HashMap::new(),
-        }
+        Self { values: Vec::new(), dedup: HashMap::new() }
     }
 
-    pub fn insert(&mut self, val: &ConstVal) -> vm::InstType {
+    pub fn insert(&mut self, val: &ConstVal) -> vm::Instruction {
         let bits = match val {
             ConstVal::Int(i) => *i as u64,
             ConstVal::Uint(u) => *u as u64,
@@ -26,7 +23,7 @@ impl ConstantPool {
         if let Some(&idx) = self.dedup.get(&bits) {
             return idx;
         }
-        let idx = self.values.len() as vm::InstType;
+        let idx = self.values.len() as vm::Instruction;
         self.dedup.insert(bits, idx);
         self.values.push(vm::Value::from_bits(bits));
         idx

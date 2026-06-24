@@ -43,6 +43,13 @@ where
         }
     }
 
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            items: Vec::with_capacity(capacity),
+            _marker: PhantomData,
+        }
+    }
+
     pub fn insert(&mut self, item: T) -> I {
         let id = self.items.len();
         self.items.push(item);

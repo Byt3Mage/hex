@@ -61,14 +61,9 @@ pub fn compile_module(module: &Module) -> Result<Compilation, CodegenError> {
         })
         .collect::<Result<_, CodegenError>>()?;
 
-    Ok(Compilation {
-        program: Program {
-            instructions: ctx.bytecode.into(),
-            constants: ctx.constants.into(),
-            functions: ctx.functions.into(),
-        },
-        functions,
-    })
+    let program = Program::new(ctx.bytecode.into(), ctx.constants.into(), ctx.functions.into());
+
+    Ok(Compilation { program, functions })
 }
 
 fn compile_function(
@@ -99,7 +94,7 @@ fn compile_function(
     for blk in &codegen.func.blocks {
         codegen
             .blk_pcs
-            .insert(blk.id, codegen.ctx.bytecode.len() as vm::InstType);
+            .insert(blk.id, codegen.ctx.bytecode.len() as vm::Instruction);
 
         for inst in &blk.insts {
             codegen.emit_inst(inst);
@@ -110,15 +105,12 @@ fn compile_function(
 
     // Patch all pending jump targets.
     for patch in &codegen.pending {
-        let target_pc = *codegen
-            .blk_pcs
-            .get(&patch.tgt)
-            .expect("block has recoded PC");
+        let target_pc = *codegen.blk_pcs.get(&patch.tgt).expect("block has recoded PC");
 
         codegen.ctx.bytecode[patch.inst_idx] = match patch.kind {
             JumpKind::Jmp => vm::jmp(target_pc),
-            JumpKind::JmpT { cond } => vm::jmp_t(cond, target_pc),
-            JumpKind::JmpF { cond } => vm::jmp_f(cond, target_pc),
+            JumpKind::JmpT { cond } => vm::jmpt(cond, target_pc),
+            JumpKind::JmpF { cond } => vm::jmpf(cond, target_pc),
         };
     }
 
@@ -129,7 +121,7 @@ fn compile_function(
     let ptr = ctx.functions.len() as FunctionId;
 
     ctx.functions.push(vm::Function {
-        callable: vm::Callable::Vm(entry_pc),
+        ty: vm::FnType::Hxvm { entry_pc },
         narg,
         nret,
         nreg,
@@ -144,7 +136,7 @@ struct Codegen<'a> {
     alloc: &'a mut RegAlloc,
     edges: &'a EdgeMoves,
     /// Map from BlockId to the PC at which that block's first instruction lives.
-    blk_pcs: HashMap<BlockId, vm::InstType>,
+    blk_pcs: HashMap<BlockId, vm::Instruction>,
     /// Jumps whose targets we couldn't resolve yet, to be patched at the end.
     pending: Vec<JumpPatch>,
 }
@@ -176,7 +168,7 @@ impl<'a> Codegen<'a> {
         match inst {
             Inst::Const { val, .. } => {
                 let idx = self.ctx.constants.insert(val);
-                self.emit(vm::const_(dst, idx));
+                self.emit(vm::loadk(dst, idx));
             }
 
             Inst::Binary { op, lhs, rhs, .. } => {
@@ -213,19 +205,11 @@ impl<'a> Codegen<'a> {
 
                 let inst_idx = self.ctx.bytecode.len();
                 self.emit(vm::jmp(0));
-                self.pending.push(JumpPatch {
-                    inst_idx,
-                    tgt: *tgt,
-                    kind: JumpKind::Jmp,
-                });
+                self.pending
+                    .push(JumpPatch { inst_idx, tgt: *tgt, kind: JumpKind::Jmp });
             }
 
-            Term::Branch {
-                cond,
-                then_blk,
-                else_blk,
-                ..
-            } => {
+            Term::Branch { cond, then_blk, else_blk, .. } => {
                 let cond = self.alloc.reg_of(*cond);
                 let then_movs = self.edges.on_branch_then.get(&block);
                 let else_movs = self.edges.on_branch_else.get(&block);
@@ -285,13 +269,13 @@ impl<'a> Codegen<'a> {
             //   JMP   then_blk
             (Some(then_moves), Some(else_moves)) => {
                 let jmp_t_idx = self.ctx.bytecode.len();
-                self.emit(vm::jmp_t(cond, 0)); // patched below
+                self.emit(vm::jmpt(cond, 0)); // patched below
 
                 self.emit_moves(&else_moves);
                 self.emit_pending(JumpKind::Jmp, else_blk);
 
-                let then_pc = self.ctx.bytecode.len() as vm::InstType;
-                self.ctx.bytecode[jmp_t_idx] = vm::jmp_t(cond, then_pc);
+                let then_pc = self.ctx.bytecode.len() as vm::Instruction;
+                self.ctx.bytecode[jmp_t_idx] = vm::jmpt(cond, then_pc);
 
                 self.emit_moves(&then_moves);
                 self.emit_pending(JumpKind::Jmp, then_blk);
@@ -305,15 +289,11 @@ impl<'a> Codegen<'a> {
         let inst_idx = self.ctx.bytecode.len();
         let placeholder = match kind {
             JumpKind::Jmp => vm::jmp(0),
-            JumpKind::JmpT { cond } => vm::jmp_t(cond, 0),
-            JumpKind::JmpF { cond } => vm::jmp_f(cond, 0),
+            JumpKind::JmpT { cond } => vm::jmpt(cond, 0),
+            JumpKind::JmpF { cond } => vm::jmpf(cond, 0),
         };
         self.emit(placeholder);
-        self.pending.push(JumpPatch {
-            inst_idx,
-            tgt,
-            kind,
-        });
+        self.pending.push(JumpPatch { inst_idx, tgt, kind });
     }
 
     /// Emit return: place each `vals[i]` into register `i`, then RET.
@@ -322,10 +302,7 @@ impl<'a> Codegen<'a> {
             let moves: Vec<Move> = vals
                 .iter()
                 .enumerate()
-                .map(|(i, &v)| Move {
-                    src: self.alloc.reg_of(v),
-                    dst: i as vm::Reg,
-                })
+                .map(|(i, &v)| Move { src: self.alloc.reg_of(v), dst: i as vm::Reg })
                 .collect();
 
             let moves = resolve_parallel_moves(&moves, self.alloc)?;
@@ -355,10 +332,10 @@ fn binopcode(op: BinOp) -> vm::Opcode {
         BinOp::Eq => vm::Opcode::EQ,
         BinOp::Ne => vm::Opcode::NE,
 
-        BinOp::SLt => vm::Opcode::ILT,
-        BinOp::SLe => vm::Opcode::ILE,
-        BinOp::SGt => vm::Opcode::IGT,
-        BinOp::SGe => vm::Opcode::IGE,
+        BinOp::SLt => vm::Opcode::SLT,
+        BinOp::SLe => vm::Opcode::SLE,
+        BinOp::SGt => vm::Opcode::SGT,
+        BinOp::SGe => vm::Opcode::SGE,
 
         BinOp::ULt => vm::Opcode::ULT,
         BinOp::ULe => vm::Opcode::ULE,

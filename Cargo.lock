@@ -59,6 +59,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hex-asm"
+version = "0.1.0"
+dependencies = [
+ "hex-vm",
+]
+
+[[package]]
 name = "hex-mir"
 version = "0.1.0"
 dependencies = [
@@ -71,6 +78,8 @@ name = "hex-runtime"
 version = "0.1.0"
 dependencies = [
  "hex-vm",
+ "slotmap",
+ "smallvec",
  "thiserror",
 ]
 
@@ -146,6 +155,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "slotmap"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdd58c3c93c3d278ca835519292445cb4b0d4dc59ccfdf7ceadaab3f8aeb4038"
+dependencies = [
+ "version_check",
 ]
 
 [[package]]

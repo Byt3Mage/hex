@@ -38,6 +38,7 @@ pub enum PrefixRule {
     Float,
     Void,
     Option,
+    Module,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,6 +479,13 @@ static RULES: [ParseRule; TokenType::COUNT] = {
 
     rules[tt![?] as usize] = ParseRule {
         prefix: PrefixRule::Option,
+        infix: InfixRule::None,
+        prec: Precedence::Primary,
+        right_assoc: false,
+    };
+
+    rules[tt![mod] as usize] = ParseRule {
+        prefix: PrefixRule::Module,
         infix: InfixRule::None,
         prec: Precedence::Primary,
         right_assoc: false,
