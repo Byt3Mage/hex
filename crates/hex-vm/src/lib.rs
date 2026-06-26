@@ -2,7 +2,6 @@ mod disassemble;
 mod error;
 mod host;
 mod instruction;
-mod interrupt;
 mod program;
 mod value;
 
@@ -10,7 +9,6 @@ pub use disassemble::disassemble;
 pub use error::*;
 pub use host::{Flow, Host, HostCtx, Syscode};
 pub use instruction::*;
-pub use interrupt::*;
 pub use program::*;
 pub use value::{Args, IsValue, Value};
 
@@ -47,6 +45,23 @@ impl VM {
         let mut vm = Self::default();
         vm.set_entry(program, func, args)?;
         Ok(vm)
+    }
+
+    pub fn set_entry(&mut self, program: &Program, entry: FunctionId, args: Args) -> Result<(), Error> {
+        let func = program.function(entry);
+        let argc = args.count();
+
+        if argc != func.narg {
+            return Err(Error::ArgcMismatch { exp: func.narg, got: argc });
+        }
+
+        self.reset();
+        self.registers.resize(func.nreg as usize, Value::ZERO);
+        self.registers[..args.len()].copy_from_slice(&args);
+        self.pc = func.ty.entry_pc()?;
+        self.base = 0;
+
+        Ok(())
     }
 
     #[inline(always)]
@@ -138,23 +153,6 @@ impl VM {
         nret: Reg,
     ) -> Result<Flow, Error> {
         host.syscall(syscode, HostCtx { base: self.reg_offset(ret), narg, nret, vm: self })
-    }
-
-    pub fn set_entry(&mut self, program: &Program, entry: FunctionId, args: Args) -> Result<(), Error> {
-        let func = program.function(entry);
-        let argc = args.count();
-
-        if argc != func.narg {
-            return Err(Error::ArgcMismatch { exp: func.narg, got: argc });
-        }
-
-        self.reset();
-        self.registers.resize(func.nreg as usize, Value::ZERO);
-        self.registers[..args.len()].copy_from_slice(&args);
-        self.pc = func.ty.entry_pc()?;
-        self.base = 0;
-
-        Ok(())
     }
 }
 
@@ -474,7 +472,7 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                     },
                 }
             }
-            Opcode::CALL_INDIRECT => {
+            Opcode::CALL_IND => {
                 let id = vm.reg::<FunctionId>(inst::b(i));
                 let func = program.function(id);
                 match func.ty {
@@ -483,6 +481,79 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                         Flow::Suspend => return Ok(RunOutcome::Suspended),
                         Flow::Continue => {}
                     },
+                }
+            }
+            Opcode::TCALL => {
+                let id = inst::bx(i) as FunctionId;
+
+                let func = program.function(id);
+                match func.ty {
+                    FnType::Hxvm { entry_pc } => {
+                        let src = vm.reg_offset(inst::a(i));
+
+                        // Move args down to the CURRENT base (reusing this frame's slot).
+                        // src >= self.base always (a_reg >= 0), so copy_within is forward-safe
+                        // only if src >= dst; here dst = self.base <= src, so left-shift: OK.
+                        vm.registers.copy_within(src..src + func.narg as usize, vm.base);
+
+                        // grow window to callee's nreg from the SAME base (no frame push)
+                        let last = vm.base + func.nreg as usize;
+                        if last > vm.registers.len() {
+                            vm.registers.resize(last, Value::ZERO);
+                        }
+
+                        vm.pc = entry_pc;
+                    }
+                    FnType::Host { syscode } => {
+                        let base = vm.base;
+                        let ctx = HostCtx { vm, base, narg: func.narg, nret: func.nret };
+                        match host.syscall(syscode, ctx)? {
+                            Flow::Suspend => return Ok(RunOutcome::Suspended),
+                            Flow::Continue => match vm.call_stack.pop() {
+                                Some(fr) => {
+                                    vm.pc = fr.ret_pc;
+                                    vm.base = fr.ret_base;
+                                }
+                                None => return Ok(RunOutcome::Completed),
+                            },
+                        }
+                    }
+                }
+            }
+            Opcode::TCALL_IND => {
+                let id = vm.reg::<FunctionId>(inst::b(i));
+                let func = program.function(id);
+                match func.ty {
+                    FnType::Hxvm { entry_pc } => {
+                        let src = vm.reg_offset(inst::a(i));
+
+                        // Move args down to the CURRENT base (reusing this frame's slot).
+                        // src >= self.base always (a_reg >= 0), so copy_within is forward-safe
+                        // only if src >= dst; here dst = self.base <= src, so left-shift: OK.
+                        vm.registers.copy_within(src..src + func.narg as usize, vm.base);
+
+                        // grow window to callee's nreg from the SAME base (no frame push)
+                        let last = vm.base + func.nreg as usize;
+                        if last > vm.registers.len() {
+                            vm.registers.resize(last, Value::ZERO);
+                        }
+
+                        vm.pc = entry_pc;
+                    }
+                    FnType::Host { syscode } => {
+                        let base = vm.base;
+                        let ctx = HostCtx { vm, base, narg: func.narg, nret: func.nret };
+                        match host.syscall(syscode, ctx)? {
+                            Flow::Suspend => return Ok(RunOutcome::Suspended),
+                            Flow::Continue => match vm.call_stack.pop() {
+                                Some(frame) => {
+                                    vm.pc = frame.ret_pc;
+                                    vm.base = frame.ret_base;
+                                }
+                                None => return Ok(RunOutcome::Completed),
+                            },
+                        }
+                    }
                 }
             }
             Opcode::RET => match vm.call_stack.pop() {

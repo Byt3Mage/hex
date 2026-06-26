@@ -102,7 +102,7 @@ define_opcodes! {
     JULT, JUGT, JULE, JUGE, // unsigned int compare-branch
     JFEQ, JFNE, JFLT, JFGT, JFLE, JFGE, // float compare-branch
     LOAD, STORE, STORE_ADDRESS, // Heap memory ops
-    RET, CALL, CALL_INDIRECT, // Return and call ops
+    RET, CALL, CALL_IND, TCALL, TCALL_IND, // Return and call ops
     HALT // end program
 }
 
@@ -557,7 +557,17 @@ pub const fn call(ret: Reg, func: Instruction) -> Instruction {
 
 #[inline(always)]
 pub const fn callr(ret: Reg, func: Reg) -> Instruction {
-    encode_abc(Opcode::CALL_INDIRECT, ret, func, R0)
+    encode_abc(Opcode::CALL_IND, ret, func, R0)
+}
+
+#[inline(always)]
+pub const fn tcall(ret: Reg, func: Instruction) -> Instruction {
+    encode_abx(Opcode::TCALL, ret, func)
+}
+
+#[inline(always)]
+pub const fn tcallr(ret: Reg, func: Reg) -> Instruction {
+    encode_abc(Opcode::TCALL_IND, ret, func, R0)
 }
 
 #[inline(always)]

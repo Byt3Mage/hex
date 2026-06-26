@@ -1,0 +1,10 @@
+// fact(n, acc): n == 0 ? acc : fact(n-1, acc*n)
+fn fact(2, 1, 3):
+    loadi R2, $0
+    jeq   R0, R2, @done     // n == 0 -> return acc
+    mul   R1, R1, R0        // acc = acc * n
+    subi  R0, R0, $1        // n = n - 1
+    tcall R0, fact          // args at R0..
+@done:
+    copy  R0, R1            // return acc
+    ret

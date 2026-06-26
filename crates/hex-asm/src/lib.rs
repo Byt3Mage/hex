@@ -1,58 +1,30 @@
-//! hxasm — assembler for the hxvm instruction set.
+//! hxasm — assembler targeting the hex VM `Program`.
 //!
-//! Syntax:
-//!   // line comment
-//!   const NAME = 42          // int constant
-//!   const PI = 3.14          // float constant
-//!   fn NAME(narg, nret, nreg):   // function header; entry pc = next instruction
-//!       <instructions>
+//! Directives:
+//!   const NAME = 42            int constant  -> Value
+//!   const NAME = 3.14          float constant -> Value
+//!   host  NAME(narg, nret) = 7 host function (syscode 7)
+//!   fn    NAME(narg, nret, nreg):   VM function; entry_pc = next instruction
+//!       <body>
 //!       ret
 //!
 //! Operands:
-//!   R0, r1     register (upper/lower)
-//!   $123, $-4  signed immediate
-//!   #NAME      constant-pool reference
-//!   @label     jump target (defined as `@label:` on its own line)
-//!   NAME       function reference (CALL only; a const here is an error)
+//!   R0 / r1     register
+//!   $123 / $-4  signed immediate (LOADI/LOADF, ADDI/SUBI/MULI)
+//!   #NAME       constant-pool reference (LOADK, *K)
+//!   @label      jump target (`@label:` defines it)
+//!   NAME        function reference (CALL only; const here = error)
 
 use std::collections::HashMap;
 use std::fmt;
 
 use hex_vm::*;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Const {
-    Int(i64),
-    Float(f64),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum FnKind {
-    Vm { entry_pc: usize },
-}
-
-#[derive(Debug, Clone)]
-pub struct FnDef {
-    pub name: String,
-    pub narg: Reg,
-    pub nret: Reg,
-    pub nreg: Reg,
-    pub kind: FnKind,
-}
-
-#[derive(Debug, Clone)]
-pub struct Assembled {
-    pub code: Vec<Instruction>,
-    pub constants: Vec<Const>,
-    pub functions: Vec<FnDef>,
-}
-
 #[derive(Debug, Clone)]
 pub struct AsmError {
     pub line: usize,
     pub msg: String,
 }
-
 impl fmt::Display for AsmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "line {}: {}", self.line, self.msg)
@@ -61,10 +33,11 @@ impl fmt::Display for AsmError {
 impl std::error::Error for AsmError {}
 
 type R<T> = Result<T, AsmError>;
-
 fn err<T>(line: usize, msg: impl Into<String>) -> R<T> {
     Err(AsmError { line, msg: msg.into() })
 }
+
+// ── Operands ──────────────────────────────────────────────────────────────
 
 enum Operand {
     Reg(Reg),
@@ -81,10 +54,8 @@ fn parse_operand(tok: &str, line: usize) -> R<Operand> {
     }
     let first = t.chars().next().unwrap();
     match first {
-        'R' | 'r' if t[1..].chars().all(|c| c.is_ascii_digit()) && t.len() > 1 => {
-            let n: u32 = t[1..]
-                .parse()
-                .map_err(|_| AsmError { line, msg: format!("bad register '{t}'") })?;
+        'R' | 'r' if t.len() > 1 && t[1..].bytes().all(|b| b.is_ascii_digit()) => {
+            let n: u32 = t[1..].parse().unwrap();
             if n > Reg::MAX as u32 {
                 return err(line, format!("register out of range '{t}'"));
             }
@@ -115,18 +86,19 @@ fn as_imm(op: &Operand, line: usize) -> R<i64> {
     }
 }
 
-fn split_mnemonic_operands(line_txt: &str) -> (String, Vec<String>) {
-    let line_txt = line_txt.trim();
-    let mut parts = line_txt.splitn(2, char::is_whitespace);
+fn split_mnemonic_operands(text: &str) -> (String, Vec<String>) {
+    let mut parts = text.trim().splitn(2, char::is_whitespace);
     let mnem = parts.next().unwrap_or("").to_lowercase();
     let rest = parts.next().unwrap_or("");
-    let operands = rest
+    let ops = rest
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    (mnem, operands)
+    (mnem, ops)
 }
+
+// ── Pending instructions (pre-resolution) ─────────────────────────────────
 
 enum Pending {
     Word(Instruction),
@@ -162,30 +134,37 @@ enum Pending {
     Call {
         ret: Reg,
         name: String,
+        tail: bool,
         line: usize,
     },
+}
+
+// FnType building needs to know host vs vm; track separately from Function
+// because entry_pc isn't known until layout for vm fns.
+struct PendingFn {
+    name: String,
+    narg: Reg,
+    nret: Reg,
+    nreg: Reg,
+    kind: PendingFnKind,
+}
+enum PendingFnKind {
+    Vm { entry_pc: usize },
+    Host { syscode: u8 },
 }
 
 #[derive(Default)]
 struct Builder {
     code: Vec<Pending>,
-    constants: Vec<Const>,
+    constants: Vec<Value>,
     const_by_name: HashMap<String, usize>,
-    functions: Vec<FnDef>,
+    fns: Vec<PendingFn>,
     fn_index: HashMap<String, usize>,
     labels: HashMap<String, usize>,
     pc: usize,
 }
 
-impl Builder {
-    fn intern_const(&mut self, c: Const) -> usize {
-        let i = self.constants.len();
-        self.constants.push(c);
-        i
-    }
-}
-
-pub fn assemble(src: &str) -> Result<Assembled, AsmError> {
+pub fn assemble(src: &str) -> Result<Program, AsmError> {
     let mut b = Builder::default();
 
     for (idx, raw) in src.lines().enumerate() {
@@ -196,22 +175,25 @@ pub fn assemble(src: &str) -> Result<Assembled, AsmError> {
         }
 
         if let Some(rest) = text.strip_prefix("const ") {
-            let (name, c) = parse_const_def(rest, line)?;
+            let (name, v) = parse_const_def(rest, line)?;
             if b.const_by_name.contains_key(&name) {
                 return err(line, format!("duplicate const '{name}'"));
             }
-            let id = b.intern_const(c);
+            let id = b.constants.len();
+            b.constants.push(v);
             b.const_by_name.insert(name, id);
             continue;
         }
 
+        if let Some(rest) = text.strip_prefix("host ") {
+            let pf = parse_host_header(rest, line)?;
+            register_fn(&mut b, pf, line)?;
+            continue;
+        }
+
         if let Some(rest) = text.strip_prefix("fn ") {
-            let def = parse_fn_header(rest, b.pc, line)?;
-            if b.fn_index.contains_key(&def.name) {
-                return err(line, format!("duplicate function '{}'", def.name));
-            }
-            b.fn_index.insert(def.name.clone(), b.functions.len());
-            b.functions.push(def);
+            let pf = parse_fn_header(rest, b.pc, line)?;
+            register_fn(&mut b, pf, line)?;
             continue;
         }
 
@@ -230,7 +212,16 @@ pub fn assemble(src: &str) -> Result<Assembled, AsmError> {
         emit_instruction(&mut b, text, line)?;
     }
 
-    resolve(&b)
+    resolve(b)
+}
+
+fn register_fn(b: &mut Builder, pf: PendingFn, line: usize) -> R<()> {
+    if b.fn_index.contains_key(&pf.name) {
+        return err(line, format!("duplicate function '{}'", pf.name));
+    }
+    b.fn_index.insert(pf.name.clone(), b.fns.len());
+    b.fns.push(pf);
+    Ok(())
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -240,7 +231,7 @@ fn strip_comment(line: &str) -> &str {
     }
 }
 
-fn parse_const_def(rest: &str, line: usize) -> R<(String, Const)> {
+fn parse_const_def(rest: &str, line: usize) -> R<(String, Value)> {
     let mut sides = rest.splitn(2, '=');
     let name = sides
         .next()
@@ -254,43 +245,73 @@ fn parse_const_def(rest: &str, line: usize) -> R<(String, Const)> {
     if name.is_empty() {
         return err(line, "empty const name");
     }
-    let c = if val.contains('.') || val.contains('e') || val.contains('E') {
-        Const::Float(
-            val.parse()
-                .map_err(|_| AsmError { line, msg: format!("bad float '{val}'") })?,
-        )
+    let value = if val.contains('.') || val.contains('e') || val.contains('E') {
+        let f: f64 = val
+            .parse()
+            .map_err(|_| AsmError { line, msg: format!("bad float '{val}'") })?;
+        f.into_value()
     } else {
-        Const::Int(
-            val.parse()
-                .map_err(|_| AsmError { line, msg: format!("bad int '{val}'") })?,
-        )
+        let i: i64 = val
+            .parse()
+            .map_err(|_| AsmError { line, msg: format!("bad int '{val}'") })?;
+        i.into_value()
     };
-    Ok((name, c))
+    Ok((name, value))
 }
 
-fn parse_fn_header(rest: &str, entry_pc: usize, line: usize) -> R<FnDef> {
-    let rest = rest.trim().trim_end_matches(':').trim();
+fn parse_counts<'a>(rest: &'a str, line: usize) -> R<(String, Vec<&'a str>)> {
     let open = rest
         .find('(')
-        .ok_or_else(|| AsmError { line, msg: "fn header needs '('".into() })?;
+        .ok_or_else(|| AsmError { line, msg: "header needs '('".into() })?;
     let close = rest
         .find(')')
-        .ok_or_else(|| AsmError { line, msg: "fn header needs ')'".into() })?;
+        .ok_or_else(|| AsmError { line, msg: "header needs ')'".into() })?;
     let name = rest[..open].trim().to_string();
-    let args: Vec<&str> = rest[open + 1..close].split(',').map(|s| s.trim()).collect();
+    let args = rest[open + 1..close].split(',').map(|s| s.trim()).collect();
+    Ok((name, args))
+}
+
+fn parse_u8(s: &str, line: usize) -> R<Reg> {
+    s.parse::<Reg>()
+        .map_err(|_| AsmError { line, msg: format!("bad count '{s}'") })
+}
+
+fn parse_fn_header(rest: &str, entry_pc: usize, line: usize) -> R<PendingFn> {
+    let rest = rest.trim().trim_end_matches(':').trim();
+    let (name, args) = parse_counts(rest, line)?;
     if args.len() != 3 {
         return err(line, "fn header needs (narg, nret, nreg)");
     }
-    let p = |s: &str| -> R<Reg> {
-        s.parse::<Reg>()
-            .map_err(|_| AsmError { line, msg: format!("bad count '{s}'") })
-    };
-    Ok(FnDef {
+    Ok(PendingFn {
         name,
-        narg: p(args[0])?,
-        nret: p(args[1])?,
-        nreg: p(args[2])?,
-        kind: FnKind::Vm { entry_pc },
+        narg: parse_u8(args[0], line)?,
+        nret: parse_u8(args[1], line)?,
+        nreg: parse_u8(args[2], line)?,
+        kind: PendingFnKind::Vm { entry_pc },
+    })
+}
+
+fn parse_host_header(rest: &str, line: usize) -> R<PendingFn> {
+    // host NAME(narg, nret) = syscode
+    let mut sides = rest.splitn(2, '=');
+    let head = sides.next().unwrap().trim();
+    let code = sides
+        .next()
+        .ok_or_else(|| AsmError { line, msg: "host needs '= syscode'".into() })?
+        .trim();
+    let (name, args) = parse_counts(head, line)?;
+    if args.len() != 2 {
+        return err(line, "host header needs (narg, nret)");
+    }
+    let syscode: u8 = code
+        .parse()
+        .map_err(|_| AsmError { line, msg: format!("bad syscode '{code}'") })?;
+    Ok(PendingFn {
+        name,
+        narg: parse_u8(args[0], line)?,
+        nret: parse_u8(args[1], line)?,
+        nreg: 0, // host fns use no VM registers
+        kind: PendingFnKind::Host { syscode },
     })
 }
 
@@ -345,7 +366,6 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
         b.code.push(p);
         b.pc += 1;
     };
-
     let two = |b: &mut Builder, p: Pending| {
         b.code.push(p);
         b.pc += 2;
@@ -500,8 +520,10 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
         "store" => one(b, Pending::Word(store(reg!(0), reg!(1), reg!(2)))),
         "store_address" => one(b, Pending::Word(store_address(reg!(0), reg!(1), reg!(2)))),
 
-        "call" => one(b, Pending::Call { ret: reg!(0), name: fname!(1), line }),
+        "call" => one(b, Pending::Call { ret: reg!(0), name: fname!(1), tail: false, line }),
         "callr" => one(b, Pending::Word(callr(reg!(0), reg!(1)))),
+        "tcall" => one(b, Pending::Call { ret: reg!(0), name: fname!(1), tail: true, line }),
+        "tcallr" => one(b, Pending::Word(tcallr(reg!(0), reg!(1)))),
         "ret" => one(b, Pending::Word(ret())),
         "halt" => one(b, Pending::Word(halt())),
 
@@ -539,8 +561,8 @@ fn cmp_branch_opcode(mnem: &str) -> Option<Opcode> {
     })
 }
 
-fn resolve(b: &Builder) -> Result<Assembled, AsmError> {
-    let mut code = Vec::with_capacity(b.code.len());
+fn resolve(b: Builder) -> Result<Program, AsmError> {
+    let mut code: Vec<Instruction> = Vec::with_capacity(b.code.len());
 
     let const_id = |name: &str, line: usize| -> R<usize> {
         b.const_by_name
@@ -564,7 +586,7 @@ fn resolve(b: &Builder) -> Result<Assembled, AsmError> {
             Pending::ArithK { op, dst, src, name, line } => {
                 let idx = const_id(name, *line)?;
                 if idx > Reg::MAX as usize {
-                    return err(*line, format!("const index {idx} exceeds c-field width"));
+                    return err(*line, format!("const index {idx} exceeds c-field (max {})", Reg::MAX));
                 }
                 code.push(encode_abc(*op, *dst, *src, idx as Reg));
             }
@@ -576,43 +598,74 @@ fn resolve(b: &Builder) -> Result<Assembled, AsmError> {
             }
             Pending::CmpBranch { op, a, b: bb, label, line } => {
                 let target = label_pc(label, *line)? as Instruction;
-                code.push(encode_abc(*op, R0, *a, *bb));
+                code.push(encode_abc(*op, hex_vm::R0, *a, *bb));
                 code.push(target);
             }
-            Pending::Call { ret, name, line } => {
-                if b.const_by_name.contains_key(name) {
-                    return err(*line, format!("'{name}' is a constant, not a function"));
-                }
+            Pending::Call { ret, name, tail, line } => {
                 let fid = b.fn_index.get(name).copied().ok_or_else(|| AsmError {
                     line: *line,
                     msg: format!("unknown function '{name}'"),
                 })?;
-                code.push(call(*ret, fid as Instruction));
+                if fid > u16::MAX as usize {
+                    return err(*line, "too many functions");
+                }
+                code.push(if *tail { tcall(*ret, fid as Instruction) } else { call(*ret, fid as Instruction) });
             }
         }
     }
 
-    Ok(Assembled {
-        code,
-        constants: b.constants.clone(),
-        functions: b.functions.clone(),
-    })
+    // build the Function table in fn_index order (== push order)
+    let functions: Vec<Function> = b
+        .fns
+        .iter()
+        .map(|pf| Function {
+            ty: match pf.kind {
+                PendingFnKind::Vm { entry_pc } => FnType::Hxvm { entry_pc },
+                PendingFnKind::Host { syscode } => FnType::Host { syscode },
+            },
+            narg: pf.narg,
+            nret: pf.nret,
+            nreg: pf.nreg,
+        })
+        .collect();
+
+    Ok(Program::new(
+        code.into_boxed_slice(),
+        b.constants.into_boxed_slice(),
+        functions.into_boxed_slice(),
+    ))
+}
+
+struct Host;
+impl hex_vm::Host for Host {
+    fn syscall(&mut self, _: Syscode, _: HostCtx) -> Result<Flow, Error> {
+        unimplemented!()
+    }
 }
 
 #[test]
 fn test_assemble() {
-    let source = r#"
-    const TEN = 10
-    const HALF = 0.5
+    let source = include_str!("test.hxa");
 
-    fn main(0, 1, 4):
-        loadi R1, $5
-        addk  R1, R1, #TEN
-        jslt  R1, R0, @done
-        loadk R2, #HALF
-    @done:
-        rets
-    "#;
+    let mut mem = vec![0];
 
-    let result = assemble(source).unwrap();
+    let program = assemble(source).unwrap();
+
+    println!("{}", disassemble(&program));
+
+    let args = &[5u64.into_value(), 1u64.into_value()];
+    let args = Args::new(args).unwrap();
+    let mut vm = VM::from_entry(&program, 0, args).unwrap();
+
+    match hex_vm::run(&mut vm, &program, &mut Host, &mut mem) {
+        Ok(outcome) => match outcome {
+            RunOutcome::Completed => {
+                let ret: u64 = vm.registers[0].get();
+                println!("ret: {ret}")
+            }
+            RunOutcome::Suspended => println!("suspended"),
+            RunOutcome::Trapped(fault) => println!("trapped: {fault}"),
+        },
+        Err(err) => println!("{err}"),
+    }
 }
