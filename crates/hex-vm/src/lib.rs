@@ -30,6 +30,7 @@ pub type word = u64;
 pub struct Frame {
     pub ret_pc: usize,
     pub ret_base: usize,
+    pub caller_id: FunctionId,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -38,6 +39,7 @@ pub struct VM {
     call_stack: Vec<Frame>,
     pc: usize,
     base: usize,
+    curr_func: FunctionId,
 }
 
 impl VM {
@@ -60,7 +62,7 @@ impl VM {
         self.registers[..args.len()].copy_from_slice(&args);
         self.pc = func.ty.entry_pc()?;
         self.base = 0;
-
+        self.curr_func = entry;
         Ok(())
     }
 
@@ -70,6 +72,7 @@ impl VM {
         self.call_stack.clear();
         self.pc = 0;
         self.base = 0;
+        self.curr_func = FunctionId::MAX;
     }
 
     #[inline]
@@ -119,7 +122,7 @@ impl VM {
     }
 
     #[inline(always)]
-    fn callvm(&mut self, ret: Reg, entry: usize, nreg: Reg) {
+    fn callvm(&mut self, callee: FunctionId, ret: Reg, entry: usize, nreg: Reg) {
         // Call convention: args are in caller registers[Rret..Rn]
         //
         // We use overlapping register windows for caller and callee
@@ -136,9 +139,14 @@ impl VM {
         }
 
         // Create new call frame and save return point
-        self.call_stack.push(Frame { ret_pc: self.pc, ret_base: self.base });
+        self.call_stack.push(Frame {
+            ret_pc: self.pc,
+            ret_base: self.base,
+            caller_id: self.curr_func,
+        });
 
         // Jump to callee code
+        self.curr_func = callee;
         self.base = base;
         self.pc = entry;
     }
@@ -163,6 +171,18 @@ fn cmp_branch(vm: &mut VM, program: &Program, jmp: bool) {
 
 #[inline(always)]
 pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [u8]) -> Result<RunOutcome, Error> {
+    // Raise a fault: unwind to a handler, or exit run if uncaught.
+    macro_rules! fault {
+        ($f:expr) => {{
+            let f = $f;
+            let v = fault_to_value(f);
+            match unwind(vm, program, v, f) {
+                Ok(()) => continue,                 // caught: resume at handler
+                Err(outcome) => return Ok(outcome), // uncaught: terminal
+            }
+        }};
+    }
+
     while vm.pc < program.len() {
         let i = program.instruction(vm.pc);
         vm.pc += 1;
@@ -248,28 +268,28 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                 let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
                 match a.checked_div(b) {
                     Some(v) => vm.set_reg(inst::a(i), v),
-                    None => return Ok(RunOutcome::Trapped(Fault::DivisionByZero)),
+                    None => fault!(Fault::DivisionByZero),
                 }
             }
             Opcode::SREM => {
                 let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
                 match a.checked_rem(b) {
                     Some(v) => vm.set_reg(inst::a(i), v),
-                    None => return Ok(RunOutcome::Trapped(Fault::DivisionByZero)),
+                    None => fault!(Fault::DivisionByZero),
                 }
             }
             Opcode::UDIV => {
                 let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
                 match a.checked_div(b) {
                     Some(v) => vm.set_reg(inst::a(i), v),
-                    None => return Ok(RunOutcome::Trapped(Fault::DivisionByZero)),
+                    None => fault!(Fault::DivisionByZero),
                 }
             }
             Opcode::UREM => {
                 let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
                 match a.checked_rem(b) {
                     Some(v) => vm.set_reg(inst::a(i), v),
-                    None => return Ok(RunOutcome::Trapped(Fault::DivisionByZero)),
+                    None => fault!(Fault::DivisionByZero),
                 }
             }
 
@@ -448,7 +468,7 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                 let start = (ptr + off) as usize;
                 match memory.get(start..start + size_of::<Value>()) {
                     Some(slice) => vm.set_reg_raw(inst::a(i), Value::copy_from_slice(slice)),
-                    None => return Ok(RunOutcome::Trapped(Fault::MemoryOOB)),
+                    None => fault!(Fault::MemoryOOB),
                 }
             }
             Opcode::STORE => {
@@ -456,7 +476,7 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                 let start = (ptr + off) as usize;
                 match memory.get_mut(start..start + size_of::<Value>()) {
                     Some(slice) => slice.copy_from_slice(&Value::to_le_bytes(vm.reg_raw(inst::a(i)))),
-                    None => return Ok(RunOutcome::Trapped(Fault::MemoryOOB)),
+                    None => fault!(Fault::MemoryOOB),
                 }
             }
 
@@ -465,7 +485,7 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                 let id = inst::bx(i) as FunctionId;
                 let func = program.function(id);
                 match func.ty {
-                    FnType::Hxvm { entry_pc } => vm.callvm(inst::a(i), entry_pc, func.nreg),
+                    FnType::Hxvm { entry_pc } => vm.callvm(id, inst::a(i), entry_pc, func.nreg),
                     FnType::Host { syscode } => match vm.callh(inst::a(i), host, syscode, func.narg, func.nret)? {
                         Flow::Suspend => return Ok(RunOutcome::Suspended),
                         Flow::Continue => {}
@@ -476,7 +496,7 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                 let id = vm.reg::<FunctionId>(inst::b(i));
                 let func = program.function(id);
                 match func.ty {
-                    FnType::Hxvm { entry_pc } => vm.callvm(inst::a(i), entry_pc, func.nreg),
+                    FnType::Hxvm { entry_pc } => vm.callvm(id, inst::a(i), entry_pc, func.nreg),
                     FnType::Host { syscode } => match vm.callh(inst::a(i), host, syscode, func.narg, func.nret)? {
                         Flow::Suspend => return Ok(RunOutcome::Suspended),
                         Flow::Continue => {}
@@ -564,10 +584,59 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                 None => return Ok(RunOutcome::Completed),
             },
 
+            Opcode::THROW => {
+                let thrown = vm.reg_raw(inst::a(i));
+                match unwind(vm, program, thrown, Fault::Uncaught) {
+                    Ok(()) => {}
+                    Err(outcome) => return Ok(outcome),
+                }
+            }
+
             Opcode::HALT => return Ok(RunOutcome::Completed),
 
             op => return Err(Error::UnknownOp(op)),
         }
     }
     Err(Error::PcOOB)
+}
+
+/// Unwind from the current pc carrying `thrown`. On finding a handler, sets
+/// pc/base/cur_func to resume at the handler and returns Ok(()). If no handler
+/// exists anywhere on the stack, returns Err(outcome) to exit `run`.
+fn unwind(vm: &mut VM, program: &Program, thrown: Value, uncaught: Fault) -> Result<(), RunOutcome> {
+    let mut func = program.function(vm.curr_func);
+    let mut check_pc = vm.pc - 1;
+
+    loop {
+        if let Some(h) = func.handler_for(check_pc) {
+            vm.set_reg_raw(h.catch_reg, thrown);
+            vm.pc = h.handler_pc;
+            return Ok(()); // Resume dispatch at handler; base unchanged (this frame)
+        }
+
+        match vm.call_stack.pop() {
+            Some(frame) => {
+                vm.base = frame.ret_base;
+                vm.pc = frame.ret_pc;
+                vm.curr_func = frame.caller_id;
+                func = program.function(vm.curr_func);
+                check_pc = frame.ret_pc - 1;
+            }
+            None => {
+                // stack empty, no handler anywhere
+                return Err(RunOutcome::Trapped(uncaught));
+            }
+        }
+    }
+}
+
+#[inline]
+fn fault_to_value(f: Fault) -> Value {
+    match f {
+        Fault::Uncaught => 0,
+        Fault::DivisionByZero => 1,
+        Fault::MemoryOOB => 2,
+        Fault::Abort(c) => 0x100 | c as i64,
+    }
+    .into_value()
 }

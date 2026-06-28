@@ -9,18 +9,6 @@ pub type FunctionId = u16;
 pub type ConstantId = u16;
 
 #[derive(Debug, Clone, Copy)]
-pub struct Function {
-    /// Function callable type
-    pub ty: FnType,
-    /// Number of arguments the function expects
-    pub narg: Reg,
-    /// Number of values the function returns
-    pub nret: Reg,
-    /// Number of registers the function uses
-    pub nreg: Reg,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub enum FnType {
     Hxvm { entry_pc: usize },
     Host { syscode: Syscode },
@@ -32,6 +20,37 @@ impl FnType {
             Self::Hxvm { entry_pc } => Ok(*entry_pc),
             _ => Err(Error::FunctionIsHost),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HandlerEntry {
+    pub start_pc: usize,
+    pub end_pc: usize,
+    pub handler_pc: usize,
+    pub catch_reg: Reg,
+}
+
+#[derive(Debug, Clone)]
+pub struct Function {
+    /// Function callable type
+    pub ty: FnType,
+    /// Number of arguments the function expects
+    pub narg: Reg,
+    /// Number of values the function returns
+    pub nret: Reg,
+    /// Number of registers the function uses
+    pub nreg: Reg,
+    /// Trap handler entries for the function
+    pub handlers: Box<[HandlerEntry]>,
+}
+
+impl Function {
+    #[inline]
+    pub fn handler_for(&self, pc: usize) -> Option<&HandlerEntry> {
+        // ranges are emitted nested, so the LAST matching entry
+        // is the most deeply nested. Iterate reversed to catch inner try.
+        self.handlers.iter().rev().find(|h| h.start_pc <= pc && pc < h.end_pc)
     }
 }
 

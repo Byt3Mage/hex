@@ -103,6 +103,7 @@ define_opcodes! {
     JFEQ, JFNE, JFLT, JFGT, JFLE, JFGE, // float compare-branch
     LOAD, STORE, STORE_ADDRESS, // Heap memory ops
     RET, CALL, CALL_IND, TCALL, TCALL_IND, // Return and call ops
+    THROW, // Unwind with a value in register a
     HALT // end program
 }
 
@@ -573,6 +574,11 @@ pub const fn tcallr(ret: Reg, func: Reg) -> Instruction {
 #[inline(always)]
 pub const fn ret() -> Instruction {
     encode_ax(Opcode::RET, 0)
+}
+
+#[inline(always)]
+pub const fn throw(val: Reg) -> Instruction {
+    encode_abc(Opcode::THROW, val, R0, R0)
 }
 
 #[inline(always)]

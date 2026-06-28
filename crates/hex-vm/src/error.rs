@@ -2,6 +2,8 @@ use crate::{Opcode, Reg, Syscode};
 
 #[derive(thiserror::Error, Copy, Clone, Debug)]
 pub enum Fault {
+    #[error("uncaught throw")]
+    Uncaught,
     #[error("division by zero")]
     DivisionByZero,
     #[error("memory access out of bounds")]
