@@ -125,6 +125,7 @@ fn compile_function(
         narg,
         nret,
         nreg,
+        handlers: Box::new([]),
     });
 
     Ok(ptr)

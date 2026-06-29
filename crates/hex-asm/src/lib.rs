@@ -1,24 +1,30 @@
 //! hxasm — assembler targeting the hex VM `Program`.
 //!
 //! Directives:
-//!   const NAME = 42            int constant  -> Value
-//!   const NAME = 3.14          float constant -> Value
-//!   host  NAME(narg, nret) = 7 host function (syscode 7)
-//!   fn    NAME(narg, nret, nreg):   VM function; entry_pc = next instruction
+//!   const NAME = 42             int constant   -> Value
+//!   const NAME = 3.14           float constant -> Value
+//!   host  NAME(narg, nret) = 7  host function (syscode 7)
+//!   fn    NAME(narg, nret, nreg):    VM function; entry_pc = next instruction
 //!       <body>
 //!       ret
+//!
+//!   try @handler, Rcatch        begin protected region (covers following insts)
+//!       <body>
+//!   endtry                      end protected region
+//!   @handler:                   handler label (normal label); Rcatch holds thrown value
 //!
 //! Operands:
 //!   R0 / r1     register
 //!   $123 / $-4  signed immediate (LOADI/LOADF, ADDI/SUBI/MULI)
 //!   #NAME       constant-pool reference (LOADK, *K)
-//!   @label      jump target (`@label:` defines it)
-//!   NAME        function reference (CALL only; const here = error)
+//!   @label      jump / handler target
+//!   NAME        function reference (CALL/TCALL only; const here = error)
 
+use hex_vm::*;
 use std::collections::HashMap;
 use std::fmt;
 
-use hex_vm::*;
+// ── Errors ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct AsmError {
@@ -102,8 +108,9 @@ fn split_mnemonic_operands(text: &str) -> (String, Vec<String>) {
 
 enum Pending {
     Word(Instruction),
+    /// cmp-branch: two words; regs known, target label resolved later
     CmpBranch {
-        op: Opcode,
+        f: CmpFn,
         a: Reg,
         b: Reg,
         label: String,
@@ -113,8 +120,12 @@ enum Pending {
         label: String,
         line: usize,
     },
-    JmpCond {
-        op: Opcode,
+    JmpT {
+        cond: Reg,
+        label: String,
+        line: usize,
+    },
+    JmpF {
         cond: Reg,
         label: String,
         line: usize,
@@ -125,7 +136,7 @@ enum Pending {
         line: usize,
     },
     ArithK {
-        op: Opcode,
+        f: ArithKFn,
         dst: Reg,
         src: Reg,
         name: String,
@@ -139,30 +150,53 @@ enum Pending {
     },
 }
 
-// FnType building needs to know host vs vm; track separately from Function
-// because entry_pc isn't known until layout for vm fns.
+type CmpFn = fn(Reg, Reg, Instruction) -> [Instruction; 2];
+type ArithKFn = fn(Reg, Reg, Reg) -> Instruction;
+
+// ── Function / handler bookkeeping ────────────────────────────────────────
+
+enum PendingFnKind {
+    Vm { entry_pc: usize },
+    Host { syscode: u8 },
+}
 struct PendingFn {
-    name: String,
     narg: Reg,
     nret: Reg,
     nreg: Reg,
     kind: PendingFnKind,
 }
-enum PendingFnKind {
-    Vm { entry_pc: usize },
-    Host { syscode: u8 },
+
+struct OpenTry {
+    start_pc: usize,
+    handler_label: String,
+    catch_reg: Reg,
+    line: usize,
+}
+struct PendingHandler {
+    fn_idx: usize,
+    start_pc: usize,
+    end_pc: usize,
+    handler_label: String,
+    catch_reg: Reg,
+    line: usize,
 }
 
 #[derive(Default)]
 struct Builder {
     code: Vec<Pending>,
-    constants: Vec<Value>,
+    constants: Vec<word>,
     const_by_name: HashMap<String, usize>,
     fns: Vec<PendingFn>,
     fn_index: HashMap<String, usize>,
     labels: HashMap<String, usize>,
     pc: usize,
+
+    open_tries: Vec<OpenTry>,
+    handlers: Vec<PendingHandler>,
+    cur_fn: Option<usize>,
 }
+
+// ── Driver ────────────────────────────────────────────────────────────────
 
 pub fn assemble(src: &str) -> Result<Program, AsmError> {
     let mut b = Builder::default();
@@ -174,6 +208,7 @@ pub fn assemble(src: &str) -> Result<Program, AsmError> {
             continue;
         }
 
+        // const NAME = value
         if let Some(rest) = text.strip_prefix("const ") {
             let (name, v) = parse_const_def(rest, line)?;
             if b.const_by_name.contains_key(&name) {
@@ -185,18 +220,61 @@ pub fn assemble(src: &str) -> Result<Program, AsmError> {
             continue;
         }
 
+        // host NAME(narg, nret) = syscode
         if let Some(rest) = text.strip_prefix("host ") {
-            let pf = parse_host_header(rest, line)?;
-            register_fn(&mut b, pf, line)?;
+            if !b.open_tries.is_empty() {
+                return err(line, "unclosed 'try' at function boundary");
+            }
+            let (name, pf) = parse_host_header(rest, line)?;
+            let i = register_fn(&mut b, name, pf, line)?;
+            b.cur_fn = Some(i);
             continue;
         }
 
+        // fn NAME(narg, nret, nreg):
         if let Some(rest) = text.strip_prefix("fn ") {
-            let pf = parse_fn_header(rest, b.pc, line)?;
-            register_fn(&mut b, pf, line)?;
+            if !b.open_tries.is_empty() {
+                return err(line, "unclosed 'try' at function boundary");
+            }
+            let (name, pf) = parse_fn_header(rest, b.pc, line)?;
+            let i = register_fn(&mut b, name, pf, line)?;
+            b.cur_fn = Some(i);
             continue;
         }
 
+        // try @handler, Rcatch
+        if let Some(rest) = text.strip_prefix("try ") {
+            let (label, reg) = parse_try(rest, line)?;
+            b.open_tries.push(OpenTry {
+                start_pc: b.pc,
+                handler_label: label,
+                catch_reg: reg,
+                line,
+            });
+            continue;
+        }
+
+        // endtry
+        if text == "endtry" {
+            let fn_idx = b
+                .cur_fn
+                .ok_or_else(|| AsmError { line, msg: "'endtry' outside a function".into() })?;
+            let open = b.open_tries.pop().ok_or_else(|| AsmError {
+                line,
+                msg: "'endtry' without matching 'try'".into(),
+            })?;
+            b.handlers.push(PendingHandler {
+                fn_idx,
+                start_pc: open.start_pc,
+                end_pc: b.pc,
+                handler_label: open.handler_label,
+                catch_reg: open.catch_reg,
+                line: open.line,
+            });
+            continue;
+        }
+
+        // @label:
         if let Some(lbl) = text.strip_prefix('@') {
             if let Some(name) = lbl.strip_suffix(':') {
                 let name = name.trim().to_string();
@@ -212,16 +290,22 @@ pub fn assemble(src: &str) -> Result<Program, AsmError> {
         emit_instruction(&mut b, text, line)?;
     }
 
+    if !b.open_tries.is_empty() {
+        let t = b.open_tries.last().unwrap();
+        return err(t.line, "unclosed 'try' at end of input");
+    }
+
     resolve(b)
 }
 
-fn register_fn(b: &mut Builder, pf: PendingFn, line: usize) -> R<()> {
-    if b.fn_index.contains_key(&pf.name) {
-        return err(line, format!("duplicate function '{}'", pf.name));
+fn register_fn(b: &mut Builder, name: String, pf: PendingFn, line: usize) -> R<usize> {
+    if b.fn_index.contains_key(&name) {
+        return err(line, format!("duplicate function '{name}'"));
     }
-    b.fn_index.insert(pf.name.clone(), b.fns.len());
+    let idx = b.fns.len();
+    b.fn_index.insert(name, idx);
     b.fns.push(pf);
-    Ok(())
+    Ok(idx)
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -231,7 +315,7 @@ fn strip_comment(line: &str) -> &str {
     }
 }
 
-fn parse_const_def(rest: &str, line: usize) -> R<(String, Value)> {
+fn parse_const_def(rest: &str, line: usize) -> R<(String, word)> {
     let mut sides = rest.splitn(2, '=');
     let name = sides
         .next()
@@ -249,12 +333,12 @@ fn parse_const_def(rest: &str, line: usize) -> R<(String, Value)> {
         let f: f64 = val
             .parse()
             .map_err(|_| AsmError { line, msg: format!("bad float '{val}'") })?;
-        f.into_value()
+        f.into_word()
     } else {
         let i: i64 = val
             .parse()
             .map_err(|_| AsmError { line, msg: format!("bad int '{val}'") })?;
-        i.into_value()
+        i.into_word()
     };
     Ok((name, value))
 }
@@ -276,23 +360,24 @@ fn parse_u8(s: &str, line: usize) -> R<Reg> {
         .map_err(|_| AsmError { line, msg: format!("bad count '{s}'") })
 }
 
-fn parse_fn_header(rest: &str, entry_pc: usize, line: usize) -> R<PendingFn> {
+fn parse_fn_header(rest: &str, entry_pc: usize, line: usize) -> R<(String, PendingFn)> {
     let rest = rest.trim().trim_end_matches(':').trim();
     let (name, args) = parse_counts(rest, line)?;
     if args.len() != 3 {
         return err(line, "fn header needs (narg, nret, nreg)");
     }
-    Ok(PendingFn {
+    Ok((
         name,
-        narg: parse_u8(args[0], line)?,
-        nret: parse_u8(args[1], line)?,
-        nreg: parse_u8(args[2], line)?,
-        kind: PendingFnKind::Vm { entry_pc },
-    })
+        PendingFn {
+            narg: parse_u8(args[0], line)?,
+            nret: parse_u8(args[1], line)?,
+            nreg: parse_u8(args[2], line)?,
+            kind: PendingFnKind::Vm { entry_pc },
+        },
+    ))
 }
 
-fn parse_host_header(rest: &str, line: usize) -> R<PendingFn> {
-    // host NAME(narg, nret) = syscode
+fn parse_host_header(rest: &str, line: usize) -> R<(String, PendingFn)> {
     let mut sides = rest.splitn(2, '=');
     let head = sides.next().unwrap().trim();
     let code = sides
@@ -306,14 +391,35 @@ fn parse_host_header(rest: &str, line: usize) -> R<PendingFn> {
     let syscode: u8 = code
         .parse()
         .map_err(|_| AsmError { line, msg: format!("bad syscode '{code}'") })?;
-    Ok(PendingFn {
+    Ok((
         name,
-        narg: parse_u8(args[0], line)?,
-        nret: parse_u8(args[1], line)?,
-        nreg: 0, // host fns use no VM registers
-        kind: PendingFnKind::Host { syscode },
-    })
+        PendingFn {
+            narg: parse_u8(args[0], line)?,
+            nret: parse_u8(args[1], line)?,
+            nreg: 0,
+            kind: PendingFnKind::Host { syscode },
+        },
+    ))
 }
+
+fn parse_try(rest: &str, line: usize) -> R<(String, Reg)> {
+    let mut parts = rest.split(',').map(|s| s.trim());
+    let label = parts.next().unwrap_or("");
+    let reg = parts
+        .next()
+        .ok_or_else(|| AsmError { line, msg: "try needs '@handler, Rreg'".into() })?;
+    let label = label
+        .strip_prefix('@')
+        .ok_or_else(|| AsmError { line, msg: "try handler must be @label".into() })?
+        .to_string();
+    let reg = match parse_operand(reg, line)? {
+        Operand::Reg(r) => r,
+        _ => return err(line, "try catch target must be a register"),
+    };
+    Ok((label, reg))
+}
+
+// ── Instruction emission ──────────────────────────────────────────────────
 
 fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
     let (mnem, ops_raw) = split_mnemonic_operands(text);
@@ -345,7 +451,7 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
             }
         };
     }
-    macro_rules! label {
+    macro_rules! lbl {
         ($i:expr) => {
             match ops.get($i) {
                 Some(Operand::Label(s)) => s.clone(),
@@ -353,7 +459,7 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
             }
         };
     }
-    macro_rules! fname {
+    macro_rules! fnm {
         ($i:expr) => {
             match ops.get($i) {
                 Some(Operand::Name(s)) => s.clone(),
@@ -372,16 +478,19 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
     };
 
     match mnem.as_str() {
+        // moves
         "copy" => one(b, Pending::Word(copy(reg!(0), reg!(1)))),
         "loadi" => one(b, Pending::Word(loadi(reg!(0), imm!(1)))),
         "loadf" => one(b, Pending::Word(loadf(reg!(0), imm!(1)))),
         "loadk" => one(b, Pending::LoadK { dst: reg!(0), name: cname!(1), line }),
 
+        // unary
         "not" => one(b, Pending::Word(not(reg!(0), reg!(1)))),
         "bnot" => one(b, Pending::Word(bnot(reg!(0), reg!(1)))),
         "ineg" => one(b, Pending::Word(ineg(reg!(0), reg!(1)))),
         "fneg" => one(b, Pending::Word(fneg(reg!(0), reg!(1)))),
 
+        // int arith
         "add" => one(b, Pending::Word(add(reg!(0), reg!(1), reg!(2)))),
         "sub" => one(b, Pending::Word(sub(reg!(0), reg!(1), reg!(2)))),
         "mul" => one(b, Pending::Word(mul(reg!(0), reg!(1), reg!(2)))),
@@ -391,7 +500,7 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
         "addk" => one(
             b,
             Pending::ArithK {
-                op: Opcode::ADDK,
+                f: addk,
                 dst: reg!(0),
                 src: reg!(1),
                 name: cname!(2),
@@ -401,7 +510,7 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
         "subk" => one(
             b,
             Pending::ArithK {
-                op: Opcode::SUBK,
+                f: subk,
                 dst: reg!(0),
                 src: reg!(1),
                 name: cname!(2),
@@ -411,7 +520,7 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
         "mulk" => one(
             b,
             Pending::ArithK {
-                op: Opcode::MULK,
+                f: mulk,
                 dst: reg!(0),
                 src: reg!(1),
                 name: cname!(2),
@@ -421,7 +530,7 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
         "faddk" => one(
             b,
             Pending::ArithK {
-                op: Opcode::FADDK,
+                f: faddk,
                 dst: reg!(0),
                 src: reg!(1),
                 name: cname!(2),
@@ -431,7 +540,7 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
         "fsubk" => one(
             b,
             Pending::ArithK {
-                op: Opcode::FSUBK,
+                f: fsubk,
                 dst: reg!(0),
                 src: reg!(1),
                 name: cname!(2),
@@ -441,7 +550,7 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
         "fmulk" => one(
             b,
             Pending::ArithK {
-                op: Opcode::FMULK,
+                f: fmulk,
                 dst: reg!(0),
                 src: reg!(1),
                 name: cname!(2),
@@ -451,7 +560,7 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
         "fdivk" => one(
             b,
             Pending::ArithK {
-                op: Opcode::FDIVK,
+                f: fdivk,
                 dst: reg!(0),
                 src: reg!(1),
                 name: cname!(2),
@@ -464,12 +573,14 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
         "udiv" => one(b, Pending::Word(udiv(reg!(0), reg!(1), reg!(2)))),
         "urem" => one(b, Pending::Word(urem(reg!(0), reg!(1), reg!(2)))),
 
+        // float arith
         "fadd" => one(b, Pending::Word(fadd(reg!(0), reg!(1), reg!(2)))),
         "fsub" => one(b, Pending::Word(fsub(reg!(0), reg!(1), reg!(2)))),
         "fmul" => one(b, Pending::Word(fmul(reg!(0), reg!(1), reg!(2)))),
         "fdiv" => one(b, Pending::Word(fdiv(reg!(0), reg!(1), reg!(2)))),
         "frem" => one(b, Pending::Word(frem(reg!(0), reg!(1), reg!(2)))),
 
+        // comparisons (write bool)
         "eq" => one(b, Pending::Word(eq(reg!(0), reg!(1), reg!(2)))),
         "ne" => one(b, Pending::Word(ne(reg!(0), reg!(1), reg!(2)))),
         "slt" => one(b, Pending::Word(ilt(reg!(0), reg!(1), reg!(2)))),
@@ -487,43 +598,184 @@ fn emit_instruction(b: &mut Builder, text: &str, line: usize) -> R<()> {
         "fle" => one(b, Pending::Word(fle(reg!(0), reg!(1), reg!(2)))),
         "fge" => one(b, Pending::Word(fge(reg!(0), reg!(1), reg!(2)))),
 
-        "jmp" => one(b, Pending::JmpAx { label: label!(0), line }),
-        "jmpt" => one(
+        // jumps
+        "jmp" => one(b, Pending::JmpAx { label: lbl!(0), line }),
+        "jmpt" => one(b, Pending::JmpT { cond: reg!(0), label: lbl!(1), line }),
+        "jmpf" => one(b, Pending::JmpF { cond: reg!(0), label: lbl!(1), line }),
+
+        // compare-branches (two words)
+        "jeq" => two(
             b,
-            Pending::JmpCond {
-                op: Opcode::JMP_T,
-                cond: reg!(0),
-                label: label!(1),
+            Pending::CmpBranch {
+                f: jeq,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
                 line,
             },
         ),
-        "jmpf" => one(
+        "jne" => two(
             b,
-            Pending::JmpCond {
-                op: Opcode::JMP_F,
-                cond: reg!(0),
-                label: label!(1),
+            Pending::CmpBranch {
+                f: jne,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "jslt" => two(
+            b,
+            Pending::CmpBranch {
+                f: jslt,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "jsgt" => two(
+            b,
+            Pending::CmpBranch {
+                f: jsgt,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "jsle" => two(
+            b,
+            Pending::CmpBranch {
+                f: jsle,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "jsge" => two(
+            b,
+            Pending::CmpBranch {
+                f: jsge,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "jult" => two(
+            b,
+            Pending::CmpBranch {
+                f: jult,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "jugt" => two(
+            b,
+            Pending::CmpBranch {
+                f: jugt,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "jule" => two(
+            b,
+            Pending::CmpBranch {
+                f: jule,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "juge" => two(
+            b,
+            Pending::CmpBranch {
+                f: juge,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "jfeq" => two(
+            b,
+            Pending::CmpBranch {
+                f: jfeq,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "jfne" => two(
+            b,
+            Pending::CmpBranch {
+                f: jfne,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "jflt" => two(
+            b,
+            Pending::CmpBranch {
+                f: jflt,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "jfgt" => two(
+            b,
+            Pending::CmpBranch {
+                f: jfgt,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "jfle" => two(
+            b,
+            Pending::CmpBranch {
+                f: jfle,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
+                line,
+            },
+        ),
+        "jfge" => two(
+            b,
+            Pending::CmpBranch {
+                f: jfge,
+                a: reg!(0),
+                b: reg!(1),
+                label: lbl!(2),
                 line,
             },
         ),
 
-        "jeq" | "jne" | "jslt" | "jsgt" | "jsle" | "jsge" | "jult" | "jugt" | "jule" | "juge" | "jfeq" | "jfne"
-        | "jflt" | "jfgt" | "jfle" | "jfge" => {
-            let op = cmp_branch_opcode(&mnem).unwrap();
-            two(
-                b,
-                Pending::CmpBranch { op, a: reg!(0), b: reg!(1), label: label!(2), line },
-            );
-        }
-
+        // memory
         "load" => one(b, Pending::Word(load(reg!(0), reg!(1), reg!(2)))),
         "store" => one(b, Pending::Word(store(reg!(0), reg!(1), reg!(2)))),
         "store_address" => one(b, Pending::Word(store_address(reg!(0), reg!(1), reg!(2)))),
 
-        "call" => one(b, Pending::Call { ret: reg!(0), name: fname!(1), tail: false, line }),
+        // calls / return / unwind
+        "call" => one(b, Pending::Call { ret: reg!(0), name: fnm!(1), tail: false, line }),
+        "tcall" => one(b, Pending::Call { ret: reg!(0), name: fnm!(1), tail: true, line }),
         "callr" => one(b, Pending::Word(callr(reg!(0), reg!(1)))),
-        "tcall" => one(b, Pending::Call { ret: reg!(0), name: fname!(1), tail: true, line }),
         "tcallr" => one(b, Pending::Word(tcallr(reg!(0), reg!(1)))),
+        "throw" => one(b, Pending::Word(throw(reg!(0)))),
         "ret" => one(b, Pending::Word(ret())),
         "halt" => one(b, Pending::Word(halt())),
 
@@ -539,27 +791,7 @@ fn mk_imm8(v: i64, line: usize) -> R<Imm8> {
     })
 }
 
-fn cmp_branch_opcode(mnem: &str) -> Option<Opcode> {
-    Some(match mnem {
-        "jeq" => Opcode::JEQ,
-        "jne" => Opcode::JNE,
-        "jslt" => Opcode::JSLT,
-        "jsgt" => Opcode::JSGT,
-        "jsle" => Opcode::JSLE,
-        "jsge" => Opcode::JSGE,
-        "jult" => Opcode::JULT,
-        "jugt" => Opcode::JUGT,
-        "jule" => Opcode::JULE,
-        "juge" => Opcode::JUGE,
-        "jfeq" => Opcode::JFEQ,
-        "jfne" => Opcode::JFNE,
-        "jflt" => Opcode::JFLT,
-        "jfgt" => Opcode::JFGT,
-        "jfle" => Opcode::JFLE,
-        "jfge" => Opcode::JFGE,
-        _ => return None,
-    })
-}
+// ── Resolution ────────────────────────────────────────────────────────────
 
 fn resolve(b: Builder) -> Result<Program, AsmError> {
     let mut code: Vec<Instruction> = Vec::with_capacity(b.code.len());
@@ -583,23 +815,27 @@ fn resolve(b: Builder) -> Result<Program, AsmError> {
             Pending::LoadK { dst, name, line } => {
                 code.push(loadk(*dst, const_id(name, *line)? as Instruction));
             }
-            Pending::ArithK { op, dst, src, name, line } => {
+            Pending::ArithK { f, dst, src, name, line } => {
                 let idx = const_id(name, *line)?;
                 if idx > Reg::MAX as usize {
                     return err(*line, format!("const index {idx} exceeds c-field (max {})", Reg::MAX));
                 }
-                code.push(encode_abc(*op, *dst, *src, idx as Reg));
+                code.push(f(*dst, *src, idx as Reg));
             }
             Pending::JmpAx { label, line } => {
                 code.push(jmp(label_pc(label, *line)? as Instruction));
             }
-            Pending::JmpCond { op, cond, label, line } => {
-                code.push(encode_abx(*op, *cond, label_pc(label, *line)? as Instruction));
+            Pending::JmpT { cond, label, line } => {
+                code.push(jmpt(*cond, label_pc(label, *line)? as Instruction));
             }
-            Pending::CmpBranch { op, a, b: bb, label, line } => {
+            Pending::JmpF { cond, label, line } => {
+                code.push(jmpf(*cond, label_pc(label, *line)? as Instruction));
+            }
+            Pending::CmpBranch { f, a, b: bb, label, line } => {
                 let target = label_pc(label, *line)? as Instruction;
-                code.push(encode_abc(*op, hex_vm::R0, *a, *bb));
-                code.push(target);
+                let pair = f(*a, *bb, target);
+                code.push(pair[0]);
+                code.push(pair[1]);
             }
             Pending::Call { ret, name, tail, line } => {
                 let fid = b.fn_index.get(name).copied().ok_or_else(|| AsmError {
@@ -609,16 +845,36 @@ fn resolve(b: Builder) -> Result<Program, AsmError> {
                 if fid > u16::MAX as usize {
                     return err(*line, "too many functions");
                 }
-                code.push(if *tail { tcall(*ret, fid as Instruction) } else { call(*ret, fid as Instruction) });
+                let w = if *tail { tcall(*ret, fid as Instruction) } else { call(*ret, fid as Instruction) };
+                code.push(w);
             }
         }
     }
 
-    // build the Function table in fn_index order (== push order)
+    // resolve handler labels, grouped by function
+    let mut per_fn: Vec<Vec<HandlerEntry>> = (0..b.fns.len()).map(|_| Vec::new()).collect();
+    for h in &b.handlers {
+        let handler_pc = b.labels.get(&h.handler_label).copied().ok_or_else(|| AsmError {
+            line: h.line,
+            msg: format!("unknown handler label '@{}'", h.handler_label),
+        })?;
+        per_fn[h.fn_idx].push(HandlerEntry {
+            start_pc: h.start_pc,
+            end_pc: h.end_pc,
+            handler_pc,
+            catch_reg: h.catch_reg,
+        });
+    }
+    // outer-first ordering so VM's reverse scan finds innermost handler first
+    for entries in per_fn.iter_mut() {
+        entries.sort_by(|x, y| x.start_pc.cmp(&y.start_pc).then(y.end_pc.cmp(&x.end_pc)));
+    }
+
     let functions: Vec<Function> = b
         .fns
         .iter()
-        .map(|pf| Function {
+        .enumerate()
+        .map(|(idx, pf)| Function {
             ty: match pf.kind {
                 PendingFnKind::Vm { entry_pc } => FnType::Hxvm { entry_pc },
                 PendingFnKind::Host { syscode } => FnType::Host { syscode },
@@ -626,6 +882,7 @@ fn resolve(b: Builder) -> Result<Program, AsmError> {
             narg: pf.narg,
             nret: pf.nret,
             nreg: pf.nreg,
+            handlers: std::mem::take(&mut per_fn[idx]).into_boxed_slice(),
         })
         .collect();
 
@@ -634,38 +891,4 @@ fn resolve(b: Builder) -> Result<Program, AsmError> {
         b.constants.into_boxed_slice(),
         functions.into_boxed_slice(),
     ))
-}
-
-struct Host;
-impl hex_vm::Host for Host {
-    fn syscall(&mut self, _: Syscode, _: HostCtx) -> Result<Flow, Error> {
-        unimplemented!()
-    }
-}
-
-#[test]
-fn test_assemble() {
-    let source = include_str!("test.hxa");
-
-    let mut mem = vec![0];
-
-    let program = assemble(source).unwrap();
-
-    println!("{}", disassemble(&program));
-
-    let args = &[5u64.into_value(), 1u64.into_value()];
-    let args = Args::new(args).unwrap();
-    let mut vm = VM::from_entry(&program, 0, args).unwrap();
-
-    match hex_vm::run(&mut vm, &program, &mut Host, &mut mem) {
-        Ok(outcome) => match outcome {
-            RunOutcome::Completed => {
-                let ret: u64 = vm.registers[0].get();
-                println!("ret: {ret}")
-            }
-            RunOutcome::Suspended => println!("suspended"),
-            RunOutcome::Trapped(fault) => println!("trapped: {fault}"),
-        },
-        Err(err) => println!("{err}"),
-    }
 }

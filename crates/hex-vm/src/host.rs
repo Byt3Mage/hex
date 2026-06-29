@@ -1,4 +1,4 @@
-use crate::{Error, IsValue, Reg, VM, Value};
+use crate::{AsWord, Error, Fault, Reg, VM, word};
 
 pub type Syscode = u8;
 
@@ -6,12 +6,20 @@ pub trait Host {
     fn syscall(&mut self, code: Syscode, ctx: HostCtx) -> Result<Flow, Error>;
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+impl Host for () {
+    fn syscall(&mut self, _: Syscode, _: HostCtx) -> Result<Flow, Error> {
+        unimplemented!("hex_vm: host has no implementation")
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
 pub enum Flow {
     /// Continue VM execution to next instruction.
     Continue,
     /// Suspend VM, reason recorded in host state. [VM::run] returns Suspended.
     Suspend,
+    /// Trap VM, VM handles the fault and may unwind.
+    Trap(Fault),
 }
 
 pub struct HostCtx<'v> {
@@ -37,12 +45,12 @@ impl<'v> HostCtx<'v> {
     }
 
     #[inline(always)]
-    pub fn args(&self) -> &[Value] {
+    pub fn args(&self) -> &[word] {
         &self.vm.registers[self.base..self.base + self.narg as usize]
     }
 
     #[inline(always)]
-    pub fn arg_raw(&self, i: Reg) -> Result<Value, Error> {
+    pub fn arg_raw(&self, i: Reg) -> Result<word, Error> {
         if i >= self.narg {
             return Err(Error::ArgOutOfBounds { index: i, narg: self.narg });
         }
@@ -50,15 +58,15 @@ impl<'v> HostCtx<'v> {
     }
 
     #[inline(always)]
-    pub fn arg<T: IsValue>(&self, i: Reg) -> Result<T, Error> {
+    pub fn arg<T: AsWord>(&self, i: Reg) -> Result<T, Error> {
         if i >= self.narg {
             return Err(Error::ArgOutOfBounds { index: i, narg: self.narg });
         }
-        Ok(self.vm.registers[self.base + i as usize].get())
+        Ok(T::from_word(self.vm.registers[self.base + i as usize]))
     }
 
     #[inline(always)]
-    pub fn ret_raw(&mut self, i: Reg, v: Value) -> Result<(), Error> {
+    pub fn ret_raw(&mut self, i: Reg, v: word) -> Result<(), Error> {
         if i >= self.nret {
             return Err(Error::RetOutOfBounds { index: i, nret: self.nret });
         }
@@ -67,15 +75,13 @@ impl<'v> HostCtx<'v> {
     }
 
     #[inline(always)]
-    pub fn ret<T: IsValue>(&mut self, i: Reg, v: T) -> Result<(), Error> {
-        self.ret_raw(i, v.into_value())
+    pub fn ret<T: AsWord>(&mut self, i: Reg, v: T) -> Result<(), Error> {
+        self.ret_raw(i, v.into_word())
     }
 
     /// Write a result slice into the return window (truncated to nret).
     #[inline]
-    pub fn ret_all(&mut self, values: &[Value]) {
-        let nret = self.nret as usize;
-        let rets = &mut self.vm.registers[self.base..self.base + nret];
-        rets.copy_from_slice(&values[..nret]);
+    pub fn rets(&mut self) -> &mut [word] {
+        &mut self.vm.registers[self.base..self.base + self.nret as usize]
     }
 }

@@ -1,4 +1,4 @@
-use hex_vm::{Args, Flow, FunctionId, HostCtx, Program, RunOutcome, Syscode};
+use hex_vm::{Args, AsWord, Flow, FunctionId, HostCtx, Program, RunOutcome, Syscode, VM};
 
 use crate::task::{Scheduler, TaskId, TaskState};
 
@@ -30,36 +30,38 @@ impl<'p> hex_vm::Host for Host<'p> {
         match code {
             syscode::SPAWN_TASK => {
                 let [f, args @ ..] = ctx.args() else { panic!("invalid spawn args") };
+                let func = FunctionId::from_word(*f);
                 let args = Args::new(args).unwrap();
-                let tid = self.scheduler.new_task(f.get(), args)?;
-                ctx.ret(0, tid)?;
+                let task_id = self.scheduler.new_task(func, args)?;
+                ctx.ret(0, task_id)?;
                 Ok(Flow::Continue)
             }
             syscode::AWAIT_TASK => {
-                let tid: TaskId = ctx.arg(0)?;
-                let task = &mut self.scheduler.tasks[tid];
-
-                // Return value and resume if already done
-                if matches!(task.state, TaskState::Done) {}
+                let task_id: TaskId = ctx.arg(0)?;
+                let task = &mut self.scheduler.tasks[task_id];
 
                 match task.state {
-                    TaskState::Ready | TaskState::Running | TaskState::Waiting => {}
+                    TaskState::Ready | TaskState::Running | TaskState::Waiting => {
+                        // Do nothing, wait for task to complete
+                    }
                     TaskState::Done => {
                         // Return and resume immediately if done
-                        ctx.ret_all(&task.vm.registers);
+                        let nret = ctx.nrets() as usize;
+                        let rets = ctx.rets();
+                        rets.copy_from_slice(&task.vm.registers[..nret]);
                         return Ok(Flow::Continue);
                     }
                     TaskState::Pending => {
                         // Mark as ready and add to ready queue
                         task.state = TaskState::Ready;
-                        self.scheduler.ready.push_back(tid);
+                        self.scheduler.ready.push_back(task_id);
                     }
                 }
 
-                if let Some(curr) = self.scheduler.current {
-                    // Add current task as a waiter
-                    task.joiners.push(curr);
-                    let curr_task = &mut self.scheduler.tasks[curr];
+                // Add current task as a waiter
+                if let Some(curr_id) = self.scheduler.current {
+                    task.joiners.push(curr_id);
+                    let curr_task = &mut self.scheduler.tasks[curr_id];
                     curr_task.state = TaskState::Waiting;
                     curr_task.resume_into = Some((ctx.arg_base(), ctx.nrets()));
                 }
@@ -73,25 +75,26 @@ impl<'p> hex_vm::Host for Host<'p> {
 
 impl<'p> Host<'p> {
     fn run_to_completion(&mut self, mem: &mut [u8]) -> Result<(), hex_vm::Error> {
-        while let Some(tid) = self.scheduler.ready.pop_front() {
-            self.scheduler.current = Some(tid);
+        let mut runner = VM::new();
 
-            let task = &mut self.scheduler.tasks[tid];
+        while let Some(task_id) = self.scheduler.ready.pop_front() {
+            self.scheduler.current = Some(task_id);
+
+            let task = &mut self.scheduler.tasks[task_id];
             task.state = TaskState::Running;
+            std::mem::swap(&mut task.vm, &mut runner);
 
-            // Take VM state to avoid borrowing issues
-            let mut vm = std::mem::take(&mut task.vm);
+            let outcome = hex_vm::run(&mut runner, self.scheduler.program, self, mem)?;
 
-            let outcome = hex_vm::run(&mut vm, self.scheduler.program, self, mem)?;
-
-            self.scheduler.tasks[tid].vm = vm;
+            let task = &mut self.scheduler.tasks[task_id];
+            std::mem::swap(&mut task.vm, &mut runner);
 
             match outcome {
-                RunOutcome::Completed => self.scheduler.complete(tid),
+                RunOutcome::Completed => self.scheduler.complete(task_id),
                 RunOutcome::Suspended => {}
                 RunOutcome::Trapped(f) => {
-                    eprintln!("task {tid:#?} trapped: {f}");
-                    self.scheduler.complete(tid);
+                    eprintln!("task {task_id:#?} trapped: {f}");
+                    self.scheduler.complete(task_id);
                 }
             }
         }

@@ -102,7 +102,7 @@ define_opcodes! {
     JULT, JUGT, JULE, JUGE, // unsigned int compare-branch
     JFEQ, JFNE, JFLT, JFGT, JFLE, JFGE, // float compare-branch
     LOAD, STORE, STORE_ADDRESS, // Heap memory ops
-    RET, CALL, CALL_IND, TCALL, TCALL_IND, // Return and call ops
+    RET, CALL, TCALL, CALL_IND, TCALL_IND, // Return and call ops
     THROW, // Unwind with a value in register a
     HALT // end program
 }

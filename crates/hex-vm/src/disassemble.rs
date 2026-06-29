@@ -1,8 +1,9 @@
 //! Disassembler for a compiled `Program`.
 
 use crate::{
-    FnType, Function, Program, Value,
+    FnType, Function, Program,
     instruction::{Instruction, Opcode, inst},
+    word,
 };
 use std::fmt::Write;
 
@@ -121,7 +122,7 @@ pub fn disassemble(program: &Program) -> String {
     let consts = program.constants();
     let _ = writeln!(out, "; constants ({})", consts.len());
     for (i, c) in consts.iter().enumerate() {
-        let _ = writeln!(out, ";   [{i}] {}", fmt_value(*c));
+        let _ = writeln!(out, ";   [{i}] {}", fmt_word(*c));
     }
 
     // functions
@@ -271,7 +272,7 @@ fn render_operands(
 
 fn const_comment(program: &Program, idx: usize) -> String {
     match program.constants().get(idx) {
-        Some(v) => format!("; {}", fmt_value(*v)),
+        Some(v) => format!("; {}", fmt_word(*v)),
         None => "; <oob>".into(),
     }
 }
@@ -294,10 +295,9 @@ fn fmt_fn(f: &Function) -> String {
     }
 }
 
-/// A Value is an opaque u64; show all plausible interpretations since the
+/// A word is an opaque u64; show all plausible interpretations since the
 /// constant pool doesn't carry type tags.
-fn fmt_value(v: Value) -> String {
-    let bits = v.to_bits();
-    let as_f = f64::from_bits(bits);
-    format!("0x{bits:016x} (i={} f={})", bits as i64, as_f)
+fn fmt_word(w: word) -> String {
+    let as_f = f64::from_bits(w);
+    format!("0x{w:016x} (i={} f={})", w as i64, as_f)
 }

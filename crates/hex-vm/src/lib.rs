@@ -10,7 +10,7 @@ pub use error::*;
 pub use host::{Flow, Host, HostCtx, Syscode};
 pub use instruction::*;
 pub use program::*;
-pub use value::{Args, IsValue, Value};
+pub use value::{Args, AsWord, word};
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
@@ -23,19 +23,16 @@ pub enum RunOutcome {
     Trapped(Fault),
 }
 
-#[allow(non_camel_case_types)]
-pub type word = u64;
-
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Frame {
     pub ret_pc: usize,
     pub ret_base: usize,
-    pub caller_id: FunctionId,
+    pub caller: FunctionId,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct VM {
-    pub registers: Vec<Value>,
+    pub registers: Vec<word>,
     call_stack: Vec<Frame>,
     pc: usize,
     base: usize,
@@ -43,8 +40,18 @@ pub struct VM {
 }
 
 impl VM {
+    pub fn new() -> Self {
+        Self {
+            registers: vec![],
+            call_stack: vec![],
+            pc: usize::MAX,
+            base: usize::MAX,
+            curr_func: FunctionId::MAX,
+        }
+    }
+
     pub fn from_entry(program: &Program, func: FunctionId, args: Args<'_>) -> Result<Self, Error> {
-        let mut vm = Self::default();
+        let mut vm = Self::new();
         vm.set_entry(program, func, args)?;
         Ok(vm)
     }
@@ -58,7 +65,7 @@ impl VM {
         }
 
         self.reset();
-        self.registers.resize(func.nreg as usize, Value::ZERO);
+        self.registers.resize(func.nreg as usize, 0);
         self.registers[..args.len()].copy_from_slice(&args);
         self.pc = func.ty.entry_pc()?;
         self.base = 0;
@@ -91,76 +98,34 @@ impl VM {
     }
 
     #[inline(always)]
-    fn reg_raw(&self, reg: Reg) -> Value {
+    fn reg_raw(&self, reg: Reg) -> word {
         // TODO: add program validation and change to get_unchecked.
         self.registers[self.base + reg as usize]
     }
 
     #[inline(always)]
-    fn reg<T: IsValue>(&self, reg: Reg) -> T {
-        T::from_value(self.registers[self.base + reg as usize])
+    fn reg<T: AsWord>(&self, reg: Reg) -> T {
+        T::from_word(self.registers[self.base + reg as usize])
     }
 
     #[inline(always)]
-    fn set_reg(&mut self, reg: Reg, value: impl IsValue) {
-        self.registers[self.base + reg as usize] = value.into_value();
+    fn set_reg(&mut self, reg: Reg, value: impl AsWord) {
+        self.registers[self.base + reg as usize] = value.into_word();
     }
 
     #[inline(always)]
-    fn set_reg_raw(&mut self, reg: Reg, value: Value) {
+    fn set_reg_raw(&mut self, reg: Reg, value: word) {
         self.registers[self.base + reg as usize] = value;
     }
 
     #[inline(always)]
-    fn two_reg<T: IsValue>(&self, reg_a: Reg, reg_b: Reg) -> (T, T) {
+    fn two_reg<T: AsWord>(&self, reg_a: Reg, reg_b: Reg) -> (T, T) {
         (self.reg(reg_a), self.reg(reg_b))
     }
 
     #[inline(always)]
     fn reg_offset(&self, reg: Reg) -> usize {
         self.base + reg as usize
-    }
-
-    #[inline(always)]
-    fn callvm(&mut self, callee: FunctionId, ret: Reg, entry: usize, nreg: Reg) {
-        // Call convention: args are in caller registers[Rret..Rn]
-        //
-        // We use overlapping register windows for caller and callee
-        // to avoid copying arguments. This is safe because argument
-        // registers are not clobbered by caller until callee returns.
-
-        // Callee window starts at caller's return register.
-        let base = self.reg_offset(ret);
-        let last = base + nreg as usize;
-
-        // Grow regs to fit callee's full register count beyond the arg base.
-        if last > self.registers.len() {
-            self.registers.resize(last, Value::ZERO);
-        }
-
-        // Create new call frame and save return point
-        self.call_stack.push(Frame {
-            ret_pc: self.pc,
-            ret_base: self.base,
-            caller_id: self.curr_func,
-        });
-
-        // Jump to callee code
-        self.curr_func = callee;
-        self.base = base;
-        self.pc = entry;
-    }
-
-    #[inline(always)]
-    fn callh<H: Host>(
-        &mut self,
-        ret: Reg,
-        host: &mut H,
-        syscode: Syscode,
-        narg: Reg,
-        nret: Reg,
-    ) -> Result<Flow, Error> {
-        host.syscall(syscode, HostCtx { base: self.reg_offset(ret), narg, nret, vm: self })
     }
 }
 
@@ -171,26 +136,100 @@ fn cmp_branch(vm: &mut VM, program: &Program, jmp: bool) {
 
 #[inline(always)]
 pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [u8]) -> Result<RunOutcome, Error> {
-    // Raise a fault: unwind to a handler, or exit run if uncaught.
-    macro_rules! fault {
-        ($f:expr) => {{
-            let f = $f;
-            let v = fault_to_value(f);
-            match unwind(vm, program, v, f) {
-                Ok(()) => continue,                 // caught: resume at handler
-                Err(outcome) => return Ok(outcome), // uncaught: terminal
-            }
-        }};
-    }
-
     while vm.pc < program.len() {
         let i = program.instruction(vm.pc);
         vm.pc += 1;
 
+        // Raise a fault: unwind to a handler, or exit run if uncaught.
+        macro_rules! trap {
+            ($f:expr) => {{
+                let f = $f;
+                match unwind(vm, program, fault_to_value(f), f) {
+                    // caught: resume at handler
+                    Ok(()) => {}
+                    // uncaught: terminal
+                    Err(fault) => return Ok(RunOutcome::Trapped(fault)),
+                }
+            }};
+
+            ($f:expr, $v:expr) => {{
+                match unwind(vm, program, $v, $f) {
+                    // caught: resume at handler
+                    Ok(()) => {}
+                    // uncaught: terminal
+                    Err(fault) => return Ok(RunOutcome::Trapped(fault)),
+                }
+            }};
+        }
+        macro_rules! call {
+            ($id:expr) => {{
+                let func_id = $id;
+                let func = program.function(func_id);
+                let base = vm.reg_offset(inst::a(i));
+                match func.ty {
+                    FnType::Hxvm { entry_pc } => {
+                        let last = base + func.nreg as usize;
+                        if last > vm.registers.len() {
+                            vm.registers.resize(last, 0);
+                        }
+                        vm.call_stack.push(Frame {
+                            ret_pc: vm.pc,
+                            ret_base: vm.base,
+                            caller: vm.curr_func,
+                        });
+                        vm.curr_func = func_id;
+                        vm.base = base;
+                        vm.pc = entry_pc;
+                    }
+                    FnType::Host { syscode } => {
+                        let ctx = HostCtx { vm, base, narg: func.narg, nret: func.nret };
+                        match host.syscall(syscode, ctx)? {
+                            Flow::Suspend => return Ok(RunOutcome::Suspended),
+                            Flow::Trap(f) => trap!(f),
+                            Flow::Continue => {}
+                        }
+                    }
+                }
+            }};
+            ($id:expr, tail) => {{
+                let id = $id;
+                let func = program.function(id);
+                let base = vm.base;
+                let src = vm.reg_offset(inst::a(i));
+                vm.registers.copy_within(src..src + func.narg as usize, base);
+
+                match func.ty {
+                    FnType::Hxvm { entry_pc } => {
+                        let last = vm.base + func.nreg as usize;
+                        if last > vm.registers.len() {
+                            vm.registers.resize(last, 0);
+                        }
+                        vm.curr_func = id;
+                        vm.pc = entry_pc;
+                    }
+                    FnType::Host { syscode } => {
+                        let ctx = HostCtx { vm, base, narg: func.narg, nret: func.nret };
+                        match host.syscall(syscode, ctx)? {
+                            Flow::Suspend => return Ok(RunOutcome::Suspended),
+                            Flow::Trap(f) => trap!(f),
+                            Flow::Continue => match vm.call_stack.pop() {
+                                Some(fr) => {
+                                    vm.pc = fr.ret_pc;
+                                    vm.base = fr.ret_base;
+                                    vm.curr_func = fr.caller;
+                                }
+                                None => return Ok(RunOutcome::Completed),
+                            },
+                        }
+                    }
+                }
+            }};
+        }
+
         match inst::op(i) {
             // Moves
             Opcode::COPY => vm.set_reg_raw(inst::a(i), vm.reg_raw(inst::b(i))),
-            Opcode::LOADK => vm.set_reg_raw(inst::a(i), program.constant(inst::bx(i) as usize)),
+            Opcode::LOADK => vm.set_reg_raw(inst::a(i), program.constant(inst::bx(i) as ConstantId)),
             Opcode::LOADI => vm.set_reg(inst::a(i), inst::bx_imm(i)),
             Opcode::LOADF => vm.set_reg(inst::a(i), inst::bx_imm(i) as f64),
 
@@ -226,40 +265,40 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                 vm.set_reg(inst::a(i), src.wrapping_mul(inst::imm8(i) as u64));
             }
             Opcode::ADDK => {
-                let a = vm.reg::<u64>(inst::b(i));
-                let k = program.constant(inst::c(i) as usize).get::<u64>();
+                let a = vm.reg::<word>(inst::b(i));
+                let k = u64::from_word(program.constant(inst::c(i) as ConstantId));
                 vm.set_reg(inst::a(i), a.wrapping_add(k));
             }
             Opcode::SUBK => {
-                let a = vm.reg::<u64>(inst::b(i));
-                let k = program.constant(inst::c(i) as usize).get::<u64>();
+                let a = vm.reg::<word>(inst::b(i));
+                let k = u64::from_word(program.constant(inst::c(i) as ConstantId));
                 vm.set_reg(inst::a(i), a.wrapping_sub(k));
             }
             Opcode::MULK => {
-                let a = vm.reg::<u64>(inst::b(i));
-                let k = program.constant(inst::c(i) as usize).get::<u64>();
+                let a = vm.reg::<word>(inst::b(i));
+                let k = u64::from_word(program.constant(inst::c(i) as ConstantId));
                 vm.set_reg(inst::a(i), a.wrapping_mul(k));
             }
 
             // Float arithmetic with constant-pool operand
             Opcode::FADDK => {
                 let a = vm.reg::<f64>(inst::b(i));
-                let k = program.constant(inst::c(i) as usize).get::<f64>();
+                let k = f64::from_word(program.constant(inst::c(i) as ConstantId));
                 vm.set_reg(inst::a(i), a + k);
             }
             Opcode::FSUBK => {
                 let a = vm.reg::<f64>(inst::b(i));
-                let k = program.constant(inst::c(i) as usize).get::<f64>();
+                let k = f64::from_word(program.constant(inst::c(i) as ConstantId));
                 vm.set_reg(inst::a(i), a - k);
             }
             Opcode::FMULK => {
                 let a = vm.reg::<f64>(inst::b(i));
-                let k = program.constant(inst::c(i) as usize).get::<f64>();
+                let k = f64::from_word(program.constant(inst::c(i) as ConstantId));
                 vm.set_reg(inst::a(i), a * k);
             }
             Opcode::FDIVK => {
                 let a = vm.reg::<f64>(inst::b(i));
-                let k = program.constant(inst::c(i) as usize).get::<f64>();
+                let k = f64::from_word(program.constant(inst::c(i) as ConstantId));
                 vm.set_reg(inst::a(i), a / k);
             }
 
@@ -268,28 +307,28 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                 let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
                 match a.checked_div(b) {
                     Some(v) => vm.set_reg(inst::a(i), v),
-                    None => fault!(Fault::DivisionByZero),
+                    None => trap!(Fault::DivisionByZero),
                 }
             }
             Opcode::SREM => {
                 let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
                 match a.checked_rem(b) {
                     Some(v) => vm.set_reg(inst::a(i), v),
-                    None => fault!(Fault::DivisionByZero),
+                    None => trap!(Fault::DivisionByZero),
                 }
             }
             Opcode::UDIV => {
                 let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
                 match a.checked_div(b) {
                     Some(v) => vm.set_reg(inst::a(i), v),
-                    None => fault!(Fault::DivisionByZero),
+                    None => trap!(Fault::DivisionByZero),
                 }
             }
             Opcode::UREM => {
                 let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
                 match a.checked_rem(b) {
                     Some(v) => vm.set_reg(inst::a(i), v),
-                    None => fault!(Fault::DivisionByZero),
+                    None => trap!(Fault::DivisionByZero),
                 }
             }
 
@@ -466,132 +505,40 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
             Opcode::LOAD => {
                 let (ptr, off) = vm.two_reg::<word>(inst::b(i), inst::c(i));
                 let start = (ptr + off) as usize;
-                match memory.get(start..start + size_of::<Value>()) {
-                    Some(slice) => vm.set_reg_raw(inst::a(i), Value::copy_from_slice(slice)),
-                    None => fault!(Fault::MemoryOOB),
+                match memory.get(start..start + size_of::<word>()) {
+                    Some(slice) => {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(slice);
+                        vm.set_reg_raw(inst::a(i), word::from_le_bytes(b));
+                    }
+                    None => trap!(Fault::MemoryOOB),
                 }
             }
             Opcode::STORE => {
                 let (ptr, off) = vm.two_reg::<word>(inst::b(i), inst::c(i));
                 let start = (ptr + off) as usize;
-                match memory.get_mut(start..start + size_of::<Value>()) {
-                    Some(slice) => slice.copy_from_slice(&Value::to_le_bytes(vm.reg_raw(inst::a(i)))),
-                    None => fault!(Fault::MemoryOOB),
+                match memory.get_mut(start..start + size_of::<word>()) {
+                    Some(slice) => slice.copy_from_slice(&word::to_le_bytes(vm.reg_raw(inst::a(i)))),
+                    None => trap!(Fault::MemoryOOB),
                 }
             }
 
             // Calls
-            Opcode::CALL => {
-                let id = inst::bx(i) as FunctionId;
-                let func = program.function(id);
-                match func.ty {
-                    FnType::Hxvm { entry_pc } => vm.callvm(id, inst::a(i), entry_pc, func.nreg),
-                    FnType::Host { syscode } => match vm.callh(inst::a(i), host, syscode, func.narg, func.nret)? {
-                        Flow::Suspend => return Ok(RunOutcome::Suspended),
-                        Flow::Continue => {}
-                    },
-                }
-            }
-            Opcode::CALL_IND => {
-                let id = vm.reg::<FunctionId>(inst::b(i));
-                let func = program.function(id);
-                match func.ty {
-                    FnType::Hxvm { entry_pc } => vm.callvm(id, inst::a(i), entry_pc, func.nreg),
-                    FnType::Host { syscode } => match vm.callh(inst::a(i), host, syscode, func.narg, func.nret)? {
-                        Flow::Suspend => return Ok(RunOutcome::Suspended),
-                        Flow::Continue => {}
-                    },
-                }
-            }
-            Opcode::TCALL => {
-                let id = inst::bx(i) as FunctionId;
+            Opcode::CALL => call!(inst::bx(i) as FunctionId),
+            Opcode::TCALL => call!(inst::bx(i) as FunctionId, tail),
+            Opcode::CALL_IND => call!(vm.reg::<FunctionId>(inst::b(i))),
+            Opcode::TCALL_IND => call!(vm.reg::<FunctionId>(inst::b(i)), tail),
 
-                let func = program.function(id);
-                match func.ty {
-                    FnType::Hxvm { entry_pc } => {
-                        let src = vm.reg_offset(inst::a(i));
-
-                        // Move args down to the CURRENT base (reusing this frame's slot).
-                        // src >= self.base always (a_reg >= 0), so copy_within is forward-safe
-                        // only if src >= dst; here dst = self.base <= src, so left-shift: OK.
-                        vm.registers.copy_within(src..src + func.narg as usize, vm.base);
-
-                        // grow window to callee's nreg from the SAME base (no frame push)
-                        let last = vm.base + func.nreg as usize;
-                        if last > vm.registers.len() {
-                            vm.registers.resize(last, Value::ZERO);
-                        }
-
-                        vm.pc = entry_pc;
-                    }
-                    FnType::Host { syscode } => {
-                        let base = vm.base;
-                        let ctx = HostCtx { vm, base, narg: func.narg, nret: func.nret };
-                        match host.syscall(syscode, ctx)? {
-                            Flow::Suspend => return Ok(RunOutcome::Suspended),
-                            Flow::Continue => match vm.call_stack.pop() {
-                                Some(fr) => {
-                                    vm.pc = fr.ret_pc;
-                                    vm.base = fr.ret_base;
-                                }
-                                None => return Ok(RunOutcome::Completed),
-                            },
-                        }
-                    }
-                }
-            }
-            Opcode::TCALL_IND => {
-                let id = vm.reg::<FunctionId>(inst::b(i));
-                let func = program.function(id);
-                match func.ty {
-                    FnType::Hxvm { entry_pc } => {
-                        let src = vm.reg_offset(inst::a(i));
-
-                        // Move args down to the CURRENT base (reusing this frame's slot).
-                        // src >= self.base always (a_reg >= 0), so copy_within is forward-safe
-                        // only if src >= dst; here dst = self.base <= src, so left-shift: OK.
-                        vm.registers.copy_within(src..src + func.narg as usize, vm.base);
-
-                        // grow window to callee's nreg from the SAME base (no frame push)
-                        let last = vm.base + func.nreg as usize;
-                        if last > vm.registers.len() {
-                            vm.registers.resize(last, Value::ZERO);
-                        }
-
-                        vm.pc = entry_pc;
-                    }
-                    FnType::Host { syscode } => {
-                        let base = vm.base;
-                        let ctx = HostCtx { vm, base, narg: func.narg, nret: func.nret };
-                        match host.syscall(syscode, ctx)? {
-                            Flow::Suspend => return Ok(RunOutcome::Suspended),
-                            Flow::Continue => match vm.call_stack.pop() {
-                                Some(frame) => {
-                                    vm.pc = frame.ret_pc;
-                                    vm.base = frame.ret_base;
-                                }
-                                None => return Ok(RunOutcome::Completed),
-                            },
-                        }
-                    }
-                }
-            }
             Opcode::RET => match vm.call_stack.pop() {
                 Some(frame) => {
                     vm.pc = frame.ret_pc;
                     vm.base = frame.ret_base;
+                    vm.curr_func = frame.caller;
                 }
                 None => return Ok(RunOutcome::Completed),
             },
 
-            Opcode::THROW => {
-                let thrown = vm.reg_raw(inst::a(i));
-                match unwind(vm, program, thrown, Fault::Uncaught) {
-                    Ok(()) => {}
-                    Err(outcome) => return Ok(outcome),
-                }
-            }
-
+            Opcode::THROW => trap!(Fault::Uncaught, vm.reg_raw(inst::a(i))),
             Opcode::HALT => return Ok(RunOutcome::Completed),
 
             op => return Err(Error::UnknownOp(op)),
@@ -603,7 +550,7 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
 /// Unwind from the current pc carrying `thrown`. On finding a handler, sets
 /// pc/base/cur_func to resume at the handler and returns Ok(()). If no handler
 /// exists anywhere on the stack, returns Err(outcome) to exit `run`.
-fn unwind(vm: &mut VM, program: &Program, thrown: Value, uncaught: Fault) -> Result<(), RunOutcome> {
+fn unwind(vm: &mut VM, program: &Program, thrown: word, uncaught: Fault) -> Result<(), Fault> {
     let mut func = program.function(vm.curr_func);
     let mut check_pc = vm.pc - 1;
 
@@ -618,25 +565,25 @@ fn unwind(vm: &mut VM, program: &Program, thrown: Value, uncaught: Fault) -> Res
             Some(frame) => {
                 vm.base = frame.ret_base;
                 vm.pc = frame.ret_pc;
-                vm.curr_func = frame.caller_id;
+                vm.curr_func = frame.caller;
                 func = program.function(vm.curr_func);
                 check_pc = frame.ret_pc - 1;
             }
             None => {
                 // stack empty, no handler anywhere
-                return Err(RunOutcome::Trapped(uncaught));
+                return Err(uncaught);
             }
         }
     }
 }
 
 #[inline]
-fn fault_to_value(f: Fault) -> Value {
+fn fault_to_value(f: Fault) -> word {
     match f {
         Fault::Uncaught => 0,
         Fault::DivisionByZero => 1,
         Fault::MemoryOOB => 2,
         Fault::Abort(c) => 0x100 | c as i64,
     }
-    .into_value()
+    .into_word()
 }

@@ -4,10 +4,9 @@ pub(crate) use hex_vm as vm;
 
 pub mod codegen;
 mod constants;
-mod dominator;
 pub mod fmt;
 pub mod instruction;
-mod liveness;
+pub mod liveness;
 pub mod op;
 mod register_alloc;
 
@@ -45,11 +44,6 @@ impl BlockId {
         Self(NonZeroU32::new(n).unwrap())
     }
 
-    fn from_idx_unchecked(i: usize) -> Self {
-        let n = u32::try_from(i + 1).expect("BlockId idx overflow");
-        BlockId(NonZeroU32::new(n).unwrap())
-    }
-
     pub fn idx(self) -> usize {
         (self.0.get() - 1) as usize
     }
@@ -66,7 +60,7 @@ pub enum Ty {
 
 #[derive(Copy, Clone, Debug)]
 pub enum ConstVal {
-    Int(i64),
+    Sint(i64),
     Uint(u64),
     Bool(bool),
     Float(f64),
@@ -75,7 +69,7 @@ pub enum ConstVal {
 impl ConstVal {
     pub fn ty(self) -> Ty {
         match self {
-            ConstVal::Int(_) => Ty::Int,
+            ConstVal::Sint(_) => Ty::Int,
             ConstVal::Uint(_) => Ty::Uint,
             ConstVal::Bool(_) => Ty::Bool,
             ConstVal::Float(_) => Ty::Float,
@@ -219,9 +213,7 @@ impl FunctionBuilder {
     /// Panics if no block is current (e.g. after `set_terminator` without
     /// a subsequent `switch_to`).
     pub fn emit(&mut self, inst: Inst) {
-        let b = self
-            .current
-            .expect("FunctionBuilder::emit with no current block");
+        let b = self.current.expect("FunctionBuilder::emit with no current block");
         self.func.blocks[b.idx()].insts.push(inst);
     }
 

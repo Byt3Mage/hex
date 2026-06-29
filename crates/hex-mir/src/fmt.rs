@@ -35,7 +35,7 @@ impl Display for Ty {
 impl Display for ConstVal {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            ConstVal::Int(i) => write!(f, "{}", i),
+            ConstVal::Sint(i) => write!(f, "{}", i),
             ConstVal::Uint(u) => write!(f, "{}", u),
             ConstVal::Bool(b) => write!(f, "{}", b),
             ConstVal::Float(x) => {
@@ -45,11 +45,7 @@ impl Display for ConstVal {
                 if x.is_nan() {
                     f.write_str("nan")
                 } else if x.is_infinite() {
-                    if *x < 0.0 {
-                        f.write_str("-inf")
-                    } else {
-                        f.write_str("inf")
-                    }
+                    if *x < 0.0 { f.write_str("-inf") } else { f.write_str("inf") }
                 } else if x.fract() == 0.0 && x.abs() < 1e16 {
                     write!(f, "{:.1}", x)
                 } else {
@@ -227,13 +223,7 @@ fn print_terminator(f: &mut Formatter<'_>, term: &Term) -> fmt::Result {
             write!(f, "jump {}", tgt)?;
             print_args(f, args)
         }
-        Term::Branch {
-            cond,
-            then_blk,
-            then_args,
-            else_blk,
-            else_args,
-        } => {
+        Term::Branch { cond, then_blk, then_args, else_blk, else_args } => {
             write!(f, "branch {}, {}", cond, then_blk)?;
             print_args(f, then_args)?;
             write!(f, ", {}", else_blk)?;

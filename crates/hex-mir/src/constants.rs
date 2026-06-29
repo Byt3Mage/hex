@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use crate::{ConstVal, vm};
-
+use vm::AsWord;
 pub struct ConstantPool {
-    values: Vec<vm::Value>,
+    values: Vec<vm::word>,
     dedup: HashMap<u64, vm::Instruction>,
 }
 
@@ -13,28 +13,29 @@ impl ConstantPool {
     }
 
     pub fn insert(&mut self, val: &ConstVal) -> vm::Instruction {
-        let bits = match val {
-            ConstVal::Int(i) => *i as u64,
-            ConstVal::Uint(u) => *u as u64,
-            ConstVal::Bool(b) => *b as u64,
-            ConstVal::Float(f) => f.to_bits(),
+        let word = match val {
+            ConstVal::Sint(i) => i64::into_word(*i),
+            ConstVal::Uint(u) => u64::into_word(*u),
+            ConstVal::Bool(b) => bool::into_word(*b),
+            ConstVal::Float(f) => f64::into_word(*f),
         };
 
-        if let Some(&idx) = self.dedup.get(&bits) {
+        if let Some(&idx) = self.dedup.get(&word) {
             return idx;
         }
+
         let idx = self.values.len() as vm::Instruction;
-        self.dedup.insert(bits, idx);
-        self.values.push(vm::Value::from_bits(bits));
+        self.dedup.insert(word, idx);
+        self.values.push(word);
         idx
     }
 
-    pub fn into_values(self) -> Vec<vm::Value> {
+    pub fn into_values(self) -> Vec<vm::word> {
         self.values
     }
 }
 
-impl From<ConstantPool> for Box<[vm::Value]> {
+impl From<ConstantPool> for Box<[vm::word]> {
     fn from(pool: ConstantPool) -> Self {
         pool.into_values().into_boxed_slice()
     }

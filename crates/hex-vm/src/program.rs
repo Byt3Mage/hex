@@ -1,7 +1,8 @@
 use crate::{
-    Error, Value,
+    Error,
     host::Syscode,
     instruction::{Instruction, Reg},
+    value::word,
 };
 
 /// Global function ID in the linked program
@@ -57,12 +58,12 @@ impl Function {
 /// Fully compiled program ready for execution
 pub struct Program {
     instructions: Box<[Instruction]>,
-    constants: Box<[Value]>,
+    constants: Box<[word]>,
     functions: Box<[Function]>,
 }
 
 impl Program {
-    pub fn new(instructions: Box<[Instruction]>, constants: Box<[Value]>, functions: Box<[Function]>) -> Self {
+    pub fn new(instructions: Box<[Instruction]>, constants: Box<[word]>, functions: Box<[Function]>) -> Self {
         Self { instructions, constants, functions }
     }
 
@@ -72,7 +73,7 @@ impl Program {
     }
 
     #[inline(always)]
-    pub fn constants(&self) -> &[Value] {
+    pub fn constants(&self) -> &[word] {
         &self.constants
     }
 
@@ -87,8 +88,8 @@ impl Program {
     }
 
     #[inline(always)]
-    pub fn constant(&self, idx: usize) -> Value {
-        self.constants[idx]
+    pub fn constant(&self, idx: ConstantId) -> word {
+        self.constants[idx as usize]
     }
 
     #[inline(always)]

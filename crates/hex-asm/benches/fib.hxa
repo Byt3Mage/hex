@@ -1,0 +1,13 @@
+fn fib(1, 1, 3):
+    loadi R1, $2
+    jslt  R0, R1, @end    // n < 2 -> return n
+
+    subi  R1, R0, $1
+    call  R1, fib          // R1 = fib(n-2), window R1..R2
+
+    subi  R2, R0, $2
+    call  R2, fib          // R2 = fib(n-1), window R2..R3
+
+    add   R0, R1, R2       // fib(n-1) + fib(n-2)
+@end:
+    ret

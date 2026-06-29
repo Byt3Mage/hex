@@ -1,143 +1,110 @@
 use std::ops::Deref;
 
-use crate::{Reg, word};
+use crate::Reg;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct Value(word);
+#[allow(non_camel_case_types)]
+pub type word = u64;
 
-impl Value {
-    pub const ZERO: Self = Self(0);
+pub trait AsWord: Copy {
+    fn from_word(w: word) -> Self;
+    fn into_word(self) -> word;
+}
 
-    pub const fn from_bits(bits: word) -> Self {
-        Self(bits)
-    }
-
-    pub const fn to_bits(self) -> word {
-        self.0
-    }
-
-    pub const fn copy_from_slice(bytes: &[u8]) -> Self {
-        let mut b = [0; 8];
-        b.copy_from_slice(bytes);
-        Self(u64::from_le_bytes(b))
-    }
-
-    pub const fn to_le_bytes(self) -> [u8; 8] {
-        self.0.to_le_bytes()
-    }
-
+impl AsWord for u64 {
     #[inline(always)]
-    pub fn get<T: IsValue>(self) -> T {
-        T::from_value(self)
+    fn from_word(w: word) -> Self {
+        w as u64
     }
-
     #[inline(always)]
-    pub fn set<T: IsValue>(&mut self, v: T) {
-        *self = v.into_value();
+    fn into_word(self) -> word {
+        self as word
     }
 }
 
-pub trait IsValue: Copy {
-    fn from_value(v: Value) -> Self;
-    fn into_value(self) -> Value;
-}
-
-impl IsValue for usize {
+impl AsWord for i64 {
     #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        v.0 as usize
+    fn from_word(w: word) -> Self {
+        w as i64
     }
     #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self as word)
+    fn into_word(self) -> word {
+        self as word
     }
 }
 
-impl IsValue for u64 {
+impl AsWord for usize {
     #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        v.0
+    fn from_word(w: word) -> Self {
+        w as usize
     }
     #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self)
-    }
-}
-
-impl IsValue for i64 {
-    #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        v.0 as i64
-    }
-    #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self as word)
+    fn into_word(self) -> word {
+        self as word
     }
 }
 
-impl IsValue for f64 {
+impl AsWord for f64 {
     #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        f64::from_bits(v.0)
+    fn from_word(w: word) -> Self {
+        f64::from_bits(w)
     }
     #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self.to_bits())
-    }
-}
-
-impl IsValue for bool {
-    #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        v.0 != 0
-    }
-    #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self as word)
+    fn into_word(self) -> word {
+        f64::to_bits(self)
     }
 }
 
-impl IsValue for u8 {
+impl AsWord for bool {
     #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        v.0 as u8
+    fn from_word(w: word) -> Self {
+        w != 0
     }
     #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self as word)
-    }
-}
-
-impl IsValue for u16 {
-    #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        v.0 as u16
-    }
-    #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self as word)
+    fn into_word(self) -> word {
+        self as word
     }
 }
 
-impl IsValue for u32 {
+impl AsWord for u8 {
     #[inline(always)]
-    fn from_value(v: Value) -> Self {
-        v.0 as u32
+    fn from_word(w: word) -> Self {
+        w as u8
     }
     #[inline(always)]
-    fn into_value(self) -> Value {
-        Value(self as word)
+    fn into_word(self) -> word {
+        self as word
+    }
+}
+
+impl AsWord for u16 {
+    #[inline(always)]
+    fn from_word(w: word) -> Self {
+        w as u16
+    }
+    #[inline(always)]
+    fn into_word(self) -> word {
+        self as word
+    }
+}
+
+impl AsWord for u32 {
+    #[inline(always)]
+    fn from_word(w: word) -> Self {
+        w as u32
+    }
+    #[inline(always)]
+    fn into_word(self) -> word {
+        self as word
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct Args<'a>(&'a [Value]);
+pub struct Args<'a>(&'a [word]);
 
 impl<'a> Args<'a> {
     #[inline]
-    pub fn new(args: &'a [Value]) -> Option<Self> {
+    pub fn new(args: &'a [word]) -> Option<Self> {
         if args.len() <= (Reg::MAX as usize) { Some(Self(args)) } else { None }
     }
 
@@ -148,7 +115,7 @@ impl<'a> Args<'a> {
 }
 
 impl<'a> Deref for Args<'a> {
-    type Target = [Value];
+    type Target = [word];
 
     fn deref(&self) -> &Self::Target {
         self.0

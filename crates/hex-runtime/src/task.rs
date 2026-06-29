@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use hex_vm::{Args, FunctionId, IsValue, Program, Reg, VM, Value};
+use hex_vm::{Args, AsWord, FunctionId, Program, Reg, VM, word};
 use slotmap::{Key, KeyData, SlotMap};
 use smallvec::{SmallVec, smallvec};
 
@@ -8,13 +8,13 @@ slotmap::new_key_type! {
     pub struct TaskId;
 }
 
-impl IsValue for TaskId {
-    fn from_value(v: Value) -> Self {
-        TaskId::from(KeyData::from_ffi(v.to_bits()))
+impl AsWord for TaskId {
+    fn from_word(w: word) -> Self {
+        TaskId::from(KeyData::from_ffi(w as u64))
     }
 
-    fn into_value(self) -> Value {
-        Value::from_bits(self.data().as_ffi())
+    fn into_word(self) -> word {
+        self.data().as_ffi() as word
     }
 }
 
@@ -71,19 +71,18 @@ impl<'p> Scheduler<'p> {
     pub fn complete(&mut self, tid: TaskId) {
         let task = &mut self.tasks[tid];
         let nret = self.program.function(task.func).nret as usize;
-        let result = SmallVec::<[Value; 4]>::from(&task.vm.registers[..nret]);
+        let result = SmallVec::<[word; 4]>::from(&task.vm.registers[..nret]);
         let joiners = std::mem::take(&mut task.joiners);
 
         task.state = TaskState::Done;
 
-        // Wake joiners
         for j in joiners {
             self.wake(j, &result);
         }
     }
 
     /// Deliver a result into a blocked task's saved return window and ready it.
-    fn wake(&mut self, tid: TaskId, result: &[Value]) {
+    fn wake(&mut self, tid: TaskId, result: &[word]) {
         let task = &mut self.tasks[tid];
         if let Some((base, nret)) = task.resume_into.take() {
             let n = nret as usize;
