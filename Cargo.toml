@@ -8,3 +8,6 @@ members = [
     "crates/lang-talkscript",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+hex-vm = { path = "crates/hex-vm" }

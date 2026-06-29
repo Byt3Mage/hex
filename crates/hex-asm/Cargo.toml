@@ -5,7 +5,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-hex-vm = { path = "../hex-vm" }
+hex-vm = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.8.2"
