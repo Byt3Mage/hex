@@ -1,16 +1,28 @@
+#![no_std]
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+#[cfg(feature = "alloc")]
 mod disassemble;
 mod error;
 mod host;
 mod instruction;
 mod program;
+mod storage;
 mod value;
 
+#[cfg(feature = "alloc")]
 pub use disassemble::disassemble;
 pub use error::*;
 pub use host::{Flow, Host, HostCtx, Syscode};
 pub use instruction::*;
 pub use program::*;
+pub use storage::{Slab, max_frames};
 pub use value::{Args, AsWord, word};
+
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
@@ -23,37 +35,70 @@ pub enum RunOutcome {
     Trapped(Fault),
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Frame {
     pub ret_pc: usize,
     pub ret_base: usize,
     pub caller: FunctionId,
 }
 
+impl Default for Frame {
+    fn default() -> Self {
+        Self {
+            ret_pc: usize::MAX,
+            ret_base: usize::MAX,
+            caller: FunctionId::MAX,
+        }
+    }
+}
+
+/// A register-based VM over caller-provided storage.
+///
+/// `R` is the register file and `F` is the call-frame stack. Both are
+/// fixed-capacity slabs (`Vec`, `[T; N]`, `&mut [T]`, ...); the VM never
+/// grows them, it bounds-checks and raises [`Fault::StackOverflow`].
+/// `registers.len()` is the maximum stack size.
 #[derive(Debug, Clone)]
-pub struct VM {
-    pub registers: Vec<word>,
-    call_stack: Vec<Frame>,
+pub struct VM<R: Slab<word>, F: Slab<Frame>> {
+    pub registers: R,
+    frames: F,
+    frame_top: usize,
     pc: usize,
     base: usize,
     curr_func: FunctionId,
 }
 
-impl VM {
-    pub fn new() -> Self {
+/// Owned, heap-backed VM. Only available with the `alloc` feature.
+#[cfg(feature = "alloc")]
+pub type HeapVM = VM<Vec<word>, Vec<Frame>>;
+
+#[cfg(feature = "alloc")]
+impl HeapVM {
+    /// One-line setup: pick a register budget; frames are sized automatically.
+    pub fn new(reg_cap: usize) -> Self {
+        Self::from_parts(
+            alloc::vec![0 as word; reg_cap],
+            alloc::vec![Frame::default(); max_frames(reg_cap)],
+        )
+    }
+
+    pub fn from_entry(program: &Program, func: FunctionId, args: Args<'_>, reg_cap: usize) -> Result<Self, Error> {
+        let mut vm = Self::new(reg_cap);
+        vm.set_entry(program, func, args)?;
+        Ok(vm)
+    }
+}
+
+impl<R: Slab<word>, F: Slab<Frame>> VM<R, F> {
+    pub fn from_parts(registers: R, frames: F) -> Self {
         Self {
-            registers: vec![],
-            call_stack: vec![],
+            registers,
+            frames,
+            frame_top: 0,
             pc: usize::MAX,
             base: usize::MAX,
             curr_func: FunctionId::MAX,
         }
-    }
-
-    pub fn from_entry(program: &Program, func: FunctionId, args: Args<'_>) -> Result<Self, Error> {
-        let mut vm = Self::new();
-        vm.set_entry(program, func, args)?;
-        Ok(vm)
     }
 
     pub fn set_entry(&mut self, program: &Program, entry: FunctionId, args: Args) -> Result<(), Error> {
@@ -65,8 +110,12 @@ impl VM {
         }
 
         self.reset();
-        self.registers.resize(func.nreg as usize, 0);
-        self.registers[..args.len()].copy_from_slice(&args);
+
+        let regs = self.registers.slots_mut();
+
+        regs[..func.nreg as usize].fill(0);
+        regs[..args.len()].copy_from_slice(&args);
+
         self.pc = func.ty.entry_pc()?;
         self.base = 0;
         self.curr_func = entry;
@@ -75,8 +124,7 @@ impl VM {
 
     #[inline(always)]
     pub fn reset(&mut self) {
-        self.registers.clear();
-        self.call_stack.clear();
+        self.frame_top = 0;
         self.pc = 0;
         self.base = 0;
         self.curr_func = FunctionId::MAX;
@@ -94,28 +142,28 @@ impl VM {
 
     #[inline]
     pub fn call_stack(&self) -> &[Frame] {
-        &self.call_stack
+        &self.frames.slots()[..self.frame_top]
     }
 
     #[inline(always)]
     fn reg_raw(&self, reg: Reg) -> word {
         // TODO: add program validation and change to get_unchecked.
-        self.registers[self.base + reg as usize]
+        self.registers.slots()[self.base + reg as usize]
     }
 
     #[inline(always)]
     fn reg<T: AsWord>(&self, reg: Reg) -> T {
-        T::from_word(self.registers[self.base + reg as usize])
+        T::from_word(self.registers.slots()[self.base + reg as usize])
     }
 
     #[inline(always)]
     fn set_reg(&mut self, reg: Reg, value: impl AsWord) {
-        self.registers[self.base + reg as usize] = value.into_word();
+        self.registers.slots_mut()[self.base + reg as usize] = value.into_word();
     }
 
     #[inline(always)]
     fn set_reg_raw(&mut self, reg: Reg, value: word) {
-        self.registers[self.base + reg as usize] = value;
+        self.registers.slots_mut()[self.base + reg as usize] = value;
     }
 
     #[inline(always)]
@@ -130,12 +178,17 @@ impl VM {
 }
 
 #[inline(always)]
-fn cmp_branch(vm: &mut VM, program: &Program, jmp: bool) {
+fn cmp_branch<R: Slab<word>, F: Slab<Frame>>(vm: &mut VM<R, F>, program: &Program, jmp: bool) {
     vm.pc = if jmp { program.instruction(vm.pc) as usize } else { vm.pc + 1 };
 }
 
 #[inline(always)]
-pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [u8]) -> Result<RunOutcome, Error> {
+pub fn run<R, F, H>(vm: &mut VM<R, F>, program: &Program, host: &mut H, memory: &mut [u8]) -> Result<RunOutcome, Error>
+where
+    R: Slab<word>,
+    F: Slab<Frame>,
+    H: Host,
+{
     while vm.pc < program.len() {
         let i = program.instruction(vm.pc);
         vm.pc += 1;
@@ -161,6 +214,34 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                 }
             }};
         }
+
+        // Push a return frame, trapping on frame-stack overflow.
+        macro_rules! push_frame {
+            () => {{
+                if vm.frame_top >= vm.frames.len() {
+                    trap!(Fault::StackOverflow);
+                }
+
+                vm.frames.slots_mut()[vm.frame_top] = Frame {
+                    ret_pc: vm.pc,
+                    ret_base: vm.base,
+                    caller: vm.curr_func,
+                };
+                vm.frame_top += 1;
+            }};
+        }
+
+        // Pop a return frame; if the stack is empty the program has completed.
+        macro_rules! pop_frame {
+            () => {{
+                if vm.frame_top == 0 {
+                    return Ok(RunOutcome::Completed);
+                }
+                vm.frame_top -= 1;
+                &vm.frames.slots()[vm.frame_top]
+            }};
+        }
+
         macro_rules! call {
             ($id:expr) => {{
                 let func_id = $id;
@@ -170,19 +251,15 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                     FnType::Hxvm { entry_pc } => {
                         let last = base + func.nreg as usize;
                         if last > vm.registers.len() {
-                            vm.registers.resize(last, 0);
+                            trap!(Fault::StackOverflow);
                         }
-                        vm.call_stack.push(Frame {
-                            ret_pc: vm.pc,
-                            ret_base: vm.base,
-                            caller: vm.curr_func,
-                        });
+                        push_frame!();
                         vm.curr_func = func_id;
                         vm.base = base;
                         vm.pc = entry_pc;
                     }
                     FnType::Host { syscode } => {
-                        let ctx = HostCtx { vm, base, narg: func.narg, nret: func.nret };
+                        let ctx = HostCtx::new(vm.registers.slots_mut(), base, func.narg, func.nret);
                         match host.syscall(syscode, ctx)? {
                             Flow::Suspend => return Ok(RunOutcome::Suspended),
                             Flow::Trap(f) => trap!(f),
@@ -196,30 +273,29 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                 let func = program.function(id);
                 let base = vm.base;
                 let src = vm.reg_offset(inst::a(i));
-                vm.registers.copy_within(src..src + func.narg as usize, base);
+                let regs = vm.registers.slots_mut();
+                regs.copy_within(src..src + func.narg as usize, base);
 
                 match func.ty {
                     FnType::Hxvm { entry_pc } => {
                         let last = vm.base + func.nreg as usize;
-                        if last > vm.registers.len() {
-                            vm.registers.resize(last, 0);
+                        if last > regs.len() {
+                            trap!(Fault::StackOverflow);
                         }
                         vm.curr_func = id;
                         vm.pc = entry_pc;
                     }
                     FnType::Host { syscode } => {
-                        let ctx = HostCtx { vm, base, narg: func.narg, nret: func.nret };
+                        let ctx = HostCtx::new(regs, base, func.narg, func.nret);
                         match host.syscall(syscode, ctx)? {
                             Flow::Suspend => return Ok(RunOutcome::Suspended),
                             Flow::Trap(f) => trap!(f),
-                            Flow::Continue => match vm.call_stack.pop() {
-                                Some(fr) => {
-                                    vm.pc = fr.ret_pc;
-                                    vm.base = fr.ret_base;
-                                    vm.curr_func = fr.caller;
-                                }
-                                None => return Ok(RunOutcome::Completed),
-                            },
+                            Flow::Continue => {
+                                let fr = pop_frame!();
+                                vm.pc = fr.ret_pc;
+                                vm.base = fr.ret_base;
+                                vm.curr_func = fr.caller;
+                            }
                         }
                     }
                 }
@@ -518,7 +594,11 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
                 let (ptr, off) = vm.two_reg::<word>(inst::b(i), inst::c(i));
                 let start = (ptr + off) as usize;
                 match memory.get_mut(start..start + size_of::<word>()) {
-                    Some(slice) => slice.copy_from_slice(&word::to_le_bytes(vm.reg_raw(inst::a(i)))),
+                    Some(slice) => {
+                        let val = vm.reg_raw(inst::a(i));
+                        let bytes = word::to_le_bytes(val);
+                        slice.copy_from_slice(&bytes);
+                    }
                     None => trap!(Fault::MemoryOOB),
                 }
             }
@@ -529,14 +609,12 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
             Opcode::CALL_IND => call!(vm.reg::<FunctionId>(inst::b(i))),
             Opcode::TCALL_IND => call!(vm.reg::<FunctionId>(inst::b(i)), tail),
 
-            Opcode::RET => match vm.call_stack.pop() {
-                Some(frame) => {
-                    vm.pc = frame.ret_pc;
-                    vm.base = frame.ret_base;
-                    vm.curr_func = frame.caller;
-                }
-                None => return Ok(RunOutcome::Completed),
-            },
+            Opcode::RET => {
+                let fr = pop_frame!();
+                vm.pc = fr.ret_pc;
+                vm.base = fr.ret_base;
+                vm.curr_func = fr.caller;
+            }
 
             Opcode::THROW => trap!(Fault::Uncaught, vm.reg_raw(inst::a(i))),
             Opcode::HALT => return Ok(RunOutcome::Completed),
@@ -550,30 +628,32 @@ pub fn run<H: Host>(vm: &mut VM, program: &Program, host: &mut H, memory: &mut [
 /// Unwind from the current pc carrying `thrown`. On finding a handler, sets
 /// pc/base/cur_func to resume at the handler and returns Ok(()). If no handler
 /// exists anywhere on the stack, returns Err(outcome) to exit `run`.
-fn unwind(vm: &mut VM, program: &Program, thrown: word, uncaught: Fault) -> Result<(), Fault> {
-    let mut func = program.function(vm.curr_func);
+fn unwind<R, F>(vm: &mut VM<R, F>, program: &Program, thrown: word, uncaught: Fault) -> Result<(), Fault>
+where
+    R: Slab<word>,
+    F: Slab<Frame>,
+{
     let mut check_pc = vm.pc - 1;
 
     loop {
-        if let Some(h) = func.handler_for(check_pc) {
+        if let Some(h) = program.handler_for(vm.curr_func, check_pc) {
             vm.set_reg_raw(h.catch_reg, thrown);
             vm.pc = h.handler_pc;
             return Ok(()); // Resume dispatch at handler; base unchanged (this frame)
         }
 
-        match vm.call_stack.pop() {
-            Some(frame) => {
-                vm.base = frame.ret_base;
-                vm.pc = frame.ret_pc;
-                vm.curr_func = frame.caller;
-                func = program.function(vm.curr_func);
-                check_pc = frame.ret_pc - 1;
-            }
-            None => {
-                // stack empty, no handler anywhere
-                return Err(uncaught);
-            }
+        if vm.frame_top == 0 {
+            // stack empty, no handler anywhere
+            return Err(uncaught);
         }
+
+        // pop frames until we find a handler or the stack is empty
+        vm.frame_top -= 1;
+        let frame = vm.frames.slots()[vm.frame_top - 1];
+        vm.base = frame.ret_base;
+        vm.pc = frame.ret_pc;
+        vm.curr_func = frame.caller;
+        check_pc = frame.ret_pc - 1;
     }
 }
 
@@ -583,6 +663,7 @@ fn fault_to_value(f: Fault) -> word {
         Fault::Uncaught => 0,
         Fault::DivisionByZero => 1,
         Fault::MemoryOOB => 2,
+        Fault::StackOverflow => 3,
         Fault::Abort(c) => 0x100 | c as i64,
     }
     .into_word()

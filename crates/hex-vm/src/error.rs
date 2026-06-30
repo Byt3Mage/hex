@@ -8,6 +8,8 @@ pub enum Fault {
     DivisionByZero,
     #[error("memory access out of bounds")]
     MemoryOOB,
+    #[error("stack overflow")]
+    StackOverflow,
     #[error("aborted with code {0}")]
     Abort(u8),
 }

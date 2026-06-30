@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use hex_vm::{Args, AsWord, FunctionId, Program, Reg, VM, word};
+use hex_vm::{Args, AsWord, FunctionId, HeapVM, Program, Reg, word};
 use slotmap::{Key, KeyData, SlotMap};
 use smallvec::{SmallVec, smallvec};
 
@@ -28,21 +28,21 @@ pub enum TaskState {
 
 pub struct Task {
     pub(crate) func: FunctionId,
-    pub(crate) vm: VM,
+    pub(crate) vm: HeapVM,
     pub(crate) state: TaskState,
     pub(crate) joiners: SmallVec<[TaskId; 4]>,
     pub(crate) resume_into: Option<(usize, Reg)>,
 }
 
 pub struct Scheduler<'p> {
-    pub(crate) program: &'p Program,
+    pub(crate) program: Program<'p>,
     pub(crate) tasks: SlotMap<TaskId, Task>,
     pub(crate) ready: VecDeque<TaskId>,
     pub(crate) current: Option<TaskId>,
 }
 
 impl<'p> Scheduler<'p> {
-    pub fn new(program: &'p Program) -> Self {
+    pub fn new(program: Program<'p>) -> Self {
         Self {
             program,
             tasks: SlotMap::with_key(),
@@ -60,7 +60,7 @@ impl<'p> Scheduler<'p> {
     pub fn new_task(&mut self, func: FunctionId, args: Args<'_>) -> Result<TaskId, hex_vm::Error> {
         Ok(self.tasks.insert(Task {
             func,
-            vm: VM::from_entry(self.program, func, args)?,
+            vm: HeapVM::from_entry(&self.program, func, args, 1024)?,
             state: TaskState::Pending,
             joiners: smallvec![],
             resume_into: None,

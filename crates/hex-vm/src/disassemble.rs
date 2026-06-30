@@ -1,11 +1,17 @@
 //! Disassembler for a compiled `Program`.
 
+use alloc::{
+    collections::BTreeMap,
+    format,
+    string::{String, ToString},
+};
+use core::fmt::Write;
+
 use crate::{
     FnType, Function, Program,
     instruction::{Instruction, Opcode, inst},
     word,
 };
-use std::fmt::Write;
 
 /// Operand shape per opcode — tells the disassembler how to decode + render.
 #[derive(Clone, Copy)]
@@ -109,8 +115,6 @@ fn shape_of(op: Opcode) -> Shape {
         _ => Shape::None, // unknown -> render raw
     }
 }
-
-use std::collections::BTreeMap;
 
 /// Disassemble a whole program into human-readable text, with reconstructed labels.
 pub fn disassemble(program: &Program) -> String {

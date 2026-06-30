@@ -1,4 +1,4 @@
-use hex_vm::{Args, AsWord, Flow, FunctionId, HostCtx, Program, RunOutcome, Syscode, VM};
+use hex_vm::{Args, AsWord, Flow, FunctionId, HeapVM, HostCtx, Program, RunOutcome, Syscode};
 
 use crate::task::{Scheduler, TaskId, TaskState};
 
@@ -75,7 +75,8 @@ impl<'p> hex_vm::Host for Host<'p> {
 
 impl<'p> Host<'p> {
     fn run_to_completion(&mut self, mem: &mut [u8]) -> Result<(), hex_vm::Error> {
-        let mut runner = VM::new();
+        let mut runner = HeapVM::new(0);
+        let program = self.scheduler.program;
 
         while let Some(task_id) = self.scheduler.ready.pop_front() {
             self.scheduler.current = Some(task_id);
@@ -84,7 +85,7 @@ impl<'p> Host<'p> {
             task.state = TaskState::Running;
             std::mem::swap(&mut task.vm, &mut runner);
 
-            let outcome = hex_vm::run(&mut runner, self.scheduler.program, self, mem)?;
+            let outcome = hex_vm::run(&mut runner, &program, self, mem)?;
 
             let task = &mut self.scheduler.tasks[task_id];
             std::mem::swap(&mut task.vm, &mut runner);
@@ -108,7 +109,7 @@ pub struct Runtime<'p> {
 }
 
 impl<'p> Runtime<'p> {
-    pub fn new(program: &'p Program, memory_size: usize) -> Self {
+    pub fn new(program: Program<'p>, memory_size: usize) -> Self {
         Self {
             memory: vec![0; memory_size],
             host: Host { scheduler: Scheduler::new(program) },

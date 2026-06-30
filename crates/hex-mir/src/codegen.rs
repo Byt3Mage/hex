@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use hex_vm::{self as vm, FunctionId, Program};
+use hex_vm::{self as vm, FunctionId, HandlerSpan, ProgramBuf};
 
 use crate::{
     BlockId, Function, Inst, Module, Term, Val,
@@ -38,7 +38,7 @@ pub enum CodegenError {
 }
 
 pub struct Compilation {
-    pub program: vm::Program,
+    pub program: vm::ProgramBuf,
     pub functions: HashMap<String, vm::FunctionId>,
 }
 
@@ -61,7 +61,12 @@ pub fn compile_module(module: &Module) -> Result<Compilation, CodegenError> {
         })
         .collect::<Result<_, CodegenError>>()?;
 
-    let program = Program::new(ctx.bytecode.into(), ctx.constants.into(), ctx.functions.into());
+    let program = ProgramBuf::new(
+        ctx.bytecode.into(),
+        ctx.constants.into(),
+        ctx.functions.into(),
+        Box::new([]),
+    );
 
     Ok(Compilation { program, functions })
 }
@@ -125,7 +130,7 @@ fn compile_function(
         narg,
         nret,
         nreg,
-        handlers: Box::new([]),
+        handlers: HandlerSpan { start: u32::MAX, len: u32::MAX },
     });
 
     Ok(ptr)

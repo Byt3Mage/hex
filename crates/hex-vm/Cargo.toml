@@ -1,3 +1,4 @@
+
 [package]
 name = "hex-vm"
 version = "0.1.0"
@@ -8,5 +9,10 @@ description = "Hex: a register-based virtual machine"
 name = "hex_vm"
 doctest = false
 
+[features]
+default = ["std"]
+std = ["alloc", "thiserror/std"]
+alloc = []
+
 [dependencies]
-thiserror = "2.0.18"
+thiserror = { version = "2.0.18", default-features = false }

@@ -153,8 +153,6 @@ enum Pending {
 type CmpFn = fn(Reg, Reg, Instruction) -> [Instruction; 2];
 type ArithKFn = fn(Reg, Reg, Reg) -> Instruction;
 
-// ── Function / handler bookkeeping ────────────────────────────────────────
-
 enum PendingFnKind {
     Vm { entry_pc: usize },
     Host { syscode: u8 },
@@ -196,9 +194,7 @@ struct Builder {
     cur_fn: Option<usize>,
 }
 
-// ── Driver ────────────────────────────────────────────────────────────────
-
-pub fn assemble(src: &str) -> Result<Program, AsmError> {
+pub fn assemble(src: &str) -> Result<ProgramBuf, AsmError> {
     let mut b = Builder::default();
 
     for (idx, raw) in src.lines().enumerate() {
@@ -793,7 +789,7 @@ fn mk_imm8(v: i64, line: usize) -> R<Imm8> {
 
 // ── Resolution ────────────────────────────────────────────────────────────
 
-fn resolve(b: Builder) -> Result<Program, AsmError> {
+fn resolve(b: Builder) -> Result<ProgramBuf, AsmError> {
     let mut code: Vec<Instruction> = Vec::with_capacity(b.code.len());
 
     let const_id = |name: &str, line: usize| -> R<usize> {
@@ -886,9 +882,10 @@ fn resolve(b: Builder) -> Result<Program, AsmError> {
         })
         .collect();
 
-    Ok(Program::new(
+    Ok(ProgramBuf::new(
         code.into_boxed_slice(),
         b.constants.into_boxed_slice(),
         functions.into_boxed_slice(),
+        Box::new([]),
     ))
 }

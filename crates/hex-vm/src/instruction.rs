@@ -11,9 +11,9 @@ pub type Reg = u8;
 pub type Instruction = u32;
 
 // Derived constants. NEVER EDIT DIRECTLY
-const REG_BITS: Instruction = (std::mem::size_of::<Reg>() * 8) as _;
-const INST_BITS: Instruction = (std::mem::size_of::<Instruction>() * 8) as _;
-const OPCODE_BITS: Instruction = (std::mem::size_of::<Opcode>() * 8) as _;
+const REG_BITS: Instruction = (core::mem::size_of::<Reg>() * 8) as _;
+const INST_BITS: Instruction = (core::mem::size_of::<Instruction>() * 8) as _;
+const OPCODE_BITS: Instruction = (core::mem::size_of::<Opcode>() * 8) as _;
 
 const REG_MASK: Instruction = (1 << REG_BITS) - 1;
 
@@ -64,8 +64,8 @@ macro_rules! define_opcodes {
             define_opcodes!(@consts 0u8, $($name),*);
         }
 
-        impl std::fmt::Display for Opcode {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        impl core::fmt::Display for Opcode {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 match self.0 {
                     $(x if x == Self::$name.0 => f.write_str(stringify!($name)),)*
                     other => write!(f, "UNKNOWN({other})"),
@@ -107,6 +107,8 @@ define_opcodes! {
     HALT // end program
 }
 
+pub const R0: Reg = 0;
+const BX_BIAS: i64 = (BX_MASK >> 1) as i64;
 const IMM8_BIAS: i64 = 128;
 
 /// A signed immediate that provably fits the 8-bit instruction field.
@@ -134,10 +136,6 @@ impl Imm8 {
         self.0 as Reg
     }
 }
-
-pub const R0: Reg = 0;
-
-const BX_BIAS: i64 = (BX_MASK >> 1) as i64;
 
 pub mod inst {
     use super::*;

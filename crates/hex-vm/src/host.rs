@@ -1,4 +1,4 @@
-use crate::{AsWord, Error, Fault, Reg, VM, word};
+use crate::{AsWord, Error, Fault, Reg, word};
 
 pub type Syscode = u8;
 
@@ -23,13 +23,18 @@ pub enum Flow {
 }
 
 pub struct HostCtx<'v> {
-    pub(crate) vm: &'v mut VM,
+    pub(crate) regs: &'v mut [word],
     pub(crate) base: usize,
     pub(crate) narg: Reg,
     pub(crate) nret: Reg,
 }
 
 impl<'v> HostCtx<'v> {
+    #[inline(always)]
+    pub fn new(regs: &'v mut [word], base: usize, narg: Reg, nret: Reg) -> Self {
+        Self { regs, base, narg, nret }
+    }
+
     #[inline(always)]
     pub fn nargs(&self) -> Reg {
         self.narg
@@ -46,7 +51,7 @@ impl<'v> HostCtx<'v> {
 
     #[inline(always)]
     pub fn args(&self) -> &[word] {
-        &self.vm.registers[self.base..self.base + self.narg as usize]
+        &self.regs[self.base..self.base + self.narg as usize]
     }
 
     #[inline(always)]
@@ -54,7 +59,7 @@ impl<'v> HostCtx<'v> {
         if i >= self.narg {
             return Err(Error::ArgOutOfBounds { index: i, narg: self.narg });
         }
-        Ok(self.vm.registers[self.base + i as usize])
+        Ok(self.regs[self.base + i as usize])
     }
 
     #[inline(always)]
@@ -62,7 +67,7 @@ impl<'v> HostCtx<'v> {
         if i >= self.narg {
             return Err(Error::ArgOutOfBounds { index: i, narg: self.narg });
         }
-        Ok(T::from_word(self.vm.registers[self.base + i as usize]))
+        Ok(T::from_word(self.regs[self.base + i as usize]))
     }
 
     #[inline(always)]
@@ -70,7 +75,7 @@ impl<'v> HostCtx<'v> {
         if i >= self.nret {
             return Err(Error::RetOutOfBounds { index: i, nret: self.nret });
         }
-        self.vm.registers[self.base + i as usize] = v;
+        self.regs[self.base + i as usize] = v;
         Ok(())
     }
 
@@ -82,6 +87,6 @@ impl<'v> HostCtx<'v> {
     /// Write a result slice into the return window (truncated to nret).
     #[inline]
     pub fn rets(&mut self) -> &mut [word] {
-        &mut self.vm.registers[self.base..self.base + self.nret as usize]
+        &mut self.regs[self.base..self.base + self.nret as usize]
     }
 }
