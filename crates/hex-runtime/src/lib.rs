@@ -15,7 +15,6 @@ pub const ABORT_DEADLOCK: u8 = 3;
 // Syscodes this runtime's ABI defines.
 pub mod syscode {
     use hex_vm::Syscode;
-
     pub const SPAWN_TASK: Syscode = 0; // (entry_fn, ...args) -> TaskId
     pub const AWAIT_TASK: Syscode = 1; // (task_id) -> the awaited task's return values
     pub const YIELD_TASK: Syscode = 2; // () -> () ; cooperative reschedule
@@ -45,8 +44,7 @@ impl<'p> hex_vm::Host for Host<'p> {
                     TaskState::Done => {
                         // Return and resume immediately if done
                         let nret = ctx.nrets() as usize;
-                        let rets = ctx.rets();
-                        rets.copy_from_slice(&task.vm.registers[..nret]);
+                        ctx.rets().copy_from_slice(&task.vm.registers[..nret]);
                         return Ok(Flow::Continue);
                     }
                     TaskState::Pending => {

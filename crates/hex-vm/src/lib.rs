@@ -8,6 +8,7 @@ mod disassemble;
 mod error;
 mod host;
 mod instruction;
+mod native;
 mod program;
 mod storage;
 mod value;
@@ -17,6 +18,7 @@ pub use disassemble::disassemble;
 pub use error::*;
 pub use host::{Flow, Host, HostCtx, Syscode};
 pub use instruction::*;
+pub use native::{NativeCtx, NativeFn, NativeOutcome};
 pub use program::*;
 pub use storage::{Slab, max_frames};
 pub use value::{AsWord, word};
@@ -156,11 +158,6 @@ impl<R: Slab<word>, F: Slab<Frame>> VM<R, F> {
         self.base
     }
 
-    #[inline]
-    pub fn call_stack(&self) -> &[Frame] {
-        &self.frames.slots()[..self.frame_top]
-    }
-
     #[inline(always)]
     fn reg_raw(&self, reg: Reg) -> word {
         self.registers.slots()[self.base + reg as usize]
@@ -185,16 +182,6 @@ impl<R: Slab<word>, F: Slab<Frame>> VM<R, F> {
     fn two_reg<T: AsWord>(&self, reg_a: Reg, reg_b: Reg) -> (T, T) {
         (self.reg(reg_a), self.reg(reg_b))
     }
-
-    #[inline(always)]
-    fn reg_offset(&self, reg: Reg) -> usize {
-        self.base + reg as usize
-    }
-}
-
-#[inline(always)]
-fn cmp_branch<R: Slab<word>, F: Slab<Frame>>(vm: &mut VM<R, F>, program: &Program, jmp: bool) {
-    vm.pc = if jmp { program.instruction(vm.pc) as usize } else { vm.pc + 1 };
 }
 
 #[inline(always)]
@@ -207,6 +194,13 @@ where
     while vm.pc < program.len() {
         let i = program.instruction(vm.pc);
         vm.pc += 1;
+
+        // Compare and branch: jump to the next instruction if condition is false.
+        macro_rules! cmp_branch {
+            ($cond:expr) => {
+                vm.pc = if $cond { program.instruction(vm.pc) as usize } else { vm.pc + 1 };
+            };
+        }
 
         // Raise a fault: unwind to a handler, or exit run if uncaught.
         macro_rules! trap {
@@ -257,11 +251,12 @@ where
             }};
         }
 
+        // Call a function: push a frame and set pc/func/base accordingly.
         macro_rules! call {
             ($id:expr) => {{
                 let func_id = $id;
                 let func = program.function(func_id);
-                let base = vm.reg_offset(inst::a(i));
+                let base = vm.base + inst::a(i) as usize;
                 match func.ty {
                     FnType::Hxvm { entry_pc } => {
                         let last = base + func.nreg as usize;
@@ -281,13 +276,21 @@ where
                             Flow::Continue => {}
                         }
                     }
+                    FnType::Native { fn_ptr } => {
+                        let max = func.narg.max(func.nret) as usize;
+                        let window = &mut vm.registers.slots_mut()[base..base + max];
+                        match fn_ptr(NativeCtx { window, memory }) {
+                            NativeOutcome::Continue => {}
+                            NativeOutcome::Trap(f) => trap!(f),
+                        }
+                    }
                 }
             }};
             ($id:expr, tail) => {{
                 let id = $id;
                 let func = program.function(id);
                 let base = vm.base;
-                let src = vm.reg_offset(inst::a(i));
+                let src = vm.base + inst::a(i) as usize;
                 let regs = vm.registers.slots_mut();
                 regs.copy_within(src..src + func.narg as usize, base);
 
@@ -306,6 +309,19 @@ where
                             Flow::Suspend => return Ok(RunOutcome::Suspended),
                             Flow::Trap(f) => trap!(f),
                             Flow::Continue => {
+                                let fr = pop_frame!();
+                                vm.pc = fr.ret_pc;
+                                vm.base = fr.ret_base;
+                                vm.curr_func = fr.caller;
+                            }
+                        }
+                    }
+                    FnType::Native { fn_ptr } => {
+                        let max = func.narg.max(func.nret) as usize;
+                        let window = &mut vm.registers.slots_mut()[base..base + max];
+                        match fn_ptr(NativeCtx { window, memory }) {
+                            NativeOutcome::Trap(f) => trap!(f),
+                            NativeOutcome::Continue => {
                                 let fr = pop_frame!();
                                 vm.pc = fr.ret_pc;
                                 vm.base = fr.ret_base;
@@ -529,67 +545,67 @@ where
             }
             Opcode::JEQ => {
                 let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a == b);
+                cmp_branch!(a == b);
             }
             Opcode::JNE => {
                 let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a != b);
+                cmp_branch!(a != b);
             }
             Opcode::JSLT => {
                 let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a < b);
+                cmp_branch!(a < b);
             }
             Opcode::JSGT => {
                 let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a > b);
+                cmp_branch!(a > b);
             }
             Opcode::JSLE => {
                 let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a <= b);
+                cmp_branch!(a <= b);
             }
             Opcode::JSGE => {
                 let (a, b) = vm.two_reg::<i64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a >= b);
+                cmp_branch!(a >= b);
             }
             Opcode::JULT => {
                 let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a < b);
+                cmp_branch!(a < b);
             }
             Opcode::JUGT => {
                 let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a > b);
+                cmp_branch!(a > b);
             }
             Opcode::JULE => {
                 let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a <= b);
+                cmp_branch!(a <= b);
             }
             Opcode::JUGE => {
                 let (a, b) = vm.two_reg::<u64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a >= b);
+                cmp_branch!(a >= b);
             }
             Opcode::JFEQ => {
                 let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a == b);
+                cmp_branch!(a == b);
             }
             Opcode::JFNE => {
                 let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a != b);
+                cmp_branch!(a != b);
             }
             Opcode::JFLT => {
                 let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a < b);
+                cmp_branch!(a < b);
             }
             Opcode::JFGT => {
                 let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a > b);
+                cmp_branch!(a > b);
             }
             Opcode::JFLE => {
                 let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a <= b);
+                cmp_branch!(a <= b);
             }
             Opcode::JFGE => {
                 let (a, b) = vm.two_reg::<f64>(inst::b(i), inst::c(i));
-                cmp_branch(vm, program, a >= b);
+                cmp_branch!(a >= b);
             }
 
             // Memory ops
@@ -679,7 +695,7 @@ fn fault_to_value(f: Fault) -> word {
         Fault::DivisionByZero => 1,
         Fault::MemoryOOB => 2,
         Fault::StackOverflow => 3,
-        Fault::Abort(c) => 0x100 | c as i64,
+        Fault::Abort(c) => 0x100 | c as u64,
     }
     .into_word()
 }

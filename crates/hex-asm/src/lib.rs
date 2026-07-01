@@ -170,6 +170,7 @@ struct OpenTry {
     catch_reg: Reg,
     line: usize,
 }
+
 struct PendingHandler {
     fn_idx: usize,
     start_pc: usize,
@@ -200,6 +201,7 @@ pub fn assemble(src: &str) -> Result<ProgramBuf, AsmError> {
     for (idx, raw) in src.lines().enumerate() {
         let line = idx + 1;
         let text = strip_comment(raw).trim();
+
         if text.is_empty() {
             continue;
         }

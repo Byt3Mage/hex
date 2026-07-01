@@ -117,7 +117,6 @@ pub struct Imm8(u8);
 
 impl Imm8 {
     /// Construct from any integer, returning None if it doesn't fit -128..=127.
-    /// This is the fusion gate: `None` means "don't fuse, fall back to CONST".
     #[inline(always)]
     pub const fn from_int(value: i64) -> Option<Self> {
         if value >= -127 && value <= 127 { Some(Self((value + IMM8_BIAS) as u8)) } else { None }

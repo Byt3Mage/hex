@@ -296,6 +296,9 @@ fn fmt_fn(f: &Function) -> String {
         FnType::Host { syscode } => {
             format!("host:{syscode} (narg={}, nret={})", f.narg, f.nret)
         }
+        FnType::Native { fn_ptr } => {
+            format!("native: {fn_ptr:?}")
+        }
     }
 }
 

@@ -1,5 +1,8 @@
+#[cfg(feature = "alloc")]
+use alloc::boxed::Box;
+
 use crate::{
-    Error,
+    Error, NativeFn,
     host::Syscode,
     instruction::{Instruction, Reg},
     value::word,
@@ -13,6 +16,7 @@ pub type ConstantId = u16;
 pub enum FnType {
     Hxvm { entry_pc: usize },
     Host { syscode: Syscode },
+    Native { fn_ptr: NativeFn },
 }
 
 impl FnType {
@@ -140,10 +144,10 @@ impl<'p> Program<'p> {
 #[cfg(feature = "alloc")]
 #[derive(Debug, Clone)]
 pub struct ProgramBuf {
-    instructions: alloc::boxed::Box<[Instruction]>,
-    constants: alloc::boxed::Box<[word]>,
-    functions: alloc::boxed::Box<[Function]>,
-    handlers: alloc::boxed::Box<[HandlerEntry]>,
+    instructions: Box<[Instruction]>,
+    constants: Box<[word]>,
+    functions: Box<[Function]>,
+    handlers: Box<[HandlerEntry]>,
 }
 
 #[cfg(feature = "alloc")]
