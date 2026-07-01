@@ -878,7 +878,7 @@ fn resolve(b: Builder) -> Result<ProgramBuf, AsmError> {
             narg: pf.narg,
             nret: pf.nret,
             nreg: pf.nreg,
-            handlers: std::mem::take(&mut per_fn[idx]).into_boxed_slice(),
+            handlers: HandlerSpan { start: 0, len: 0 },
         })
         .collect();
 

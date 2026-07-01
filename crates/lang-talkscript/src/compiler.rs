@@ -1,5 +1,3 @@
-pub(crate) use hex_mir as ir;
-
 mod ast;
 mod error;
 mod lexer;

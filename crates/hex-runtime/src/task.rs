@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use hex_vm::{Args, AsWord, FunctionId, HeapVM, Program, Reg, word};
+use hex_vm::{AsWord, FunctionId, HeapVM, Program, Reg, word};
 use slotmap::{Key, KeyData, SlotMap};
 use smallvec::{SmallVec, smallvec};
 
@@ -57,7 +57,7 @@ impl<'p> Scheduler<'p> {
         self.current = None;
     }
 
-    pub fn new_task(&mut self, func: FunctionId, args: Args<'_>) -> Result<TaskId, hex_vm::Error> {
+    pub fn new_task(&mut self, func: FunctionId, args: &[word]) -> Result<TaskId, hex_vm::Error> {
         Ok(self.tasks.insert(Task {
             func,
             vm: HeapVM::from_entry(&self.program, func, args, 1024)?,

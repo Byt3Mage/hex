@@ -3,10 +3,7 @@ use simple_ternary::tnr;
 use crate::{
     arena::Interner,
     compiler::{
-        ast::{
-            AssignOp, Ast, BinOp, Decl, DeclId, DeclKind, Expr, ExprId, ExprKind, Param, Stmt,
-            StmtKind, UnOp, Visibility,
-        },
+        ast::{AssignOp, Ast, BinOp, Decl, DeclKind, Expr, ExprId, ExprKind, Param, Stmt, StmtKind, UnOp, Visibility},
         lexer::{Lexer, LexerError},
         parse_rules::{InfixRule, ParseRule, Precedence, PrefixRule},
         token::{Span, Token, TokenType},
@@ -23,10 +20,7 @@ pub struct ParseError {
 
 impl From<LexerError> for ParseError {
     fn from(err: LexerError) -> Self {
-        Self {
-            msg: err.to_string(),
-            span: err.span,
-        }
+        Self { msg: err.to_string(), span: err.span }
     }
 }
 
@@ -40,20 +34,11 @@ pub struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(
-        ast: &'a mut Ast,
-        intern: &'a mut Interner,
-        source: &'a str,
-    ) -> Result<Parser<'a>, ParseError> {
+    pub fn new(ast: &'a mut Ast, intern: &'a mut Interner, source: &'a str) -> Result<Parser<'a>, ParseError> {
         let mut lexer = Lexer::new(source);
         let current = lexer.next_token()?;
 
-        Ok(Parser {
-            ast,
-            intern,
-            lexer,
-            current,
-        })
+        Ok(Parser { ast, intern, lexer, current })
     }
 
     pub fn advance(&mut self) -> ParseResult<()> {
@@ -173,11 +158,7 @@ impl<'a> Parser<'a> {
             vis,
             name: self.intern.get_or_intern(func_name.lexeme),
             span: fn_token.span.merge(body.span),
-            kind: DeclKind::Func {
-                params,
-                ret,
-                body: self.ast.insert_expr(body),
-            },
+            kind: DeclKind::Func { params, ret, body: self.ast.insert_expr(body) },
         })
     }
 
@@ -200,10 +181,7 @@ impl<'a> Parser<'a> {
         Ok(Decl {
             vis,
             name: self.intern.get_or_intern(const_name.lexeme),
-            kind: DeclKind::Const {
-                ty,
-                val: self.ast.insert_expr(value),
-            },
+            kind: DeclKind::Const { ty, val: self.ast.insert_expr(value) },
             span: const_token.span.merge(semi.span),
         })
     }
@@ -371,11 +349,7 @@ impl<'a> Parser<'a> {
         self.parse_precedence(Precedence::Assignment, false)
     }
 
-    fn parse_precedence(
-        &mut self,
-        precedence: Precedence,
-        allow_struct: bool,
-    ) -> ParseResult<Expr> {
+    fn parse_precedence(&mut self, precedence: Precedence, allow_struct: bool) -> ParseResult<Expr> {
         let rule = ParseRule::get(self.current.ty);
         let mut expr = self.parse_prefix(rule.prefix, allow_struct)?;
 
@@ -429,12 +403,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_infix(
-        &mut self,
-        rule: InfixRule,
-        left: Expr,
-        allow_struct: bool,
-    ) -> ParseResult<Expr> {
+    fn parse_infix(&mut self, rule: InfixRule, left: Expr, allow_struct: bool) -> ParseResult<Expr> {
         match rule {
             InfixRule::Binary => self.parse_binary(left, allow_struct),
             InfixRule::Assign => self.parse_assign(left, allow_struct),
@@ -466,10 +435,7 @@ impl<'a> Parser<'a> {
 
         let r_brace = self.expect(tt!['}'])?;
 
-        Ok(Expr {
-            span: ty.span.merge(r_brace.span),
-            kind: todo!(),
-        })
+        Ok(Expr { span: ty.span.merge(r_brace.span), kind: todo!() })
     }
 
     fn parse_ident(&mut self) -> ParseResult<Expr> {
@@ -482,42 +448,27 @@ impl<'a> Parser<'a> {
 
     fn parse_int_type(&mut self) -> ParseResult<Expr> {
         let int_ty = self.expect(tt![int])?;
-        Ok(Expr {
-            kind: ExprKind::IntType,
-            span: int_ty.span,
-        })
+        Ok(Expr { kind: ExprKind::IntType, span: int_ty.span })
     }
 
     fn parse_uint_type(&mut self) -> ParseResult<Expr> {
         let uint_ty = self.expect(tt![uint])?;
-        Ok(Expr {
-            kind: ExprKind::UintType,
-            span: uint_ty.span,
-        })
+        Ok(Expr { kind: ExprKind::UintType, span: uint_ty.span })
     }
 
     fn parse_bool_type(&mut self) -> ParseResult<Expr> {
         let bool_ty = self.expect(tt![bool])?;
-        Ok(Expr {
-            kind: ExprKind::BoolType,
-            span: bool_ty.span,
-        })
+        Ok(Expr { kind: ExprKind::BoolType, span: bool_ty.span })
     }
 
     fn parse_float_type(&mut self) -> ParseResult<Expr> {
         let float_ty = self.expect(tt![float])?;
-        Ok(Expr {
-            kind: ExprKind::FloatType,
-            span: float_ty.span,
-        })
+        Ok(Expr { kind: ExprKind::FloatType, span: float_ty.span })
     }
 
     fn parse_void_type(&mut self) -> ParseResult<Expr> {
         let void_ty = self.expect(tt![void])?;
-        Ok(Expr {
-            kind: ExprKind::VoidType,
-            span: void_ty.span,
-        })
+        Ok(Expr { kind: ExprKind::VoidType, span: void_ty.span })
     }
 
     fn parse_option_type(&mut self) -> ParseResult<Expr> {
@@ -552,10 +503,7 @@ impl<'a> Parser<'a> {
         let int_token = self.expect(tt![cint_lit])?;
 
         match str::parse::<u64>(int_token.lexeme) {
-            Ok(u) => Ok(Expr {
-                kind: ExprKind::CintLit(u),
-                span: int_token.span,
-            }),
+            Ok(u) => Ok(Expr { kind: ExprKind::CintLit(u), span: int_token.span }),
             Err(err) => Err(ParseError {
                 msg: format!("Error parsing cint literal: {err}"),
                 span: int_token.span,
@@ -567,10 +515,7 @@ impl<'a> Parser<'a> {
         let int_token = self.expect(tt![uint_lit])?;
 
         match str::parse::<u64>(int_token.lexeme) {
-            Ok(u) => Ok(Expr {
-                kind: ExprKind::UintLit(u),
-                span: int_token.span,
-            }),
+            Ok(u) => Ok(Expr { kind: ExprKind::UintLit(u), span: int_token.span }),
             Err(err) => Err(ParseError {
                 msg: format!("Error parsing uint literal: {err}"),
                 span: int_token.span,
@@ -582,10 +527,7 @@ impl<'a> Parser<'a> {
         let int_token = self.expect(tt![int_lit])?;
 
         match str::parse::<i64>(int_token.lexeme) {
-            Ok(i) => Ok(Expr {
-                kind: ExprKind::IntLit(i),
-                span: int_token.span,
-            }),
+            Ok(i) => Ok(Expr { kind: ExprKind::IntLit(i), span: int_token.span }),
             Err(err) => Err(ParseError {
                 msg: format!("Error parsing int literal: {err}"),
                 span: int_token.span,
@@ -622,27 +564,18 @@ impl<'a> Parser<'a> {
             }
         };
 
-        Ok(Expr {
-            kind: ExprKind::BoolLit(val),
-            span: token.span,
-        })
+        Ok(Expr { kind: ExprKind::BoolLit(val), span: token.span })
     }
 
     fn parse_string(&mut self) -> ParseResult<Expr> {
         let str_token = self.expect(tt![str_lit])?;
-        Ok(Expr {
-            kind: todo!(),
-            span: str_token.span,
-        })
+        Ok(Expr { kind: todo!(), span: str_token.span })
     }
 
     fn parse_null(&mut self) -> ParseResult<Expr> {
         let null_token = self.expect(tt![null])?;
 
-        Ok(Expr {
-            kind: ExprKind::NullLit,
-            span: null_token.span,
-        })
+        Ok(Expr { kind: ExprKind::NullLit, span: null_token.span })
     }
 
     fn parse_array(&mut self) -> ParseResult<Expr> {
@@ -724,10 +657,7 @@ impl<'a> Parser<'a> {
 
         Ok(Expr {
             span: op_token.span.merge(expr.span),
-            kind: ExprKind::Unary {
-                op,
-                rhs: self.ast.insert_expr(expr),
-            },
+            kind: ExprKind::Unary { op, rhs: self.ast.insert_expr(expr) },
         })
     }
 
@@ -822,10 +752,7 @@ impl<'a> Parser<'a> {
                 // Parse expression statements
                 tt => {
                     // check if current token can start a block expression
-                    let is_blk = matches!(
-                        tt,
-                        tt!['{'] | tt![if] | tt![match] | tt![while] | tt![for] | tt![loop]
-                    );
+                    let is_blk = matches!(tt, tt!['{'] | tt![if] | tt![match] | tt![while] | tt![for] | tt![loop]);
 
                     let expr = self.parse_expr()?;
 
@@ -928,10 +855,7 @@ impl<'a> Parser<'a> {
             None
         };
 
-        Ok(Expr {
-            kind: ExprKind::Return(expr),
-            span,
-        })
+        Ok(Expr { kind: ExprKind::Return(expr), span })
     }
 
     fn parse_break(&mut self) -> ParseResult<Expr> {
@@ -946,10 +870,7 @@ impl<'a> Parser<'a> {
             None
         };
 
-        Ok(Expr {
-            kind: ExprKind::Break(expr),
-            span,
-        })
+        Ok(Expr { kind: ExprKind::Break(expr), span })
     }
 
     fn parse_continue(&mut self) -> ParseResult<Expr> {

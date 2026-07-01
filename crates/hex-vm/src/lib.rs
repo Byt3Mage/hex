@@ -19,7 +19,7 @@ pub use host::{Flow, Host, HostCtx, Syscode};
 pub use instruction::*;
 pub use program::*;
 pub use storage::{Slab, max_frames};
-pub use value::{Args, AsWord, word};
+pub use value::{AsWord, word};
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -59,7 +59,7 @@ impl Default for Frame {
 /// grows them, it bounds-checks and raises [`Fault::StackOverflow`].
 /// `registers.len()` is the maximum stack size.
 #[derive(Debug, Clone)]
-pub struct VM<R: Slab<word>, F: Slab<Frame>> {
+pub struct VM<R, F> {
     pub registers: R,
     frames: F,
     frame_top: usize,
@@ -82,10 +82,26 @@ impl HeapVM {
         )
     }
 
-    pub fn from_entry(program: &Program, func: FunctionId, args: Args<'_>, reg_cap: usize) -> Result<Self, Error> {
+    pub fn from_entry(program: &Program, func: FunctionId, args: &[word], reg_cap: usize) -> Result<Self, Error> {
         let mut vm = Self::new(reg_cap);
         vm.set_entry(program, func, args)?;
         Ok(vm)
+    }
+}
+impl<R, F> Default for VM<R, F>
+where
+    R: Default,
+    F: Default,
+{
+    fn default() -> Self {
+        Self {
+            registers: Default::default(),
+            frames: Default::default(),
+            frame_top: 0,
+            pc: usize::MAX,
+            base: usize::MAX,
+            curr_func: FunctionId::MAX,
+        }
     }
 }
 
@@ -101,12 +117,12 @@ impl<R: Slab<word>, F: Slab<Frame>> VM<R, F> {
         }
     }
 
-    pub fn set_entry(&mut self, program: &Program, entry: FunctionId, args: Args) -> Result<(), Error> {
+    pub fn set_entry(&mut self, program: &Program, entry: FunctionId, args: &[word]) -> Result<(), Error> {
         let func = program.function(entry);
-        let argc = args.count();
+        let argc = args.len();
 
-        if argc != func.narg {
-            return Err(Error::ArgcMismatch { exp: func.narg, got: argc });
+        if argc != func.narg as usize {
+            return Err(Error::ArgcMismatch { exp: func.narg, got: argc as Reg });
         }
 
         self.reset();
@@ -147,7 +163,6 @@ impl<R: Slab<word>, F: Slab<Frame>> VM<R, F> {
 
     #[inline(always)]
     fn reg_raw(&self, reg: Reg) -> word {
-        // TODO: add program validation and change to get_unchecked.
         self.registers.slots()[self.base + reg as usize]
     }
 

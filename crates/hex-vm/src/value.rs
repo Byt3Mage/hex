@@ -1,7 +1,3 @@
-use core::ops::Deref;
-
-use crate::Reg;
-
 #[allow(non_camel_case_types)]
 pub type word = u64;
 
@@ -59,6 +55,7 @@ impl AsWord for bool {
     fn from_word(w: word) -> Self {
         w != 0
     }
+
     #[inline(always)]
     fn into_word(self) -> word {
         self as word
@@ -98,26 +95,18 @@ impl AsWord for u32 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct Args<'a>(&'a [word]);
-
-impl<'a> Args<'a> {
-    #[inline]
-    pub fn new(args: &'a [word]) -> Option<Self> {
-        if args.len() <= (Reg::MAX as usize) { Some(Self(args)) } else { None }
-    }
-
+impl AsWord for i32 {
     #[inline(always)]
-    pub fn count(&self) -> Reg {
-        self.len() as Reg
+    fn from_word(w: word) -> Self {
+        w as i32
+    }
+    #[inline(always)]
+    fn into_word(self) -> word {
+        self as word
     }
 }
 
-impl<'a> Deref for Args<'a> {
-    type Target = [word];
-
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
+#[macro_export]
+macro_rules! args {
+    ($($arg:expr),* $(,)?) => { &[$($crate::AsWord::into_word($arg)),*] };
 }

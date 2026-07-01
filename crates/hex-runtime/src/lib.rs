@@ -1,4 +1,4 @@
-use hex_vm::{Args, AsWord, Flow, FunctionId, HeapVM, HostCtx, Program, RunOutcome, Syscode};
+use hex_vm::{AsWord, Flow, FunctionId, HeapVM, HostCtx, Program, RunOutcome, Syscode, word};
 
 use crate::task::{Scheduler, TaskId, TaskState};
 
@@ -30,9 +30,7 @@ impl<'p> hex_vm::Host for Host<'p> {
         match code {
             syscode::SPAWN_TASK => {
                 let [f, args @ ..] = ctx.args() else { panic!("invalid spawn args") };
-                let func = FunctionId::from_word(*f);
-                let args = Args::new(args).unwrap();
-                let task_id = self.scheduler.new_task(func, args)?;
+                let task_id = self.scheduler.new_task(FunctionId::from_word(*f), args)?;
                 ctx.ret(0, task_id)?;
                 Ok(Flow::Continue)
             }
@@ -116,10 +114,9 @@ impl<'p> Runtime<'p> {
         }
     }
 
-    pub fn execute(&mut self, func: FunctionId, args: Args<'_>) -> Result<(), hex_vm::Error> {
+    pub fn execute(&mut self, func: FunctionId, args: &[word]) -> Result<(), hex_vm::Error> {
         // Clear previous state and reset
         self.host.scheduler.reset();
-
         // Spawn root task from entry point
         let root_id = self.host.scheduler.new_task(func, args)?;
         self.host.scheduler.tasks[root_id].state = TaskState::Ready;
